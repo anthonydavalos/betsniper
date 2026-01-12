@@ -49,7 +49,7 @@ El sistema debe persistir datos para no gastar la cuota de 100 llamadas/día de 
 **Restricción:** Máximo 100 llamadas/día.
 
 **Estrategia:**
-1.  **Filtro Previo:** Solo consultar ligas TOP (Premier, LaLiga, Bundesliga, Serie A, Champions, Liga 1 Perú).
+1.  **Filtro Previo:** No solo consultar ligas TOP (Premier, LaLiga, Bundesliga, Serie A, Champions, Liga 1 Perú) sinó tambien las demas ya que puede haber oportunidad en las demas también.
 2.  **Batching:** Consultar `/fixtures` para los próximos 2 días.
 3.  **Extracción de Valor:** Para cada partido filtrado, llamar a `/odds?bookmaker=4` (Pinnacle).
 4.  **Matemática:**
