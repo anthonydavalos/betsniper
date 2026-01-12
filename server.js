@@ -17,6 +17,10 @@ app.use(express.json());
 // Inicializar Base de Datos
 await initDB();
 
+// Rutas de API
+import opportunitiesRouter from './src/routes/opportunities.js';
+app.use('/api/opportunities', opportunitiesRouter);
+
 // Rutas Básicas (API Health Check)
 app.get('/', (req, res) => {
   res.send('🔫 BetSniper V3 API is Running - Oportunidades en la mira.');
