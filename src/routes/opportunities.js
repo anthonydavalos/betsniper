@@ -1,7 +1,7 @@
 import express from 'express';
 import { scanLiveOpportunities } from '../services/scannerService.js';
+import { scanPrematchOpportunities } from '../services/prematchScannerService.js';
 import db from '../db/database.js';
-import { calculateEV, calculateKellyStake } from '../utils/mathUtils.js';
 
 const router = express.Router();
 
@@ -21,22 +21,16 @@ router.get('/live', async (req, res) => {
 });
 
 // GET /api/opportunities/prematch
-// Retorna oportunidades Pre-Match guardadas en DB
+// Retorna oportunidades Pre-Match calculadas vs Altenar (GetUpcoming)
 router.get('/prematch', async (req, res) => {
   try {
-    await db.read();
-    const matches = db.data.upcomingMatches || [];
-    const bankroll = db.data.config.bankroll || 1000;
-    
-    // Filtramos solo las que tengan EV positivo ahora con las cuotas que guardamos?
-    // En realidad, ingest.js guarda las probabilidades reales.
-    // Para saber si hay Value PRE-MATCH, deberíamos comparar vs Altenar Pre-Match.
-    // Por ahora, devolvemos todo lo analizado que tenga alta probabilidad para que el usuario decida,
-    // o calculamos un "Theoretical EV" vs la bookie Pinnacle (si es que Pinnacle paga mal, raro).
-    // LO MEJOR: Frontend pedirá cuota actual de Altenar y calculará ahí, o el backend lo hace si cruzamos.
-    // DE MOMENTO: Devolvemos la data cruda "Source of Truth" para el Frontend.
-    
-    res.json(matches);
+    // Escaner Real vs Altenar
+    const opportunities = await scanPrematchOpportunities();
+    res.json({
+        timestamp: new Date().toISOString(),
+        count: opportunities.length,
+        data: opportunities
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
