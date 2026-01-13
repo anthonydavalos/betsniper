@@ -17,6 +17,7 @@ const defaultData = {
     "Man City": "Manchester City" 
   },
   upcomingMatches: [],
+  altenarUpcoming: [], // Caché de cuotas Pre-Match Altenar
   liveTracking: []
 };
 

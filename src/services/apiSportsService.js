@@ -59,18 +59,27 @@ const fetchPaginatedData = async (endpoint, params = {}) => {
 };
 
 export const getFixturesByDate = async (date) => {
-  // Nota: /fixtures por fecha generalmente no requiere paginación massiva como odds,
-  // pero usaremos el endpoint estándar. 
-  // OJO: API-Sports a veces no pagina fixtures por fecha si son < X.
-  // Pero si devuelve 'paging', el fetchPaginated lo maneja.
-  // Sin embargo, /fixtures tiene un limite duro de requests.
-  // Vamos a usar la llamada simple si no hay paginacion explicita requerida, 
-  // pero el fetchPaginated es seguro.
-  // En filtro por fecha, get fixtures devuelve TODAS las ligas.
-  return fetchPaginatedData('/fixtures', { 
-    date: date,
-    timezone: 'America/Lima' // Sincronizado con Altenar (PE)
-  });
+  console.log(`🌐 API-Sports: Fetching /fixtures for ${date} (Sin paginación)...`);
+  try {
+    const response = await client.get('/fixtures', { 
+      params: {
+        date: date,
+        timezone: 'America/Lima' // Sincronizado con Altenar (PE)
+      }
+    });
+
+    if (response.data.errors && Object.keys(response.data.errors).length > 0) {
+      // A veces la API devuelve errores en formato 200 OK
+      console.error('❌ API-Sports Error (Fixtures):', response.data.errors);
+      return [];
+    }
+
+    return response.data.response || [];
+
+  } catch (error) {
+    console.error(`❌ Falló petición a /fixtures:`, error.message);
+    return [];
+  }
 };
 
 export const getPinnacleOddsByDate = async (date) => {
