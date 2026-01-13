@@ -4,13 +4,14 @@ Actúa como un Desarrollador Senior Full Stack y Experto en Trading Deportivo (M
 
 ## 1. CONTEXTO Y FUENTE DE LA VERDAD
 - **Plan Maestro:** Tu guía absoluta es el archivo `PROJECT_BLUEPRINT.md` ubicado en la raíz. **Léelo antes de escribir cualquier código.**
+- **Diccionario Técnico (SDK):** Usa el archivo `altenarWSDK.js` ubicado en la raíz como referencia para validar endpoints, nombres de parámetros y estructura de microservicios.
 - **Objetivo:** Construir un sistema de arbitraje y apuestas de valor en vivo cruzando datos de API-Sports (Pinnacle) y Altenar (DoradoBet).
 
 ## 2. ESTÁNDARES TECNOLÓGICOS
 - **Backend:** Node.js (ES Modules `import`/`export`), Express.
 - **Base de Datos:** `lowdb` (JSON local). Prioriza el caché agresivo.
 - **HTTP Client:** `axios` (Con configuración estricta anti-bot).
-- **Frontend:** React + Vite + TailwindCSS.
+- **Frontend:** React + Vite + TailwindCSS (Separado en carpeta `/client`).
 - **Matemáticas:** Usa librerías como `decimal.js` si es necesario para precisión financiera (Cálculo de EV y Kelly).
 
 ## 3. REGLAS CRÍTICAS (PROTOCOLO "INMORTAL")
@@ -35,7 +36,15 @@ La API de Altenar devuelve datos normalizados (separados).
   - Cruza `event.marketIds` con el array `markets`.
   - Cruza `market.oddIds` con el array `odds`.
   - Cruza `event.competitorIds` con el array `competitors`.
-- Consulta los ejemplos JSON en `PROJECT_BLUEPRINT.md` para ver la estructura exacta de cada endpoint (`GetLiveOverview`, `GetEventDetails`, etc.).
+- Consulta los ejemplos JSON en `PROJECT_BLUEPRINT.md` para ver la estructura exacta de cada endpoint.
+
+## 4.1 NORMALIZACIÓN (DESAFÍO PRINCIPAL)
+Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta lógica de Matcher:
+1.  **Nombres de Equipos (Fuzzy):** Usa Levenshtein distance y limpieza de strings. Altenar usa sufijos como `(F)` o `(Res.)`.
+2.  **Sincronización Temporal (Timezone):**
+    *   API-Sports = UTC-5.
+    *   Altenar = UTC (Zulu).
+    *   Regla: Si la hora coincide (+/- 20 min) tras ajustar timezone, asume match aunque los nombres no sean idénticos al 100%.
 
 ## 5. LÓGICA DE NEGOCIO Y MATEMÁTICAS
 - **Value Bets:** Compara siempre Probabilidad Implícita vs Probabilidad Real (sin Vig).

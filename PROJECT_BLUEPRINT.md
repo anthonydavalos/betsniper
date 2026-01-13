@@ -13,6 +13,13 @@
 * **Frontend:** React + Vite + TailwindCSS.
 * **Matemáticas:** Cálculo de Probabilidad Implícita, Valor Esperado (EV+) y Criterio de Kelly.
 
+## 1.1 FUENTES DE DATOS Y ARQUITECTURA (SDK REFERENCE)
+El archivo `altenarWSDK.js` ubicado en la raíz actúa como el mapa de microservicios de Altenar.
+**Endpoints Oficiales extraídos del SDK:**
+* **Data Core (Polling):** `https://sb2frontend-altenar2.biahosted.com/api/` (Usaremos este en Fase 1).
+* **Real-Time (Futuro):** `wss://sb2frontendwebsocket-altenar2-dev.biahosted.com` (WebSockets).
+* **Betting Gateway:** `https://sb2betgateway-altenar2.biahosted.com/api/` (Para futura automatización de apuestas).
+
 ---
 
 ## 2. ARQUITECTURA DE DATOS (DATABASE)
@@ -49,7 +56,7 @@ El sistema debe persistir datos para no gastar la cuota de 100 llamadas/día de 
 **Restricción:** Máximo 100 llamadas/día.
 
 **Estrategia:**
-1.  **Filtro Previo:** No solo consultar ligas TOP (Premier, LaLiga, Bundesliga, Serie A, Champions, Liga 1 Perú) sinó tambien las demas ya que puede haber oportunidad en las demas también.
+1.  **Filtro Ampliado:** No solo consultar ligas TOP (Premier, LaLiga, Bundesliga, Serie A, Champions, Liga 1 Perú) sino también ligas secundarias con liquidez, ya que ahí suelen estar las mayores ineficiencias (Value Bets).
 2.  **Batching:** Consultar `/fixtures` para los próximos 2 días.
 3.  **Extracción de Valor:** Para cada partido filtrado, llamar a `/odds?bookmaker=4` (Pinnacle).
 4.  **Matemática:**
@@ -97,19 +104,230 @@ Debes crear una instancia de axios (`client`) configurada para evitar bloqueos y
 
 La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normalizado. Debes implementar una función helper llamada `parseRelationalData(data)` que reconstruya los objetos.
 
-**Estructura del JSON recibido (Ejemplo):**
+**Estructura del JSON recibido (Ejemplo Genérico):**
 ```json
 {
-  "events": [
-    { "id": 14967576, "name": "Equipo A vs Equipo B", "marketIds": [1342240087, ...], "score": [1, 0], "liveTime": "13'" }
-  ],
-  "markets": [
-    { "id": 1342240087, "name": "1x2", "typeId": 1, "oddIds": [3322312241, 3322312242, 3322312243] }
-  ],
-  "odds": [
-    { "id": 3322312241, "typeId": 1, "price": 4.20 },
-    { "id": 3322312242, "typeId": 2, "price": 3.75 },
-    { "id": 3322312243, "typeId": 3, "price": 1.68 }
+  "get": "fixtures",
+  "parameters": {
+    "date": "2026-01-13"
+  },
+  "errors": [],
+  "results": 3,
+  "paging": {
+    "current": 1,
+    "total": 1
+  },
+  "response": [
+    {
+      "fixture": {
+        "id": 1493277,
+        "referee": null,
+        "timezone": "UTC",
+        "date": "2026-01-13T00:00:00+00:00",
+        "timestamp": 1768262400,
+        "periods": {
+          "first": 1768262400,
+          "second": 1768266000
+        },
+        "venue": {
+          "id": null,
+          "name": null,
+          "city": "Toluca"
+        },
+        "status": {
+          "long": "Match Finished",
+          "short": "FT",
+          "elapsed": 90,
+          "extra": 8
+        }
+      },
+      "league": {
+        "id": 673,
+        "name": "Liga MX Femenil",
+        "country": "Mexico",
+        "logo": "https://media.api-sports.io/football/leagues/673.png",
+        "flag": "https://media.api-sports.io/flags/mx.svg",
+        "season": 2025,
+        "round": "Clausura - 2",
+        "standings": true
+      },
+      "teams": {
+        "home": {
+          "id": 14885,
+          "name": "Toluca W",
+          "logo": "https://media.api-sports.io/football/teams/14885.png",
+          "winner": true
+        },
+        "away": {
+          "id": 14873,
+          "name": "Atlas W",
+          "logo": "https://media.api-sports.io/football/teams/14873.png",
+          "winner": false
+        }
+      },
+      "goals": {
+        "home": 2,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 0,
+          "away": 0
+        },
+        "fulltime": {
+          "home": 2,
+          "away": 0
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture": {
+        "id": 1500782,
+        "referee": null,
+        "timezone": "UTC",
+        "date": "2026-01-13T00:00:00+00:00",
+        "timestamp": 1768262400,
+        "periods": {
+          "first": 1768262400,
+          "second": 1768266000
+        },
+        "venue": {
+          "id": null,
+          "name": "Arena da Amazonia",
+          "city": "Manaus"
+        },
+        "status": {
+          "long": "Match Finished",
+          "short": "FT",
+          "elapsed": 90,
+          "extra": 7
+        }
+      },
+      "league": {
+        "id": 522,
+        "name": "Amazonense",
+        "country": "Brazil",
+        "logo": "https://media.api-sports.io/football/leagues/522.png",
+        "flag": "https://media.api-sports.io/flags/br.svg",
+        "season": 2026,
+        "round": "Regular Season - 1",
+        "standings": true
+      },
+      "teams": {
+        "home": {
+          "id": 2214,
+          "name": "Manaus FC",
+          "logo": "https://media.api-sports.io/football/teams/2214.png",
+          "winner": true
+        },
+        "away": {
+          "id": 20724,
+          "name": "Parintins",
+          "logo": "https://media.api-sports.io/football/teams/20724.png",
+          "winner": false
+        }
+      },
+      "goals": {
+        "home": 1,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 0,
+          "away": 0
+        },
+        "fulltime": {
+          "home": 1,
+          "away": 0
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    },
+    {
+      "fixture": {
+        "id": 1436039,
+        "referee": "Sami Ahmed Al-Jurays, Saudi Arabia",
+        "timezone": "UTC",
+        "date": "2026-01-13T15:25:00+00:00",
+        "timestamp": 1768317900,
+        "periods": {
+          "first": 1768317900,
+          "second": null
+        },
+        "venue": {
+          "id": 12238,
+          "name": "Prince Hathloul bin Abdul Aziz Sports City",
+          "city": "Najran"
+        },
+        "status": {
+          "long": "Halftime",
+          "short": "HT",
+          "elapsed": 45,
+          "extra": 2
+        }
+      },
+      "league": {
+        "id": 307,
+        "name": "Pro League",
+        "country": "Saudi-Arabia",
+        "logo": "https://media.api-sports.io/football/leagues/307.png",
+        "flag": "https://media.api-sports.io/flags/sa.svg",
+        "season": 2025,
+        "round": "Regular Season - 15",
+        "standings": true
+      },
+      "teams": {
+        "home": {
+          "id": 2977,
+          "name": "Al Okhdood",
+          "logo": "https://media.api-sports.io/football/teams/2977.png",
+          "winner": null
+        },
+        "away": {
+          "id": 10509,
+          "name": "Al Kholood",
+          "logo": "https://media.api-sports.io/football/teams/10509.png",
+          "winner": null
+        }
+      },
+      "goals": {
+        "home": 0,
+        "away": 0
+      },
+      "score": {
+        "halftime": {
+          "home": 0,
+          "away": 0
+        },
+        "fulltime": {
+          "home": null,
+          "away": null
+        },
+        "extratime": {
+          "home": null,
+          "away": null
+        },
+        "penalty": {
+          "home": null,
+          "away": null
+        }
+      }
+    }
   ]
 }
 ```
@@ -129,6 +347,23 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 * **Endpoint:** `/GetUpcoming`
 * **Params:** `eventCount={limit}`
 
+#### 1. Implementación del Motor de Coincidencias (Matcher)
+El principal desafío aquí es la normalización de dos factores críticos:
+
+1.  **Nombres de Equipos (Fuzzy Logic):**
+    *   La primera API usa nombres más limpios o en inglés, mientras que Altenar a veces usa abreviaturas, sufijos como `(F)` para femenino, `(Res.)` para reservas, o transliteraciones distintas (ej. `Al-Orobah` vs `Al Orubah`).
+    *   **Lógica del Matcher:**
+        1.  Toma un partido de Pinnacle (Reference).
+        2.  Busca en la lista de Altenar SOLO los partidos que empiecen a la misma hora (+/- 20 min).
+        3.  Aplica normalización (eliminar acentos, lowercase) + Levenshtein Distance para encontrar el par correcto.
+        4.  Si hay match y EV+, genera la alerta.
+
+2.  **Normalización de Tiempo (Timezone):**
+    *   **API-Sports:** Viene en UTC-5 (Offset verificable `-05:00`).
+    *   **Altenar:** Viene en UTC (Hora Zulu `Z`).
+    *   **Diferencia:** 5 horas (Ej: 14:30 en API-Sports son las 19:30 en Altenar).
+    *   **Validación:** Si los nombres no son exactos "string-to-string" pero la hora coincide tras normalizar el timezone, y las cuotas están en un rango lógico (diferencia < 10%), asume que es el mismo partido.
+
 #### B. getLiveMatches()
 * **Endpoint:** `/GetLivenow`
 * **Params:** `eventCount=50` (Traer suficientes para escanear)
@@ -141,14 +376,13 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 * **Objetivo:** Obtener los eventos destacados para la Home.
 * **Endpoint:** `/GetTopEvents`
 * **Configuración Axios:** Params: `culture=es-ES`, `integration=doradobet`, `countryCode=PE`, `numFormat=en-GB`, `timezoneOffset=300`.
-* **Estructura JSON (Relacional):** Recibes arrays separados: `events`, `markets`, `odds`, `competitors`.
 * **Lógica de Negocio:**
     1.  Crea un Map de `competitors` por ID para obtener nombres de equipos rápido.
-    2.  Itera `events`. Cada evento tiene `marketIds`.
-    3.  Busca SOLO el mercado "1x2" (Ganador del partido) dentro de los `markets` disponibles para mostrar la cuota principal en la tarjeta del evento.
+    2.  Itera `events`.
+    3.  Busca SOLO el mercado "1x2" dentro de los `markets` disponibles.
     4.  Devuelve un array limpio: `[{ id, name, leagueName, homeTeam, awayTeam, date, odds: { 1: X, X: Y, 2: Z } }]`.
 
-*Estructura del JSON recibido (Estructura simplificada manteniendo un elementode ejemplo):*
+*Estructura del JSON recibido (Ejemplo simplificado):*
 ```json
 {
   "markets": [
@@ -287,12 +521,9 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 * **Params Extra:** `deviceType=1` (Desktop).
 * **Análisis JSON:**
     * El objeto `event` tiene la propiedad `hasStream: true`.
-    * `streamProvider`: Indica la fuente (ID entero).
-* **Acción:**
-    * Esta función debe devolver solo una lista de IDs de eventos: `[15226765, 15226809, ...]`.
-    * Usaremos esta lista para poner un icono de "TV" o "LIVE" en tu interfaz.
+* **Acción:** Devuelve lista de IDs de eventos: `[15226765, 15226809]`.
 
-*Estructura del JSON recibido (Estructura simplificada manteniendo un elementode ejemplo):*
+*Estructura del JSON recibido:*
 ```json
 {
   "events": [
@@ -382,14 +613,9 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 **MÓDULO: SOCIAL PROOF (GetPopularBets)**
 * **Objetivo:** Mostrar las apuestas más calientes del momento.
 * **Endpoint:** `/GetPopularBets`
-* **Estructura Crítica:**
-    * La API devuelve `markets` específicos que están siendo muy apostados.
-    * NO devuelve todos los mercados del evento, solo el "Popular".
-* **Lógica:**
-    1.  Extraer el evento y el mercado específico asociado.
-    2.  Mostrar: "En el partido X, la gente está apostando a [Mercado Y - Cuota Z]".
+* **Lógica:** Extraer el evento y el mercado específico asociado (Solo devuelve el mercado popular, no todos).
 
-*Estructura del JSON recibido (Estructura simplificada manteniendo un elementode ejemplo):*
+*Estructura del JSON recibido:*
 ```json
 {
   "markets": [
@@ -518,16 +744,12 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 * **Objetivo:** Escaneo masivo de partidos en vivo para detectar oportunidades.
 * **Endpoint:** `/GetLiveOverview`
 * **Params:** `sportId=66` (Fútbol), `categoryId=0` (Mundo).
-* **Procesamiento de Datos (Vital para el Bot):**
-    1.  **LiveTime:** El campo viene como string (ej: "35\'"). Debes eliminar la comilla y convertir a Entero para cálculos matemáticos.
-    2.  **Score:** Viene como array `[Local, Visita]` (ej: `[2, 0]`).
-    3.  **Mapeo Relacional:**
-        * Cruza `event.marketIds` con el array `markets`.
-        * Busca mercados de "Línea de Gol" (Over/Under) y "Hándicap".
-* **Salida Esperada:** Objeto optimizado para análisis algorítmico:
-    `{ matchId, time: 35, score: "2-0", markets: { over25: 1.80, under25: 1.90 } }`
+* **Procesamiento de Datos:**
+    1.  **LiveTime:** Convertir string "35'" a entero.
+    2.  **Score:** Viene como array `[1, 0]`.
+    3.  **Mapeo:** Cruzar markets para buscar líneas de gol y hándicap.
 
-*Estructura del JSON recibido (Estructura simplificada manteniendo un elementode ejemplo):*
+*Estructura del JSON recibido:*
 ```json
 {
   "liveSports": [
@@ -682,12 +904,9 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 **MÓDULO: NAVIGATION (GetFavouritesChamps)**
 * **Objetivo:** Obtener estructura de ligas top.
 * **Endpoint:** `/GetFavouritesChamps`
-* **Lógica:**
-    * Recibes `champs` (Ligas) y `categories` (Países).
-    * Agrupa las Ligas por `iso` (Código de país) o `iconName`.
-    * Retorna un árbol de navegación: `País -> Lista de Ligas`.
+* **Lógica:** Agrupar `champs` (Ligas) usando `categories` (Países).
 
-*Estructura del JSON recibido (Estructura simplificada manteniendo un elementode ejemplo):*
+*Estructura del JSON recibido:*
 ```json
 {
   "champs": [
@@ -748,12 +967,9 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 * **Objetivo:** Actualización ultrarápida de marcador y tiempo.
 * **Endpoint:** `/GetEventTrackerInfo`
 * **Params:** `eventId={id}`.
-* **Uso Estratégico:**
-    * NO trae cuotas (Odds). Solo estado del partido.
-    * Úsala en un `setInterval` corto (3s) para detectar Goles o Tarjetas Rojas (campo `rc: true/false`).
-    * Si detectas cambio de marcador aquí, dispara una llamada a `GetEventDetails` para ver cómo cambiaron las cuotas.
+* **Uso:** `setInterval` corto (3s). Verificar `rc` (Red Card) y cambios en `score`.
 
-*Estructura del JSON recibido (Estructura simplificada manteniendo un elementode ejemplo):*
+*Estructura del JSON recibido:*
 ```json
 {
   "events": [
@@ -827,19 +1043,10 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 * **Objetivo:** Obtener data profunda para cálculo de probabilidades.
 * **Endpoint:** `/GetEventDetails`
 * **Params:** `eventId={id}`.
-* **Estructura Compleja (MarketGroups):**
-    * La respuesta trae `marketGroups` (Pestañas: Principal, Corners, Tarjetas, Minutos).
-    * Debes implementar una función `findMarketByGroup(groupName, marketName)`.
-* **Extracción de Estadísticas Implícitas:**
-    * Altenar no siempre da "5 corners". Da el mercado "Total Corners Más de 5.5".
-    * **Algoritmo de Inferencia:** Si el mercado activo es "Más de 9.5 corners" (cuota ~1.8), puedes inferir que actualmente hay aprox. 9 corners.
-    * Busca IDs de mercados `typeId`:
-        * `166`: Total Corners.
-        * `172`: Corners Par/Impar.
-        * `10`: Doble Oportunidad (para ver cobertura).
-* **Salida:** Objeto completo del partido para la vista de detalle.
+* **Estructura Compleja (MarketGroups):** Implementar `findMarketByGroup`.
+* **Inferencia de Stats:** Si el mercado de Corners activo es "Más de 9.5", inferir que hay 9 corners.
 
-*Estructura del JSON recibido (Estructura simplificada manteniendo 2 ó 3 elementode ejemplo):*
+*Estructura del JSON recibido:*
 ```json
 {
   "id": 14967576,
@@ -1012,10 +1219,10 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 **MÓDULO: CONTEXT (GetBreadcrumbEvents)**
 * **Objetivo:** Navegación cruzada y partidos relacionados.
 * **Endpoint:** `/GetBreadcrumbEvents`
-* **Params:** `champId={id}`, `isLive=false` (para ver próximos), `isLive=true` (para ver otros en vivo de la misma liga).
-* **Uso:** Muestra una lista "Otros partidos de la Liga 1 Perú" debajo del partido actual.
+* **Params:** `champId={id}`, `isLive=true/false`.
+* **Uso:** "Otros partidos de la Liga".
 
-*Sin el parametro `isLive=true`:*
+*Estructura del JSON recibido:*
 ```json
 {
   "events": [
@@ -1109,17 +1316,16 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 Este módulo debe correr en un bucle (`setInterval`) inteligente.
 
 **Flujo de Trabajo:**
-
 1.  **Escaneo Ligero:** Llamar a `GetLiveOverview` (trae todos los partidos en vivo).
 2.  **Filtro "Trigger":**
     * ¿Está jugando un Favorito (según DB API-Sports o Cuota Pre-match < 1.50)?
     * ¿El Favorito va perdiendo por 1 gol?
     * ¿Tiempo de juego entre 15' y 70'?
 3.  **Análisis Profundo (Solo si pasa el filtro):**
-    * Llamar a `GetEventDetails` (Data pesada).
+    * Llamar a `GetEventDetails`.
     * Llamar a `GetEventTrackerInfo` (Verificar Tarjetas Rojas - `rc`).
     * Verificar Stats: ¿El favorito tiene posesión > 60% y Tiros a puerta > Rival?
-4.  **Señal de Entrada:** Si todo es SI -> Calcular Stake con Kelly Criterion -> **ALERTA**, Si es posible sonora.
+4.  **Señal de Entrada:** Si todo es SI -> Calcular Stake con Kelly Criterion -> **ALERTA**.
 
 ---
 
@@ -1131,9 +1337,7 @@ Implementar funciones puras en `mathUtils.js`:
 2.  **Fair Odds (Sin Vig):** Normalizar las probabilidades inversas de Pinnacle para que sumen 100%.
 3.  **Valor Esperado (EV):** $EV = (ProbabilidadReal \times CuotaDorado) - 1$
 4.  **Criterio de Kelly (Gestión de Bankroll):**
-
     $$F = \frac{p(b+1) - 1}{b}$$
-
     * Donde: $p$ = Probabilidad Real, $b$ = (Cuota - 1).
     * **Kelly Fraccional:** Usar siempre `Kelly * 0.25` para reducir volatilidad.
 
@@ -1144,8 +1348,9 @@ Implementar funciones puras en `mathUtils.js`:
 1.  **Dashboard Home:**
     * Sección "Value Bets (Pre-match)": Tabla comparativa (Cuota Real vs DoradoBet | EV% | Kelly Stake).
     * Sección "Live Snipes": Tarjetas de partidos en vivo que cumplen la condición de "Volteada".
-2.  **Filtros:** Toggle para ver "Solo con Streaming" (usando `GetStreamingEvents`).
+2.  **Filtros:** Toggle para ver "Solo con Streaming".
 3.  **Config:** Input para definir mi Bankroll actual.
+4.  **Estructura Monorepo:** Mantener `/client` (Frontend) separado de la raíz (Backend) para evitar conflictos de `node_modules`.
 
 ---
 
