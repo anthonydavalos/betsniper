@@ -45,6 +45,11 @@ const ingestAltenarPrematch = async () => {
     const cleanEvents = [];
 
     for (const event of events) {
+      // 🟢 FILTRO DE FECHAS (Solo próximos 2 días)
+      if (!event.startDate) continue;
+      const eventDate = new Date(event.startDate);
+      if (eventDate < now || eventDate > endDate) continue;
+
       // Extraer cuotas 1x2 usando la lógica que ya conocemos
       const odds1x2 = extract1x2Odds(event, marketsMap, oddsMap);
       

@@ -1,7 +1,7 @@
 # PROJECT BLUEPRINT: BetSniper V3 - Sistema de Arbitraje y Trading Deportivo
 
 **Rol:** Actúa como Arquitecto de Software Senior y Experto en Matemáticas Financieras (Trading).
-**Objetivo:** Construir una aplicación Full-Stack para detectar apuestas de valor (Value Bets) y oportunidades en vivo (Live Trading) cruzando datos de API-Sports (Pinnacle) y Altenar (DoradoBet).
+**Objetivo:** Construir una aplicación Full-Stack para detectar apuestas de valor (Value Bets) y oportunidades en vivo (Live Trading) cruzando datos de Pinnacle (Arcadia API) y Altenar (DoradoBet).
 
 ---
 
@@ -13,18 +13,15 @@
 * **Frontend:** React + Vite + TailwindCSS.
 * **Matemáticas:** Cálculo de Probabilidad Implícita, Valor Esperado (EV+) y Criterio de Kelly.
 
-## 1.1 FUENTES DE DATOS Y ARQUITECTURA (SDK REFERENCE)
-El archivo `altenarWSDK.js` ubicado en la raíz actúa como el mapa de microservicios de Altenar.
-**Endpoints Oficiales extraídos del SDK:**
-* **Data Core (Polling):** `https://sb2frontend-altenar2.biahosted.com/api/` (Usaremos este en Fase 1).
-* **Real-Time (Futuro):** `wss://sb2frontendwebsocket-altenar2-dev.biahosted.com` (WebSockets).
-* **Betting Gateway:** `https://sb2betgateway-altenar2.biahosted.com/api/` (Para futura automatización de apuestas).
+## 1.1 FUENTES DE DATOS Y ARQUITECTURA
+**1. Pinnacle (Real Odds):** API Arcadia (`guest.api.arcadia.pinnacle.com`). Fuente de la verdad para probabilidades reales.
+**2. Altenar (Soft Bookie):** API de DoradoBet (`sb2frontend-altenar2.biahosted.com`). Fuente para encontrar ineficiencias (Value Bets).
 
 ---
 
 ## 2. ARQUITECTURA DE DATOS (DATABASE)
 
-El sistema debe persistir datos para no gastar la cuota de 100 llamadas/día de API-Sports ni ser detectado por Altenar.
+El sistema debe persistir datos para minimizar peticiones y evitar bloqueos.
 
 **Estructura sugerida (`db.json`):**
 
@@ -34,16 +31,18 @@ El sistema debe persistir datos para no gastar la cuota de 100 llamadas/día de 
   "mappedTeams": { "Man City": "Manchester City" }, // Diccionario de normalización
   "upcomingMatches": [
     {
-      "id": "fixture_id_apisports",
+      "id": "pinnacle_match_id",
       "home": "Team A",
       "away": "Team B",
       "date": "ISO_DATE",
-      "league": "Premier League",
-      "pinnacleOdds": { "1": 1.5, "X": 4.0, "2": 6.5 },
-      "realProbabilities": { "home": 65.5, "draw": 20.0, "away": 14.5 },
-      "isAnalyzed": true
+      "league": { "name": "Premier League" },
+      "bookmaker": "Pinnacle",
+      "odds": { "home": 1.5, "draw": 4.0, "away": 6.5 },
+      "altenarId": 123456, // ID Enlazado
+      "altenarName": "Team A vs Team B"
     }
   ],
+  "altenarUpcoming": [], // Cache de eventos Altenar (ventana 48h)
   "liveTracking": [] // Partidos en seguimiento para estrategia "Volteada"
 }
 ```
@@ -52,17 +51,53 @@ El sistema debe persistir datos para no gastar la cuota de 100 llamadas/día de 
 
 ## 3. MÓDULOS DEL BACKEND (Lógica de Negocio)
 
-### MÓDULO A: "Source of Truth" (API-Sports)
-**Restricción:** Máximo 100 llamadas/día.
+### MÓDULO A: "Source of Truth" (Pinnacle Arcadia)
+**Endpoint:** `guest.api.arcadia.pinnacle.com/0.1` (Guest API Unofficial).
+**Restricción:** Usar Headers/Cookies de "Invitado" y throttling para no ser bloqueado por WAF.
 
-**Estrategia:**
-1.  **Filtro Ampliado:** No solo consultar ligas TOP (Premier, LaLiga, Bundesliga, Serie A, Champions, Liga 1 Perú) sino también ligas secundarias con liquidez, ya que ahí suelen estar las mayores ineficiencias (Value Bets).
-2.  **Batching:** Consultar `/fixtures` para los próximos 2 días.
-3.  **Extracción de Valor:** Para cada partido filtrado, llamar a `/odds?bookmaker=4` (Pinnacle).
+**Estrategia (Implementada en `ingest-pinnacle.js`):**
+1.  **Discovery:** Consultar `/sports/29/leagues?hasMatchups=true` para obtener ligas activas.
+2.  **Filtrado Inteligente:**
+    *   Obtener matchups por liga: `/leagues/{id}/matchups`.
+    *   **Filtro en Memoria:** Descartar partidos más allá de 48h para reducir volumen.
+3.  **Extracción de Cuotas:**
+    *   Para cada partido filtrado, llamar a `/matchups/{id}/markets/related/straight`.
+    *   Detectar mercado "Moneyline" (`s;0;m`).
+    *   Convertir cuotas Americanas a Decimales.
 4.  **Matemática:**
-    * Calcular el margen de la casa (Vig) de Pinnacle.
-    * Eliminar el Vig para obtener la Probabilidad Real (Fair Odds).
-    * Guardar en DB.
+    *   Guardar Odds crudas en DB.
+    *   El Scanner calculará la Probabilidad Real (Fair Odds) eliminando el Vig al vuelo.
+
+#### Estructura de Datos (Arcadia)
+
+**Matchups Response (`/leagues/{id}/matchups`):**
+```json
+[
+  {
+    "id": 1599583,
+    "type": "matchup",
+    "startTime": "2026-05-15T14:00:00Z",
+    "participants": [
+      { "name": "Team Home", "alignment": "home" },
+      { "name": "Team Away", "alignment": "away" }
+    ],
+    "leagues": [ { "id": 29, "name": "Premier League" } ]
+  }
+]
+```
+
+**Odds Response (`/matchups/{id}/markets/related/straight`):**
+```json
+[
+  {
+    "key": "s;0;m", // Moneyline
+    "prices": [
+      { "designation": "home", "price": -150 }, // American Odds
+      { "designation": "away", "price": 130 }
+    ]
+  }
+]
+```
 
 ### MÓDULO B: "The Opportunity" (Altenar Wrapper)
 
@@ -76,7 +111,7 @@ Todas las peticiones a `sb2frontend-altenar2.biahosted.com` deben usar:
 
 #### 1. Implementación de Endpoints
 
-* **GetUpcoming:** Cruzar con la DB de API-Sports. Si `Cuota DoradoBet > (1 / ProbabilidadReal)`, alerta **VALUE BET**.
+* **GetUpcoming:** Cruzar con la DB de Pinnacle Arcadia. Si `Cuota DoradoBet > (1 / ProbabilidadReal)`, alerta **VALUE BET**.
 * **GetTopEvents & GetPopularBets:** Para identificar liquidez y partidos relevantes.
 * **GetStreamingEvents:** Prioridad alta. Si hay video, la data es más rápida.
 * **GetFavouritesChamps:** Para generar menú de navegación.
@@ -104,230 +139,32 @@ Debes crear una instancia de axios (`client`) configurada para evitar bloqueos y
 
 La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normalizado. Debes implementar una función helper llamada `parseRelationalData(data)` que reconstruya los objetos.
 
-**Estructura del JSON recibido (Ejemplo Genérico):**
+**Estructura del JSON recibido (Ejemplo Genérico - Relacional):**
 ```json
 {
-  "get": "fixtures",
-  "parameters": {
-    "date": "2026-01-13"
-  },
-  "errors": [],
-  "results": 3,
-  "paging": {
-    "current": 1,
-    "total": 1
-  },
-  "response": [
+  "events": [
     {
-      "fixture": {
-        "id": 1493277,
-        "referee": null,
-        "timezone": "UTC",
-        "date": "2026-01-13T00:00:00+00:00",
-        "timestamp": 1768262400,
-        "periods": {
-          "first": 1768262400,
-          "second": 1768266000
-        },
-        "venue": {
-          "id": null,
-          "name": null,
-          "city": "Toluca"
-        },
-        "status": {
-          "long": "Match Finished",
-          "short": "FT",
-          "elapsed": 90,
-          "extra": 8
-        }
-      },
-      "league": {
-        "id": 673,
-        "name": "Liga MX Femenil",
-        "country": "Mexico",
-        "logo": "https://media.api-sports.io/football/leagues/673.png",
-        "flag": "https://media.api-sports.io/flags/mx.svg",
-        "season": 2025,
-        "round": "Clausura - 2",
-        "standings": true
-      },
-      "teams": {
-        "home": {
-          "id": 14885,
-          "name": "Toluca W",
-          "logo": "https://media.api-sports.io/football/teams/14885.png",
-          "winner": true
-        },
-        "away": {
-          "id": 14873,
-          "name": "Atlas W",
-          "logo": "https://media.api-sports.io/football/teams/14873.png",
-          "winner": false
-        }
-      },
-      "goals": {
-        "home": 2,
-        "away": 0
-      },
-      "score": {
-        "halftime": {
-          "home": 0,
-          "away": 0
-        },
-        "fulltime": {
-          "home": 2,
-          "away": 0
-        },
-        "extratime": {
-          "home": null,
-          "away": null
-        },
-        "penalty": {
-          "home": null,
-          "away": null
-        }
-      }
-    },
-    {
-      "fixture": {
-        "id": 1500782,
-        "referee": null,
-        "timezone": "UTC",
-        "date": "2026-01-13T00:00:00+00:00",
-        "timestamp": 1768262400,
-        "periods": {
-          "first": 1768262400,
-          "second": 1768266000
-        },
-        "venue": {
-          "id": null,
-          "name": "Arena da Amazonia",
-          "city": "Manaus"
-        },
-        "status": {
-          "long": "Match Finished",
-          "short": "FT",
-          "elapsed": 90,
-          "extra": 7
-        }
-      },
-      "league": {
-        "id": 522,
-        "name": "Amazonense",
-        "country": "Brazil",
-        "logo": "https://media.api-sports.io/football/leagues/522.png",
-        "flag": "https://media.api-sports.io/flags/br.svg",
-        "season": 2026,
-        "round": "Regular Season - 1",
-        "standings": true
-      },
-      "teams": {
-        "home": {
-          "id": 2214,
-          "name": "Manaus FC",
-          "logo": "https://media.api-sports.io/football/teams/2214.png",
-          "winner": true
-        },
-        "away": {
-          "id": 20724,
-          "name": "Parintins",
-          "logo": "https://media.api-sports.io/football/teams/20724.png",
-          "winner": false
-        }
-      },
-      "goals": {
-        "home": 1,
-        "away": 0
-      },
-      "score": {
-        "halftime": {
-          "home": 0,
-          "away": 0
-        },
-        "fulltime": {
-          "home": 1,
-          "away": 0
-        },
-        "extratime": {
-          "home": null,
-          "away": null
-        },
-        "penalty": {
-          "home": null,
-          "away": null
-        }
-      }
-    },
-    {
-      "fixture": {
-        "id": 1436039,
-        "referee": "Sami Ahmed Al-Jurays, Saudi Arabia",
-        "timezone": "UTC",
-        "date": "2026-01-13T15:25:00+00:00",
-        "timestamp": 1768317900,
-        "periods": {
-          "first": 1768317900,
-          "second": null
-        },
-        "venue": {
-          "id": 12238,
-          "name": "Prince Hathloul bin Abdul Aziz Sports City",
-          "city": "Najran"
-        },
-        "status": {
-          "long": "Halftime",
-          "short": "HT",
-          "elapsed": 45,
-          "extra": 2
-        }
-      },
-      "league": {
-        "id": 307,
-        "name": "Pro League",
-        "country": "Saudi-Arabia",
-        "logo": "https://media.api-sports.io/football/leagues/307.png",
-        "flag": "https://media.api-sports.io/flags/sa.svg",
-        "season": 2025,
-        "round": "Regular Season - 15",
-        "standings": true
-      },
-      "teams": {
-        "home": {
-          "id": 2977,
-          "name": "Al Okhdood",
-          "logo": "https://media.api-sports.io/football/teams/2977.png",
-          "winner": null
-        },
-        "away": {
-          "id": 10509,
-          "name": "Al Kholood",
-          "logo": "https://media.api-sports.io/football/teams/10509.png",
-          "winner": null
-        }
-      },
-      "goals": {
-        "home": 0,
-        "away": 0
-      },
-      "score": {
-        "halftime": {
-          "home": 0,
-          "away": 0
-        },
-        "fulltime": {
-          "home": null,
-          "away": null
-        },
-        "extratime": {
-          "home": null,
-          "away": null
-        },
-        "penalty": {
-          "home": null,
-          "away": null
-        }
-      }
+      "id": 1001,
+      "name": "Team A vs Team B",
+      "marketIds": [ 2005 ],
+      "competitorIds": [ 3001, 3002 ]
     }
+  ],
+  "markets": [
+    {
+      "id": 2005,
+      "name": "1x2",
+      "oddIds": [ 4001, 4002, 4003 ]
+    }
+  ],
+  "odds": [
+    { "id": 4001, "name": "1", "price": 2.50 },
+    { "id": 4002, "name": "X", "price": 3.10 },
+    { "id": 4003, "name": "2", "price": 2.80 }
+  ],
+  "competitors": [
+    { "id": 3001, "name": "Team A" },
+    { "id": 3002, "name": "Team B" }
   ]
 }
 ```
@@ -1312,13 +1149,13 @@ El principal desafío aquí es la normalización de dos factores críticos:
 }
 ```
 
-### MÓDULO C: "The Sniper" (Live Strategy - La Volteada)
+#### C. "The Sniper" (Live Strategy - La Volteada)
 Este módulo debe correr en un bucle (`setInterval`) inteligente.
 
 **Flujo de Trabajo:**
 1.  **Escaneo Ligero:** Llamar a `GetLiveOverview` (trae todos los partidos en vivo).
 2.  **Filtro "Trigger":**
-    * ¿Está jugando un Favorito (según DB API-Sports o Cuota Pre-match < 1.50)?
+    * ¿Está jugando un Favorito (según DB Pinnacle, o Cuota Pre-match < 1.50)?
     * ¿El Favorito va perdiendo por 1 gol?
     * ¿Tiempo de juego entre 15' y 70'?
 3.  **Análisis Profundo (Solo si pasa el filtro):**
@@ -1357,7 +1194,7 @@ Implementar funciones puras en `mathUtils.js`:
 ## 6. PLAN DE EJECUCIÓN (Fases para Copilot)
 
 * **FASE 1:** Configurar servidor Express, Axios Instance con Headers Altenar y Conexión a lowdb.
-* **FASE 2:** Crear script `ingest.js` para consumir API-Sports (Pinnacle) y guardar Probabilidades Reales en DB.
+* **FASE 2:** Crear script `ingest-pinnacle.js` para consumir Pinnacle Arcadia API y guardar Probabilidades Reales en DB.
 * **FASE 3:** Implementar `GetLiveOverview` y lógica de "La Volteada" cruzando datos en tiempo real.
 * **FASE 4:** Implementar cálculo de Kelly y EV en el backend.
 * **FASE 5:** Construir el Frontend en React que consuma `GET /api/opportunities`.

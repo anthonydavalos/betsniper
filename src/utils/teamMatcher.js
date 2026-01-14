@@ -35,7 +35,19 @@ const TEAM_ALIASES = {
     "sparta rotterdam": "sparta de roterdam",
     "sparta de roterdam": "sparta rotterdam",
     "bragantino": "rb bragantino",
-    "rb bragantino": "bragantino"
+    "rb bragantino": "bragantino",
+    "sporting cp": "sporting lisboa",
+    "sporting lisboa": "sporting cp",
+    "inter de limeira": "internacional limeira", 
+    "internacional limeira": "inter de limeira",
+    "sao jose ec sp": "sao jose",
+    "sao jose": "sao jose ec sp",
+    "deportes concepcion": "d. concepcion",
+    "d. concepcion": "deportes concepcion",
+    "centro sportivo alagoano": "csa",
+    "csa": "centro sportivo alagoano",
+    "coquimbo unido": "coquimbo",
+    "coquimbo": "coquimbo unido"
 };
   
   /**
@@ -99,7 +111,7 @@ const TEAM_ALIASES = {
     return (longer.length - levenshteinDistance(s1, s2)) / longer.length;
   };
   
-  export const isTimeMatch = (dateStr1, dateStr2, toleranceMinutes = 20) => {
+  export const isTimeMatch = (dateStr1, dateStr2, toleranceMinutes = 1440) => { // Tolerancia ampliada a 24h (1440 min)
     const d1 = new Date(dateStr1).getTime();
     const d2 = new Date(dateStr2).getTime();
     const diffMs = Math.abs(d1 - d2);
