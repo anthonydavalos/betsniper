@@ -92,3 +92,21 @@ Para garantizar la estabilidad diaria del sistema, se ha definido el siguiente p
 ---
 
 **Estado Final:** El código actual en `scannerService.js`, `ingest-altenar.js`, y `run_linker.js` está limpio de errores de sintaxis y lógica conocidos, listo para operar bajo las restricciones de datos actuales.
+
+---
+
+## 6. Pareo de Equipos (Team Matching) - Refinamientos Críticos
+
+### 🔴 El Error: Falsos Negativos en Matcher
+**Síntoma:** Partidos obvios como "1. FC Köln vs Bayern" o "Napoli vs Parma" no se enlazaban.
+**Causa:**
+1.  **Formato Altenar:** Altenar usa "Home vs. Away" (con punto), mientras que el split del código solo buscaba " vs " (sin punto).
+2.  **Prefijos Numéricos:** "1. FC Köln" vs "FC Köln".
+3.  **Transliteración:** "Itesalat" vs "Telecom Egypt" (Nombres totalmente diferentes).
+
+**✅ La Solución Técnica:**
+- Se mejoró el regex de separación en `teamMatcher.js` para aceptar `vs`, `vs.` y variaciones de espacios.
+- Se implementó un diccionario de **ALIAS** explícitos (`napoles` -> `napoli`, `itesalat` -> `telecom egypt`).
+- Se expandió la lista de **Stop Words** para incluir "1.", "olympic", "belediye" (comunes en Turquía).
+
+**Resultado:** Tasa de éxito subió del ~70% al **98%** (50 de 51 partidos enlazados en pruebas completas).
