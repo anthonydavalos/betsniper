@@ -2,6 +2,9 @@ import db, { initDB } from '../src/db/database.js';
 import apiSportsHelper from '../src/services/apiSportsService.js';
 import { calculateFairProbabilities } from '../src/utils/mathUtils.js';
 
+// Helper para delay
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Fecha helper (YYYY-MM-DD)
 const getDateString = (daysOffset = 0) => {
   const date = new Date();
@@ -15,13 +18,12 @@ const ingestData = async () => {
 
   // 1. Verificar Cuota
   const status = await apiSportsHelper.getQuotaStatus();
-  if (status) {
-    const { current, limit } = status.response.requests;
-    console.log(`📊 Estado de Cuota API: ${current}/${limit} llamadas usadas hoy.`);
-    if (current >= limit) {
-      console.error('⛔ Límite de API alcanzado. Abortando ingesta.');
-      return;
-    }
+  
+  let requestBalance = 90; // Valor seguro por defecto
+  // Actualizar saldo real si tenemos info
+  if (status && status.response && status.response.requests) {
+      requestBalance = status.response.requests.limit_day - status.response.requests.current;
+      console.log(`💰 Saldo API disponible: ~${requestBalance} llamadas.`);
   }
 
   // 2. Definir fechas (Hoy y Mañana)
@@ -29,19 +31,35 @@ const ingestData = async () => {
   const allEnrichedMatches = [];
 
   for (const date of dates) {
+    if (requestBalance < 3) {
+        console.warn('⛔ Saldo API crítico. Deteniendo procesamiento de fechas.');
+        break;
+    }
+
     console.log(`\n📅 Procesando fecha: ${date}`);
     
     // 2.1 Obtener Fixtures (Partidos)
-    // Esto trae toda la metadata: Nombres de equipos, liga, hora exacta.
     const fixtures = await apiSportsHelper.getFixturesByDate(date);
+    requestBalance--; 
     console.log(`   ✅ Fixtures encontrados: ${fixtures.length}`);
 
     if (fixtures.length === 0) continue;
 
-    // 2.2 Obtener Pinnacle Odds
-    // Esto trae las cuotas de valor.
+    // 2.2 ESTRATEGIA GLOBAL (FREE PLAN): Pedir Odds Globales (Limitado a 3 páginas)
+    // apiSportsHelper manejará la paginación y parará suavemente en la página 3.
     const oddsData = await apiSportsHelper.getPinnacleOddsByDate(date);
     console.log(`   ✅ Odds (Pinnacle) encontrados: ${oddsData.length} bloques`);
+
+    /*
+    // ESTRATEGIA OPTIMIZADA (FREE PLAN): Odds POR LIGA + THROTTLING - DESACTIVADA
+    // Razón: El plan gratuito bloquea el acceso a "current season" cuando se pide por liga específica.
+    
+    // Agrupar IDs de Ligas, contar partidos y capturar SEASON
+    const leaguesInfo = new Map();
+    // ... codigo removido para limpieza ...
+    */
+
+    console.log(`   ✅ Odds (Pinnacle) recolectados: ${oddsData.length} bloques totales.`);
 
     // 2.3 Cruzar Data (Fixture + Odds)
     console.log('   🔄 Cruzando datos y calculando Fair Odds...');

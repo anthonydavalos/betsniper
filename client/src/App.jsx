@@ -7,6 +7,7 @@ const API_URL = 'http://localhost:3000/api/opportunities';
 
 function App() {
   const [prematchOps, setPrematchOps] = useState([])
+  const [liveOps, setLiveOps] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [bankroll, setBankroll] = useState(1000)
@@ -23,14 +24,18 @@ function App() {
     });
   }
 
-  const fetchPrematch = async () => {
+  const fetchAll = async () => {
     setLoading(true)
     setError(null)
     try {
-      const res = await axios.get(`${API_URL}/prematch`)
-      // La data ya viene procesada, pero podríamos necesitar recalcular stakes si el usuario cambia el bankroll
-      // En este caso simple, usaremos la data tal cual y recalcularemos en render o en un useEffect dependencia
-      setPrematchOps(res.data.data) 
+      // 1. Fetch Prematch
+      const preRes = await axios.get(`${API_URL}/prematch`)
+      setPrematchOps(preRes.data.data) 
+      
+      // 2. Fetch Live
+      const liveRes = await axios.get(`${API_URL}/live`)
+      setLiveOps(liveRes.data.data)
+
     } catch (err) {
       console.error(err)
       setError('Error conectando con el servidor BetSniper.')
@@ -40,11 +45,25 @@ function App() {
   }
 
   useEffect(() => {
-    fetchPrematch()
+    fetchAll()
+    
+    // Auto-refresh Live cada 30s
+    const interval = setInterval(() => {
+        axios.get(`${API_URL}/live`)
+            .then(res => setLiveOps(res.data.data))
+            .catch(console.error);
+    }, 30000);
+
+    return () => clearInterval(interval);
   }, [])
 
   // Derivamos los datos para renderizar (recalculando stakes si cambia el bankroll local)
-  const displayedOps = prematchOps.map(op => ({
+  const displayedPrematch = prematchOps.map(op => ({
+      ...op,
+      kellyStake: (bankroll * op.kellyPct) / 100
+  }));
+
+  const displayedLive = liveOps.map(op => ({
       ...op,
       kellyStake: (bankroll * op.kellyPct) / 100
   }));
@@ -92,14 +111,20 @@ function App() {
           </div>
         </div>
 
-        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-lg cursor-not-allowed opacity-60">
+        <div className={`bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-lg ${liveOps.length > 0 ? 'ring-2 ring-red-500/50' : ''}`}>
           <div className="flex justify-between items-start">
             <div>
-              <p className="text-slate-400 text-xs font-bold uppercase tracking-wider">Live Sniper (Pronto)</p>
-              <h3 className="text-3xl font-bold mt-1 text-slate-500">--</h3>
-              <p className="text-xs text-slate-600 mt-1">Esperando partidos en vivo...</p>
+              <p className="text-slate-400 text-xs font-bold uppercase tracking-wider flex items-center gap-2">
+                 Live Sniper 
+                 <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
+                 </span>
+              </p>
+              <h3 className="text-3xl font-bold mt-1 text-white">{liveOps.length}</h3>
+              <p className="text-xs text-slate-400 mt-1">Escaneando tiempo real...</p>
             </div>
-            <div className="p-3 bg-red-500/10 rounded-lg text-red-400">
+            <div className={`p-3 rounded-lg ${liveOps.length > 0 ? 'bg-red-500 text-white shadow-lg shadow-red-500/50 animate-pulse' : 'bg-red-500/10 text-red-400'}`}>
               <AlertTriangle size={24} />
             </div>
           </div>
@@ -115,13 +140,77 @@ function App() {
 
       {/* MAIN CONTENT Area */}
       <main>
+
+        {/* LIVE OPS SECTION */}
+        {displayedLive.length > 0 && (
+          <div className="mb-12 animate-fade-in-down">
+             <h2 className="text-xl font-bold flex items-center gap-2 mb-4 text-red-500 animate-pulse">
+                <AlertTriangle className="fill-red-500 text-slate-900" />
+                🔥 LIVE OPPORTUNITIES ({displayedLive.length})
+             </h2>
+             
+             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {displayedLive.map((op, idx) => (
+                    <div key={idx} className="bg-gradient-to-br from-slate-800 to-slate-900 border-2 border-red-500/50 rounded-xl p-5 shadow-2xl shadow-red-900/20 relative overflow-hidden group hover:scale-[1.02] transition-transform">
+                        {/* BADGE TIPO */}
+                        <div className="absolute top-0 right-0 bg-red-600 text-white text-[10px] uppercase font-bold px-3 py-1 rounded-bl-lg shadow-lg z-10">
+                            {op.type === 'LA_VOLTEADA' ? '🔄 LA VOLTEADA' : '⚡ LIVE VALUE'}
+                        </div>
+                        
+                        {/* HEADER MATCH */}
+                        <div className="mb-4 pr-16">
+                            <h3 className="text-lg font-bold text-white leading-tight">{op.match}</h3>
+                            <div className="flex items-center gap-2 mt-2 text-sm">
+                                <span className="bg-slate-700 text-slate-300 px-2 py-0.5 rounded text-xs font-bold">{op.league}</span>
+                                <span className="font-mono text-red-400 font-bold bg-red-900/20 px-2 rounded flex items-center gap-1">
+                                    ⏱ {op.time} <span className="text-slate-500">|</span> ⚽ {op.score}
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* METRICS GRID */}
+                        <div className="grid grid-cols-2 gap-3 mb-4">
+                            <div className="bg-slate-950/50 p-2 rounded border border-slate-700/50">
+                                <p className="text-[10px] text-slate-500 uppercase font-bold">Mercado</p>
+                                <p className="text-sm font-bold text-slate-200 truncate">{op.market}</p>
+                            </div>
+                            <div className="bg-emerald-900/10 p-2 rounded border border-emerald-500/20">
+                                <p className="text-[10px] text-emerald-500 uppercase font-bold">Cuota Actual</p>
+                                <p className="text-xl font-bold text-emerald-400 font-mono">{op.odd.toFixed(2)}</p>
+                            </div>
+                            <div className="bg-blue-900/10 p-2 rounded border border-blue-500/20">
+                                <p className="text-[10px] text-blue-500 uppercase font-bold">EV Estimado</p>
+                                <p className="text-lg font-bold text-blue-300">+{op.ev.toFixed(1)}%</p>
+                            </div> 
+                             <div className="bg-yellow-900/10 p-2 rounded border border-yellow-500/20">
+                                <p className="text-[10px] text-yellow-500 uppercase font-bold">Kelly Stake</p>
+                                <p className="text-lg font-bold text-yellow-300">${op.kellyStake.toFixed(1)}</p>
+                            </div> 
+                        </div>
+
+                        {/* ACTION */}
+                        <a 
+                          href="https://doradobet.com" 
+                          target="_blank" 
+                          rel="noreferrer"
+                          className="block w-full text-center bg-red-600 hover:bg-red-500 text-white font-bold py-2 rounded-lg transition-colors shadow-lg shadow-red-600/20"
+                        >
+                          APOSTAR AHORA
+                        </a>
+                    </div>
+                ))}
+             </div>
+          </div>
+        )}
+
+        {/* PREMATCH SECTION */}
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-xl font-semibold flex items-center gap-2">
             <span className="w-2 h-8 bg-emerald-500 rounded-full inline-block shadow-lg shadow-emerald-500/50"></span>
             Value Bets (Pre-Match)
           </h2>
           <button 
-            onClick={fetchPrematch}
+            onClick={fetchAll}
             disabled={loading}
             className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-sm px-4 py-2 rounded-lg transition-all border border-slate-600 hover:border-emerald-500/50 text-slate-300 hover:text-white"
           >
@@ -152,7 +241,7 @@ function App() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-700/50">
-                {displayedOps.length === 0 ? (
+                {displayedPrematch.length === 0 ? (
                   <tr>
                     <td colSpan="7" className="p-12 text-center text-slate-500 italic">
                       {loading ? (
@@ -163,38 +252,38 @@ function App() {
                     </td>
                   </tr>
                 ) : (
-                  displayedOps.map((op, idx) => (
+                  displayedPrematch.map((op, idx) => (
                     <tr key={idx} className="hover:bg-slate-700/30 transition-colors group">
                       <td className="p-4">
                         <div className="font-bold text-slate-200 text-lg">{op.match}</div>
                         <div className="text-xs text-slate-500 flex gap-2 items-center mt-1">
-                            <span className="bg-slate-700 px-1.5 py-0.5 rounded text-slate-300">{op.league}</span>
+                            <span className="bg-slate-700 px-1.5 py-0.5 rounded text-slate-300">{op.league || 'Liga Desconocida'}</span>
                             <span>•</span>
-                            <span>{new Date(op.date).toLocaleDateString()} {new Date(op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                            <span>{new Date(op.date || Date.now()).toLocaleDateString()} {new Date(op.date || Date.now()).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
                         </div>
                       </td>
                       <td className="p-4">
                         <span className="bg-slate-900 px-3 py-1.5 rounded-md text-xs font-mono font-bold text-slate-300 border border-slate-700">
-                          {op.market}
+                          {op.market || '1x2'}
                         </span>
                       </td>
                       <td className="p-4 text-right">
-                        <div className="font-mono text-slate-400">{(100 / op.realProb).toFixed(2)}</div>
-                        <div className="text-[10px] text-slate-600 font-bold">{op.realProb}%</div>
+                        <div className="font-mono text-slate-400">{(100 / (op.realProb || 1)).toFixed(2)}</div>
+                        <div className="text-[10px] text-slate-600 font-bold">{op.realProb || 0}%</div>
                       </td>
                       <td className="p-4 text-right bg-emerald-900/5 group-hover:bg-emerald-900/10 transition-colors">
                          <div className="font-mono text-emerald-400 font-bold text-2xl tracking-tighter shadow-emerald-500/20 drop-shadow-sm">
-                            {op.odd.toFixed(2)}
+                            {(op.odd || 0).toFixed(2)}
                          </div>
                       </td>
                       <td className="p-4 text-center">
                         <span className={`inline-block px-2 py-1 rounded font-bold text-xs border ${op.ev > 5 ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-300'}`}>
-                          +{op.ev.toFixed(2)}%
+                          +{(op.ev || 0).toFixed(2)}%
                         </span>
                       </td>
                       <td className="p-4 text-right">
-                        <div className="font-bold text-slate-100 text-lg">${op.kellyStake.toFixed(2)}</div>
-                        <div className="text-[10px] text-slate-500">{(op.kellyPct).toFixed(2)}% Bank</div>
+                        <div className="font-bold text-slate-100 text-lg">${(op.kellyStake || 0).toFixed(2)}</div>
+                        <div className="text-[10px] text-slate-500">{(op.kellyPct || 0).toFixed(2)}% Bank</div>
                       </td>
                       <td className="p-4 text-center">
                         <a 

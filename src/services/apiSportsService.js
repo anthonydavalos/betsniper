@@ -35,7 +35,14 @@ const fetchPaginatedData = async (endpoint, params = {}) => {
       });
 
       if (response.data.errors && Object.keys(response.data.errors).length > 0) {
-        console.error('❌ API-Sports Error:', response.data.errors);
+        // DETECCIÓN DE LÍMITE DE PAGINACIÓN (Free Plan)
+        const errors = response.data.errors;
+        if (errors.plan && errors.plan.includes('maximum value of 3')) {
+          console.warn(`⚠️ Límite de paginación (Page 3) alcanzado. Deteniendo fetch para este endpoint sin romper el flujo.`);
+          break; // Salimos del loop suavemente y devolvemos lo recolectado
+        }
+        
+        console.error('❌ API-Sports Error:', errors);
         throw new Error('API-Sports returned an error');
       }
 
@@ -83,16 +90,17 @@ export const getFixturesByDate = async (date) => {
 };
 
 export const getPinnacleOddsByDate = async (date) => {
-  // Este endpoint consume 1 llamada por página.
-  // Odds por fecha + bookmaker suele tener muchas páginas.
-  // ¡CUIDADO! Si hay 50 páginas, son 50 llamadas.
-  // Estrategia "Blueprint": Máximo 100 llamadas/día.
-  // Si pedimos Fixtures (1 llamada) + Odds (N llamadas), podríamos romperlo.
-  // Alternativa segura: Pedir Odds solo de las Ligas filtradas si son muchas?
-  // El usuario pidió "Todas las ligas".
-  // Vamos a intentarlo, pero logueando consumo.
   return fetchPaginatedData('/odds', {
     date: date,
+    bookmaker: PINNACLE_ID
+  });
+};
+
+export const getOddsByLeague = async (leagueId, date, season) => {
+  return fetchPaginatedData('/odds', {
+    league: leagueId,
+    date: date,
+    season: season, // Requerido cuando se filtra por liga
     bookmaker: PINNACLE_ID
   });
 };
@@ -109,5 +117,6 @@ export const getQuotaStatus = async () => {
 export default {
   getFixturesByDate,
   getPinnacleOddsByDate,
+  getOddsByLeague,
   getQuotaStatus
 };

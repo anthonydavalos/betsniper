@@ -1,19 +1,20 @@
 import express from 'express';
-import { scanLiveOpportunities } from '../services/scannerService.js';
+import { getCachedLiveOpportunities } from '../services/scannerService.js';
 import { scanPrematchOpportunities } from '../services/prematchScannerService.js';
 import db from '../db/database.js';
 
 const router = express.Router();
 
 // GET /api/opportunities/live
-// Retorna las oportunidades en vivo (Live Value)
+// Retorna las oportunidades en vivo (USA CACHÉ EN MEMORIA)
 router.get('/live', async (req, res) => {
   try {
-    const opportunities = await scanLiveOpportunities();
+    // Ya no invoca el escaneo real, sino que lee la memoria del worker
+    const result = getCachedLiveOpportunities();
     res.json({
-      timestamp: new Date().toISOString(),
-      count: opportunities.length,
-      data: opportunities
+      timestamp: result.timestamp || new Date().toISOString(),
+      count: result.data.length,
+      data: result.data
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

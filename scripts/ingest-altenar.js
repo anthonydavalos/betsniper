@@ -2,15 +2,29 @@ import altenarClient from '../src/config/axiosClient.js';
 import db, { initDB } from '../src/db/database.js';
 
 const ingestAltenarPrematch = async () => {
-  console.log('🚀 INICIANDO INGESTA PRE-MATCH ALTENAR (DoradoBet)...');
+  console.log('🚀 INICIANDO INGESTA MASIVA PRE-MATCH ALTENAR (DoradoBet)...');
   await initDB();
 
   try {
-    // 1. Obtener Próximos Partidos (Bloque Grande)
-    // Traemos 200 eventos para tener una buena cobertura de lo que hay en API-Sports
-    console.log('📡 Consultando API Altenar /GetUpcoming...');
+    // Calcular rango de fechas para coincidir con Pinnacle (Hoy + 2 días)
+    const now = new Date();
+    const endDate = new Date();
+    endDate.setDate(now.getDate() + 2); // 48 horas de ventana
+
+    console.log('📡 Consultando API Altenar /GetUpcoming (Massive Fetch)...');
+    
+    // PARAMS EXACTOS DEL APPS SCRIPT (Sin eventCount explicito si el default es masivo)
     const response = await altenarClient.get('/GetUpcoming', {
-      params: { eventCount: 100, sportId: 66 } 
+      params: { 
+          culture: 'es-ES',
+          timezoneOffset: 300,
+          integration: 'doradobet',
+          deviceType: 1,
+          numFormat: 'en-GB',
+          countryCode: 'PE',
+          sportId: 66
+          // eventCount REMOVIDO intencionalmente para probar el default behavior
+      } 
     });
 
     const events = response.data.events || [];

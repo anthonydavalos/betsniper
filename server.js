@@ -17,6 +17,11 @@ app.use(express.json());
 // Inicializar Base de Datos
 await initDB();
 
+// INICIALIZAR BACKGROUND WORKER (SCANNER)
+// Esto arranca el bucle infinito que consulta a Altenar cada ~30s
+import { startBackgroundScanner } from './src/services/scannerService.js';
+startBackgroundScanner();
+
 // Rutas de API
 import opportunitiesRouter from './src/routes/opportunities.js';
 app.use('/api/opportunities', opportunitiesRouter);

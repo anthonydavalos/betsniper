@@ -7,8 +7,8 @@
 const STOP_WORDS = [
     'fc', 'sc', 'sk', 'club', 'cd', 'cf', 
     'u20', 'u21', 'u23', 'u19',
-    '(f)', '(res.)', 'women', 'w', 'reserves',
-    'royal', 'real', 'sporting', 'athletic', 'atletico' // Opcional: A veces 'Real' distingue, pero en 'Real Madrid' vs 'Madrid' ayuda quitarlo.
+    '(f)', '(res.)', 'women', 'w', 'reserves'
+    // 'royal', 'real', 'sporting', 'athletic', 'atletico' -> COMENTADO POR SEGURIDAD (Evitar falsos positivos)
   ];
   
   /**
