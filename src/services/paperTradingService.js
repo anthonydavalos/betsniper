@@ -84,6 +84,9 @@ export const placeAutoBet = async (opportunity) => {
         createdAt: new Date().toISOString(), // Fecha de transacción
         matchDate: opportunity.date || null, // Fecha del partido (si disponible)
         eventId: opportunity.eventId, // ID Altenar para tracking robusto
+        sportId: opportunity.sportId,
+        catId: opportunity.catId,
+        champId: opportunity.champId,
         match: opportunity.match,
         league: opportunity.league,
         type: opportunity.type, 
@@ -107,7 +110,7 @@ export const placeAutoBet = async (opportunity) => {
     return newBet;
 };
 
-import { getEventDetails } from './liveScannerService.js';
+import { getEventDetails, getEventResult } from './liveScannerService.js';
 
 // ... (Resto del código)
 
@@ -242,8 +245,34 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
                              isFinished = true; 
                         } else {
                             // Si returns null, el evento ya no existe en Altenar (borrado post-partido)
-                            // Para Live Snipes, verificamos si 'temporalmente' ya tiene sentido que haya acabado.
-                            if (!bet.matchDate) { 
+
+                            // 1. Intentar resolver con API de Resultados (Zombie Fix)
+                            // Consultamos oficialmente si el partido terminó y tiene resultado final.
+                            if (bet.catId) {
+                                try {
+                                    const dateToCheck = bet.matchDate || bet.createdAt;
+                                    // sportId default 66 (Fútbol)
+                                    const rData = await getEventResult(bet.sportId || 66, bet.catId, dateToCheck);
+                                    
+                                    if (rData && rData.events) {
+                                        const found = rData.events.find(e => e.id === bet.eventId);
+                                        if (found) {
+                                            console.log(`✅ Zombie Match Resuelto (Results API): ${bet.match}`);
+                                            // Altenar Results trae score array [home, away]
+                                            if (found.score && found.score.length >= 2) {
+                                                finalScore = found.score;
+                                                bet.lastKnownScore = `${finalScore[0]}-${finalScore[1]}`;
+                                            }
+                                            isFinished = true;
+                                        }
+                                    }
+                                } catch (e) { 
+                                    console.error("Error check results", e.message); 
+                                }
+                            }
+
+                            // 2. Si aún no está resuelto, aplicar lógica de tiempo límite
+                            if (!isFinished && !bet.matchDate) { 
                                 let safeToClose = false;
                                 try {
                                     const timeVal = parseInt((bet.liveTime || "0").toString().replace("'", "")) || 0;

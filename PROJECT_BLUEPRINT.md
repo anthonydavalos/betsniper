@@ -1053,6 +1053,15 @@ El principal desafío aquí es la normalización de dos factores críticos:
 }
 ```
 
+**MÓDULO: RESULTS (GetEventResults)**
+* **Objetivo:** Obtener resultados oficiales de partidos finalizados (Solución Zombie Matches).
+* **Endpoint:** `/GetEventResults`
+* **BaseURL:** `https://sb2ris-altenar2.biahosted.com/api/WidgetResults`
+* **Params:** `sportId=66`, `categoryId={catId}`, `date={YYYY-MM-DD}`.
+* **Lógica:** 
+    * Altenar mueve los partidos finalizados a este endpoint y los borra del feed en vivo.
+    * Requiere tener guardado el `catId` (Categoría/País) del evento.
+
 **MÓDULO: CONTEXT (GetBreadcrumbEvents)**
 * **Objetivo:** Navegación cruzada y partidos relacionados.
 * **Endpoint:** `/GetBreadcrumbEvents`
@@ -1168,15 +1177,18 @@ Este módulo debe correr en un bucle (`setInterval`) inteligente.
 
 El sistema de Paper Trading debe gestionar de forma inteligente el ciclo de vida de la apuesta para evitar falsos negativos.
 
+**Requisito de Persistencia:**
+Al crear una apuesta, **GUARDAR OBLIGATORIAMENTE**: `sportId`, `catId`, `champId`. Son necesarios para buscar el resultado oficial si el partido se vuelve "Zombie".
+
 **Reglas de Cierre de Apuestas:**
 1.  **Pre-Match Safety:** Las apuestas Pre-Match tienen un bloqueo de **2.2 horas** desde el inicio oficial (`matchDate`). No se verifica el resultado antes de este tiempo para evitar errores durante el entretiempo.
 2.  **Live Snipes (Smart Settlement):**
     *   Si el evento desaparece del feed (`GetEventDetails` devuelve null):
-        *   **Check 1:** Si `liveTime` registrado era >= 90' → Liquidar inmediatamente como FINALIZADO usando `lastKnownScore`.
-        *   **Check 2:** Si `liveTime` < 90' → Calcular tiempo estimado (`liveTime` + tiempo real transcurrido).
-            *   Si estimado > 100' → Liquidar (Asumimos fin del partido).
-            *   Si estimado < 100' → Mantener en espera (Posible descanso o suspensión momentánea).
-    *   **Zombie Protocol:** Si tras 3 horas de creada la apuesta sigue viva sin data, forzar cierre para liberar recursos.
+        *   **Zombie Protocol (Prioritario):** Consultar endpoint `GetEventResults` usando el `catId` y la fecha. Si devuelve score final, liquidar inmediatamente.
+        *   **Time Fallback:** Si no hay resultado en API de Resultados:
+            *   Si `liveTime` registrado era >= 90' → Liquidar inmediatamente.
+            *   Si `liveTime` < 90' → Calcular tiempo estimado. Si > 100' → Liquidar.
+    *   **Deadman Switch:** Si tras 3 horas de creada la apuesta sigue viva sin data ni resultados, forzar cierre para liberar recursos.
 
 ---
 

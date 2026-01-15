@@ -39,6 +39,35 @@ export const getEventDetails = async (eventId) => {
 };
 
 /**
+ * Obtiene el resultado final de un evento desde el API de Resultados.
+ * Útil para partidos que ya no están en el feed en vivo (Zombie Matches).
+ */
+export const getEventResult = async (sportId, catId, dateISO) => {
+    try {
+         // Endpoint: https://sb2ris-altenar2.biahosted.com/api/WidgetResults/GetEventResults
+         const resultsBaseURL = 'https://sb2ris-altenar2.biahosted.com/api/WidgetResults';
+         
+         // Asegurar que la fecha esté en formato correcto (start of day often works best for filtering)
+         // El usuario usó: date=2026-01-15T00:00:00.000Z
+         // Si dateISO viene con hora, quizás cortarlo al día.
+         const dateParam = dateISO ? new Date(dateISO).toISOString().split('T')[0] + 'T00:00:00.000Z' : new Date().toISOString().split('T')[0] + 'T00:00:00.000Z';
+
+         const { data } = await altenarClient.get('/GetEventResults', {
+            baseURL: resultsBaseURL, 
+            params: {
+                sportId: sportId || 66,
+                categoryId: catId,
+                date: dateParam
+            }
+         });
+         return data;
+    } catch (error) {
+        console.error(`❌ Error en GetEventResult (Cat: ${catId}):`, error.message);
+        return null;
+    }
+};
+
+/**
  * Analiza el marcador para ver si cumple la condición de "Favorito Perdiendo".
  * @param {Object} liveEvent - Evento de Altenar
  * @param {Object} pinnacleMatch - Datos guardados de Pinnacle (Source of Truth)
@@ -136,6 +165,9 @@ export const scanLiveOpportunities = async () => {
                             eventId: event.id, // ID Vital para tracking
                             match: event.name,
                             league: pinMatch.league.name,
+                            sportId: event.sportId || 66,
+                            catId: event.catId || event.categoryId,
+                            champId: event.champId || event.championshipId,
                             time: event.liveTime,
                             score: condition.currentScore,
                             favorite: condition.favorite,

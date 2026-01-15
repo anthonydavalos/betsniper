@@ -55,7 +55,7 @@ Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta ló
 - **Protocolo de Liquidación (Settlement Logic):**
   - **Live Snipes:** Liquidación **INMEDIATA** si el evento desaparece del feed y `(Minuto >= 90 OR Tiempo Estimado > 100')`.
   - **Pre-Match:** Buffer de seguridad obligatorio de **2.2 horas** post-inicio antes de verificar resultados.
-  - **Zombie Bets:** Si `GetEventDetails` falla (evento borrado), usar `lastKnownScore` tras validar la regla de los 100 minutos.
+  - **Zombie Bets:** Si `GetEventDetails` falla (evento borrado), CONSULTAR SIEMPRE `GetEventResults` (API de Resultados) antes de aplicar reglas de tiempo. Si la API confirma fin, liquidar.
 
 ## 6. ESTILO DE CÓDIGO
 - Usa Español para comentarios explicativos, especialmente en la lógica financiera.
