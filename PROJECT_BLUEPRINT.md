@@ -1155,7 +1155,7 @@ Este módulo debe correr en un bucle (`setInterval`) inteligente.
 **Flujo de Trabajo:**
 1.  **Escaneo Ligero:** Llamar a `GetLiveOverview` (trae todos los partidos en vivo).
 2.  **Filtro "Trigger":**
-    * ¿Está jugando un Favorito (según DB Pinnacle, o Cuota Pre-match < 1.50)?
+    * ¿Está jugando un Favorito (según DB Pinnacle, o Cuota Pre-match < 1.80 / Prob > 55%)?
     * ¿El Favorito va perdiendo por 1 gol?
     * ¿Tiempo de juego entre 15' y 70'?
 3.  **Análisis Profundo (Solo si pasa el filtro):**
@@ -1163,6 +1163,20 @@ Este módulo debe correr en un bucle (`setInterval`) inteligente.
     * Llamar a `GetEventTrackerInfo` (Verificar Tarjetas Rojas - `rc`).
     * Verificar Stats: ¿El favorito tiene posesión > 60% y Tiros a puerta > Rival?
 4.  **Señal de Entrada:** Si todo es SI -> Calcular Stake con Kelly Criterion -> **ALERTA**.
+
+#### D. MOTOR DE LIQUIDACIÓN Y PAPER TRADING (Settlement Engine)
+
+El sistema de Paper Trading debe gestionar de forma inteligente el ciclo de vida de la apuesta para evitar falsos negativos.
+
+**Reglas de Cierre de Apuestas:**
+1.  **Pre-Match Safety:** Las apuestas Pre-Match tienen un bloqueo de **2.2 horas** desde el inicio oficial (`matchDate`). No se verifica el resultado antes de este tiempo para evitar errores durante el entretiempo.
+2.  **Live Snipes (Smart Settlement):**
+    *   Si el evento desaparece del feed (`GetEventDetails` devuelve null):
+        *   **Check 1:** Si `liveTime` registrado era >= 90' → Liquidar inmediatamente como FINALIZADO usando `lastKnownScore`.
+        *   **Check 2:** Si `liveTime` < 90' → Calcular tiempo estimado (`liveTime` + tiempo real transcurrido).
+            *   Si estimado > 100' → Liquidar (Asumimos fin del partido).
+            *   Si estimado < 100' → Mantener en espera (Posible descanso o suspensión momentánea).
+    *   **Zombie Protocol:** Si tras 3 horas de creada la apuesta sigue viva sin data, forzar cierre para liberar recursos.
 
 ---
 

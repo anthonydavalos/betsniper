@@ -79,8 +79,11 @@ export const calculateKellyStake = (realProbPercent, odd, bankroll, fraction = 0
   let stakePercent = fullKelly.mul(fraction);
   if (stakePercent.isNegative()) stakePercent = new Decimal(0);
 
-  // Límite de seguridad (Max stake 5% por ejemplo, opcional pero recomendado)
-  // Aquí usamos la matemática pura del blueprint
+  // Límite de seguridad
+  const maxStakePercent = new Decimal(0.05); // Max 5% del bankroll
+  if (stakePercent.greaterThan(maxStakePercent)) {
+      stakePercent = maxStakePercent;
+  }
   
   return {
     percentage: stakePercent.mul(100).toNumber(),

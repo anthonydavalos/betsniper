@@ -24,7 +24,10 @@ startBackgroundScanner();
 
 // Rutas de API
 import opportunitiesRouter from './src/routes/opportunities.js';
+import portfolioRouter from './src/routes/portfolio.js';
+
 app.use('/api/opportunities', opportunitiesRouter);
+app.use('/api/portfolio', portfolioRouter);
 
 // Rutas Básicas (API Health Check)
 app.get('/', (req, res) => {

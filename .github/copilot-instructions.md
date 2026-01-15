@@ -48,8 +48,14 @@ Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta ló
 
 ## 5. LÓGICA DE NEGOCIO Y MATEMÁTICAS
 - **Value Bets:** Compara siempre Probabilidad Implícita vs Probabilidad Real (sin Vig).
-- **Estrategia "La Volteada":** Prioriza la eficiencia. Usa `GetLiveOverview` para el escaneo rápido y `GetEventDetails` solo para la confirmación profunda.
+- **Estrategia "La Volteada":** 
+  - **Umbral de Favorito:** Probabilidad > 55% (antes 60%). Ajustado para capturar más valor (Ej. Caso Tigres/Pumas).
+  - Prioriza la eficiencia. Usa `GetLiveOverview` para el escaneo rápido y `GetEventDetails` solo para la confirmación profunda.
 - **Gestión de Bankroll:** Aplica el Criterio de Kelly Fraccional (x0.25) definido en el Blueprint.
+- **Protocolo de Liquidación (Settlement Logic):**
+  - **Live Snipes:** Liquidación **INMEDIATA** si el evento desaparece del feed y `(Minuto >= 90 OR Tiempo Estimado > 100')`.
+  - **Pre-Match:** Buffer de seguridad obligatorio de **2.2 horas** post-inicio antes de verificar resultados.
+  - **Zombie Bets:** Si `GetEventDetails` falla (evento borrado), usar `lastKnownScore` tras validar la regla de los 100 minutos.
 
 ## 6. ESTILO DE CÓDIGO
 - Usa Español para comentarios explicativos, especialmente en la lógica financiera.

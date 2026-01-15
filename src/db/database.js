@@ -18,7 +18,14 @@ const defaultData = {
   },
   upcomingMatches: [],
   altenarUpcoming: [], // Caché de cuotas Pre-Match Altenar
-  liveTracking: []
+  liveTracking: [],
+  // PORTFOLIO Y SIMULACIÓN
+  portfolio: {
+    balance: 1000,
+    initialCapital: 1000,
+    activeBets: [], // Apuestas en juego
+    history: []     // Apuestas cerradas
+  }
 };
 
 // Inicialización de LowDB

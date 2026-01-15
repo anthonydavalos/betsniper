@@ -24,6 +24,24 @@ export const scanPrematchOpportunities = async () => {
         const valueBets = [];
         let totalMatchesFound = 0;
         let newLinksCreated = 0; // Contador de nuevos enlaces
+        let expiredCount = 0;
+
+        // Limpieza de partidos pasados (Started)
+        const now = new Date();
+        const validPinnacleMatches = pinnacleMatches.filter(m => {
+            const matchDate = new Date(m.date);
+            // Permitimos un margen de 5 min después del inicio por si hay delay en "En Vivo"
+            // Pero idealmente, si ya empezó, es Live.
+            const isFuture = matchDate > new Date(now.getTime() - 5 * 60000); 
+            if (!isFuture) expiredCount++;
+            return isFuture;
+        });
+
+        if (expiredCount > 0) {
+            // Actualizar DB para remover expirados si se desea
+            // Por ahora solo filtramos en memoria para no borrar data histórica útil para debug
+             console.log(`   🧹 Filtrando ${expiredCount} partidos que ya comenzaron o terminaron.`);
+        }
 
         // Helper para calcular Probabilidad Real (Sin Vig)
         // Pinnacle tiene margen muy bajo, pero igual hay que quitarlo para ser precisos.
@@ -41,8 +59,8 @@ export const scanPrematchOpportunities = async () => {
             };
         };
 
-        // 2. Iterar sobre Pinnacle
-        for (const pinMatch of pinnacleMatches) {
+        // 2. Iterar sobre Pinnacle (SOLO VÁLIDOS)
+        for (const pinMatch of validPinnacleMatches) {
             
             let altenarEvent = null;
 
@@ -72,12 +90,14 @@ export const scanPrematchOpportunities = async () => {
                 const realProbs = getFairProbabilities(pinMatch.odds);
                 const altenarOdds = altenarEvent.odds;
 
+                const currentBankroll = db.data.portfolio.balance || db.data.config.bankroll || 1000;
+
                 if (realProbs && altenarOdds) {
                      // Analizar Oportunidades (1x2)
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs.home, db.data.config.bankroll);
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs.home, currentBankroll);
                      // La lógica de evaluacion de empate y visita:
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs.draw, db.data.config.bankroll);
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs.away, db.data.config.bankroll);
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs.draw, currentBankroll);
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs.away, currentBankroll);
                 }
             }
         }
@@ -88,8 +108,13 @@ export const scanPrematchOpportunities = async () => {
             console.log(`   🔗 ${newLinksCreated} nuevos enlaces Pinnacle-Altenar guardados en DB.`);
         }
 
+        // ORDENAMIENTO CRÍTICO: Partidos más cercanos primero
+        // Esto responde a la necesidad de ver "lo más reciente/próximo" arriba en la UI.
+        valueBets.sort((a, b) => new Date(a.date) - new Date(b.date));
+
         console.log(`\n📊 ESTADÍSTICAS PRE-MATCH:`);
         console.log(`   - Partidos Pinnacle (48h): ${pinnacleMatches.length}`);
+        console.log(`   - Filtrados (Ya iniciaron): ${expiredCount}`);
         console.log(`   - Enlazados con Altenar:   ${totalMatchesFound}`);
 
         if (valueBets.length > 0) {
@@ -121,7 +146,9 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
         
         resultsArray.push({
             type: 'PREMATCH_VALUE',
+            eventId: event.id, // ID Vital para tracking
             match: `${dbMatch.home} vs ${dbMatch.away}`,
+            date: dbMatch.date,
             market: '1x2',
             selection: listSide,
             odd: offeredOdd,
