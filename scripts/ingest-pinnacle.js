@@ -30,6 +30,18 @@ async function fetchMarketsForMatch(matchId) {
     }
 }
 
+async function fetchRelated(matchId) {
+    const DEVICE_UUID = randomUUID();
+    try {
+        const { data } = await axios.get(`https://guest.api.arcadia.pinnacle.com/0.1/matchups/${matchId}/related`, { 
+            headers: { ...HEADERS, 'X-Device-UUID': DEVICE_UUID } 
+        });
+        return data;
+    } catch (e) {
+        return [];
+    }
+}
+
 function processMoneyline(markets) {
     const mlMarket = markets.find(m => m.key === 's;0;m' && m.status === 'open');
     if (!mlMarket || !mlMarket.prices) return null;
@@ -45,6 +57,64 @@ function processMoneyline(markets) {
         away: prices.away || null,
         draw: prices.draw || null
     };
+}
+
+function processTotals(markets) {
+    // Buscar mercados de tipo 'total' para el periodo 0 (partido completo)
+    // El endpoint /straight puede devolver múltiples líneas (incluyendo alternativos)
+    const totalMarkets = markets.filter(m => m.type === 'total' && m.period === 0 && m.status === 'open');
+    if (totalMarkets.length === 0) return [];
+
+    const lines = [];
+    totalMarkets.forEach(m => {
+        const overPrice = m.prices.find(p => p.designation === 'over');
+        const underPrice = m.prices.find(p => p.designation === 'under');
+        
+        // Usar puntos del precio o del mercado si existe
+        const points = overPrice?.points || m.points; 
+
+        if (points && overPrice && underPrice) {
+            lines.push({
+                line: points,
+                over: Number(americanToDecimal(overPrice.price).toFixed(3)),
+                under: Number(americanToDecimal(underPrice.price).toFixed(3))
+            });
+        }
+    });
+
+    // Ordenar por línea para facilitar lectura (ej. 1.5, 2.5, 3.5)
+    return lines.sort((a, b) => a.line - b.line);
+}
+
+function processBTTS(markets, participants) {
+    // BTTS es un moneyline dentro del matchup especial
+    // Usamos los IDs de participantes (Yes/No) obtenidos de la API 'related'
+    const ml = markets.find(m => m.type === 'moneyline' && m.period === 0 && m.status === 'open');
+    if (!ml || !ml.prices || !participants) return null;
+
+    const partYes = participants.find(p => p.name === 'Yes');
+    const partNo = participants.find(p => p.name === 'No');
+
+    if (!partYes || !partNo) return null;
+
+    let priceYes = null;
+    let priceNo = null;
+
+    ml.prices.forEach(p => {
+        const decimal = americanToDecimal(p.price);
+        if (decimal) {
+             if (p.participantId === partYes.id) {
+                 priceYes = Number(decimal.toFixed(3));
+             } else if (p.participantId === partNo.id) {
+                 priceNo = Number(decimal.toFixed(3));
+             }
+        }
+    });
+
+    if (priceYes && priceNo) {
+        return { yes: priceYes, no: priceNo };
+    }
+    return null;
 }
 
 async function run() {
@@ -96,19 +166,45 @@ async function run() {
                 console.log(`   Analizando ${league.name}: ${relevant.length} partidos.`);
                 
                 for (const match of relevant) {
-                    await sleep(100);
-                    const markets = await fetchMarketsForMatch(match.id);
-                    const odds = processMoneyline(markets);
+                    await sleep(100); // Throttling
                     
-                    if (odds && odds.home && odds.away) {
+                    // 1. Fetch Main Markets (Moneyline + Totals)
+                    const markets = await fetchMarketsForMatch(match.id);
+                    const oddsML = processMoneyline(markets);
+                    const oddsTotals = processTotals(markets);
+                    
+                    // 2. Fetch Helper Markets (BTTS) via Related API
+                    let oddsBTTS = null;
+                    try {
+                        const related = await fetchRelated(match.id);
+                        const bttsSpec = related.find(r => 
+                            r.special && 
+                            r.special.description && 
+                            r.special.description.includes('Both Teams To Score')
+                        );
+
+                        if (bttsSpec) {
+                            await sleep(50); // Extra sleep for 2nd call
+                            const bttsMarkets = await fetchMarketsForMatch(bttsSpec.id);
+                            oddsBTTS = processBTTS(bttsMarkets, bttsSpec.participants);
+                        }
+                    } catch (err) {
+                        // Silent fail for optional markets
+                    }
+
+                    if (oddsML && oddsML.home && oddsML.away) {
                         refinedMatches.push({
                             id: match.id.toString(),
-                            home: match.participants.find(p => p.alignment === 'home')?.name, // Adapted for Scanner
-                            away: match.participants.find(p => p.alignment === 'away')?.name, // Adapted for Scanner
-                            date: match.startTime, // Adapted for Scanner
+                            home: match.participants.find(p => p.alignment === 'home')?.name, 
+                            away: match.participants.find(p => p.alignment === 'away')?.name, 
+                            date: match.startTime, 
                             league: { name: league.name },
                             bookmaker: "Pinnacle",
-                            odds: odds // Store RAW odds, Scanner will calc Probabilities
+                            odds: {
+                                ...oddsML,         // home, draw, away
+                                totals: oddsTotals, // array of {line, over, under}
+                                btts: oddsBTTS      // {yes, no} or null
+                            }
                         });
                     }
                 }

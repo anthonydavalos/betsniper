@@ -43,8 +43,7 @@ export const scanPrematchOpportunities = async () => {
              console.log(`   🧹 Filtrando ${expiredCount} partidos que ya comenzaron o terminaron.`);
         }
 
-        // Helper para calcular Probabilidad Real (Sin Vig)
-        // Pinnacle tiene margen muy bajo, pero igual hay que quitarlo para ser precisos.
+        // Helper para calcular Probabilidad Real (Sin Vig) - 3 WAY (1x2)
         const getFairProbabilities = (odds) => {
             if (!odds || !odds.home || !odds.draw || !odds.away) return null;
             const impliedHome = 1 / odds.home;
@@ -59,6 +58,15 @@ export const scanPrematchOpportunities = async () => {
             };
         };
 
+        // Helper para calcular Probabilidad Real - 2 WAY (Over/Under, BTTS, Handicap)
+        const getFair2Way = (o1, o2) => {
+            if (!o1 || !o2) return null;
+            const i1 = 1 / o1;
+            const i2 = 1 / o2;
+            const sum = i1 + i2;
+            return { p1: i1 / sum, p2: i2 / sum };
+        };
+
         // 2. Iterar sobre Pinnacle (SOLO VÁLIDOS)
         for (const pinMatch of validPinnacleMatches) {
             
@@ -71,12 +79,9 @@ export const scanPrematchOpportunities = async () => {
 
             // Si no tenemos ID o el ID ya no existe en el feed reciente, buscamos fuzzy
             if (!altenarEvent) {
-                // pinMatch.home, pinMatch.date vienen de ingest-pinnacle.js nuevo formato
                 const matchResult = findMatch(pinMatch.home, pinMatch.date, altenarCachedEvents);
                 if (matchResult) {
                     altenarEvent = matchResult.match;
-                    
-                    // 🧠 LINKER MAGICO
                     pinMatch.altenarId = altenarEvent.id; 
                     pinMatch.altenarName = altenarEvent.name; 
                     newLinksCreated++;
@@ -86,18 +91,51 @@ export const scanPrematchOpportunities = async () => {
             if (altenarEvent) {
                 totalMatchesFound++;
 
-                // Calcular Probabilidad Real desde las odds crudas de Pinnacle grabadas en DB
-                const realProbs = getFairProbabilities(pinMatch.odds);
+                const currentBankroll = db.data.portfolio.balance || db.data.config.bankroll || 1000;
                 const altenarOdds = altenarEvent.odds;
 
-                const currentBankroll = db.data.portfolio.balance || db.data.config.bankroll || 1000;
+                // A) Analizar Oportunidades 1x2
+                // ==========================================
+                const realProbs1x2 = getFairProbabilities(pinMatch.odds);
+                if (realProbs1x2 && altenarOdds) {
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs1x2.home, currentBankroll, '1x2');
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs1x2.draw, currentBankroll, '1x2');
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs1x2.away, currentBankroll, '1x2');
+                }
 
-                if (realProbs && altenarOdds) {
-                     // Analizar Oportunidades (1x2)
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs.home, currentBankroll);
-                     // La lógica de evaluacion de empate y visita:
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs.draw, currentBankroll);
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs.away, currentBankroll);
+                // B) Analizar Totals (Over/Under)
+                // ==========================================
+                if (pinMatch.odds.totals && Array.isArray(pinMatch.odds.totals) && 
+                    altenarOdds.totals && Array.isArray(altenarOdds.totals)) {
+                    
+                    for (const pinTotal of pinMatch.odds.totals) {
+                        // Buscamos la misma linea en Altenar (margen error 0.1 para floats 2.5 vs 2.50)
+                        const altTotal = altenarOdds.totals.find(t => Math.abs(t.line - pinTotal.line) < 0.1);
+                        
+                        if (altTotal) {
+                            const realProbsTotal = getFair2Way(pinTotal.over, pinTotal.under);
+                            if (realProbsTotal) {
+                                // Over (p1)
+                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Over ${pinTotal.line}`, altTotal.over, realProbsTotal.p1, currentBankroll, 'Total');
+                                // Under (p2)
+                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Under ${pinTotal.line}`, altTotal.under, realProbsTotal.p2, currentBankroll, 'Total');
+                            }
+                        }
+                    }
+                }
+
+                // C) Analizar BTTS (Ambos Marcan)
+                // ==========================================
+                // Verificamos que existan ambos mercados en ambas casas
+                if (pinMatch.odds.btts && pinMatch.odds.btts.yes && 
+                    altenarOdds.btts && altenarOdds.btts.yes) {
+                    
+                    const realProbsBTTS = getFair2Way(pinMatch.odds.btts.yes, pinMatch.odds.btts.no);
+                    
+                    if (realProbsBTTS) {
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS Yes', altenarOdds.btts.yes, realProbsBTTS.p1, currentBankroll, 'BTTS');
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS No', altenarOdds.btts.no, realProbsBTTS.p2, currentBankroll, 'BTTS');
+                    }
                 }
             }
         }
@@ -132,7 +170,7 @@ export const scanPrematchOpportunities = async () => {
 };
 
 // Helper interno para evaluar y agregar oportunidad
-const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd, realProb, bankroll) => {
+const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd, realProb, bankroll, marketName = '1x2') => {
     if (!offeredOdd || offeredOdd <= 1) return;
 
     // EV Formula: (ProbReal * CuotaOfrecida) - 1
@@ -149,7 +187,7 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
             eventId: event.id, // ID Vital para tracking
             match: `${dbMatch.home} vs ${dbMatch.away}`,
             date: dbMatch.date,
-            market: '1x2',
+            market: marketName,
             selection: listSide,
             odd: offeredOdd,
             realProb: realProb * 100,

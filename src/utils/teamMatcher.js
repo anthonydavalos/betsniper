@@ -8,7 +8,8 @@ const STOP_WORDS = [
     'fc', 'sc', 'sk', 'fk', 'club', 'cd', 'cf', 'ca',
     'u20', 'u21', 'u23', 'u19',
     '(f)', '(res.)', 'women', 'w', 'reserves',
-    'olympic', 'belediye', 'spor', 'buyuksehir', 'bb'
+    'olympic', 'belediye', 'spor', 'buyuksehir', 'bb',
+    'borough', 'ketema', 'kenema', 'iii', 'ii', 'b' // 'b' para equipos B si es token aislado, cuidado aquí.
     // 'royal', 'real', 'sporting', 'athletic', 'atletico' -> COMENTADO POR SEGURIDAD
   ];
 
@@ -47,7 +48,14 @@ const TEAM_ALIASES = {
     "centro sportivo alagoano": "csa",
     "csa": "centro sportivo alagoano",
     "coquimbo unido": "coquimbo",
-    "coquimbo": "coquimbo unido"
+    "coquimbo": "coquimbo unido",
+    // NUEVOS ALIAS
+    "elche ilicitano": "elche b",
+    "elche b": "elche ilicitano",
+    "hertha bsc": "hertha berlin",
+    "hertha berlin": "hertha bsc",
+    "correcaminos de la uat iii": "correcaminos uat reserves",
+    "hampton & richmond": "hampton and richmond borough"
 };
   
   /**
@@ -68,6 +76,10 @@ const TEAM_ALIASES = {
 
     // 2. Normalizar Prefijos Árabes: "al-orobah" -> "al orobah"
     clean = clean.replace(/al-/g, "al ");
+
+    // 2.b Normalizar Símbolos: "&" -> "and", "." -> "" (U.A.T -> UAT)
+    clean = clean.replace(/&/g, " and ");
+    clean = clean.replace(/\./g, "");
   
     // 3. Eliminar Stop Words
     STOP_WORDS.forEach(word => {

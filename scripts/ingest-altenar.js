@@ -50,10 +50,13 @@ const ingestAltenarPrematch = async () => {
       const eventDate = new Date(event.startDate);
       if (eventDate < now || eventDate > endDate) continue;
 
-      // Extraer cuotas 1x2 usando la lógica que ya conocemos
-      const odds1x2 = extract1x2Odds(event, marketsMap, oddsMap);
+      // Extraer cuotas 1x2, Totales y BTTS
+      const odds = extractOdds(event, marketsMap, oddsMap);
       
-      if (odds1x2) {
+      // Filtramos si no tiene al menos una cuota válida de algún tipo
+      // Puede que solo tenga 1x2, o solo Totales, etc.
+      // Modificamos para ser permisivos si hay ALGUNA información útil.
+      if (odds.home || odds.draw || odds.away || odds.totals.length > 0 || odds.btts.yes) {
         cleanEvents.push({
           id: event.id,
           name: event.name,
@@ -61,7 +64,13 @@ const ingestAltenarPrematch = async () => {
           status: event.status, // 0 = Not started
           champId: event.champId,
           competitors: event.competitorIds, // IDs para referencia futura
-          odds: odds1x2, // { home: 1.5, draw: 3.2, away: 5.0 }
+          odds: {
+              home: odds.home,
+              draw: odds.draw,
+              away: odds.away,
+              totals: odds.totals, // Array [{ line, over, under }]
+              btts: odds.btts      // { yes, no }
+          },
           lastUpdated: new Date().toISOString()
         });
       }
@@ -81,29 +90,88 @@ const ingestAltenarPrematch = async () => {
   }
 };
 
-// Helper Duplicado (Idealmente mover a utils compartido si se usa en 3 sitios)
-const extract1x2Odds = (event, marketsMap, oddsMap) => {
-  if (!event.marketIds) return null;
-  let odds = { home: 0, draw: 0, away: 0 };
-  let found = false;
+// Helper Unificado para extraer todas las cuotas
+const extractOdds = (event, marketsMap, oddsMap) => {
+  if (!event.marketIds) return { home: 0, draw: 0, away: 0, totals: [], btts: {} };
+  
+  let result = { 
+      home: 0, 
+      draw: 0, 
+      away: 0,
+      totals: [], // Lista de lineas over/under encontradas
+      btts: {}    // Both Teams To Score
+  };
 
   for (const marketId of event.marketIds) {
     const market = marketsMap.get(marketId);
     if (!market) continue;
+
+    // A) Mercado 1x2 (typeId 1 o name '1x2')
     if (market.typeId === 1 || market.name === '1x2') {
       for (const oddId of market.oddIds) {
         const odd = oddsMap.get(oddId);
         if (odd) {
-          if (odd.typeId === 1) odds.home = odd.price;
-          if (odd.typeId === 2) odds.draw = odd.price; 
-          if (odd.typeId === 3) odds.away = odd.price; 
+          if (odd.typeId === 1) result.home = odd.price;
+          if (odd.typeId === 2) result.draw = odd.price; 
+          if (odd.typeId === 3) result.away = odd.price; 
         }
       }
-      found = true;
-      break; 
+    }
+
+    // B) Mercado Totales (typeId 18 o name 'Total')
+    if (market.typeId === 18 || market.name === 'Total') {
+        const lineVal = parseFloat(market.sv || market.sn); // sv="2.5" usually
+        if (!isNaN(lineVal)) {
+            let overPrice = 0;
+            let underPrice = 0;
+            
+            for (const oddId of market.oddIds) {
+                const odd = oddsMap.get(oddId);
+                if (odd) {
+                    // TypeId 12 = Over, TypeId 13 = Under (Segun Blueprint)
+                    // A veces varía, pero confiamos en Blueprint + Data Real
+                    // Tambien chequeamos name por si acaso (Más de / Menos de)
+                    const nameLower = (odd.name || "").toLowerCase();
+                    if (odd.typeId === 12 || nameLower.includes('más') || nameLower.includes('over')) overPrice = odd.price;
+                    if (odd.typeId === 13 || nameLower.includes('menos') || nameLower.includes('under')) underPrice = odd.price;
+                }
+            }
+
+            if (overPrice > 0 && underPrice > 0) {
+                result.totals.push({
+                    line: lineVal,
+                    over: overPrice,
+                    under: underPrice
+                });
+            }
+        }
+    }
+
+    // C) Mercado BTTS (typeId 29 o name 'Ambos equipos marcan')
+    if (market.typeId === 29 || (market.name && market.name.toLowerCase().includes('ambos teams'))) {
+         let yesPrice = 0;
+         let noPrice = 0;
+
+         for (const oddId of market.oddIds) {
+             const odd = oddsMap.get(oddId);
+             if (odd) {
+                 // TypeId 74 = Yes, TypeId 76 = No (Segun Blueprint)
+                 const nameLower = (odd.name || "").toLowerCase();
+                 if (odd.typeId === 74 || nameLower === 'sí' || nameLower === 'yes') yesPrice = odd.price;
+                 if (odd.typeId === 76 || nameLower === 'no') noPrice = odd.price;
+             }
+         }
+
+         if (yesPrice > 0 && noPrice > 0) {
+             result.btts = { yes: yesPrice, no: noPrice };
+         }
     }
   }
-  return found ? odds : null;
+  
+  // Ordenar totales por linea para consistencia (1.5, 2.5, 3.5)
+  result.totals.sort((a,b) => a.line - b.line);
+  
+  return result;
 };
 
 ingestAltenarPrematch();

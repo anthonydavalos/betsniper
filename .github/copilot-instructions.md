@@ -47,7 +47,7 @@ Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta ló
     *   Regla: Si la hora coincide (+/- 20 min) tras ajustar timezone, asume match aunque los nombres no sean idénticos al 100%.
 
 ## 5. LÓGICA DE NEGOCIO Y MATEMÁTICAS
-- **Value Bets:** Compara siempre Probabilidad Implícita vs Probabilidad Real (sin Vig).
+- **Value Bets:** Compara siempre Probabilidad Implícita vs Probabilidad Real (sin Vig) en mercados 1x2, Over/Under y BTTS.
 - **Estrategia "La Volteada":** 
   - **Umbral de Favorito:** Probabilidad > 55% (antes 60%). Ajustado para capturar más valor (Ej. Caso Tigres/Pumas).
   - Prioriza la eficiencia. Usa `GetLiveOverview` para el escaneo rápido y `GetEventDetails` solo para la confirmación profunda.

@@ -111,7 +111,9 @@ Todas las peticiones a `sb2frontend-altenar2.biahosted.com` deben usar:
 
 #### 1. Implementación de Endpoints
 
-* **GetUpcoming:** Cruzar con la DB de Pinnacle Arcadia. Si `Cuota DoradoBet > (1 / ProbabilidadReal)`, alerta **VALUE BET**.
+* **GetUpcoming:** Cruzar con la DB de Pinnacle Arcadia.
+    * Si `Cuota DoradoBet > (1 / ProbabilidadReal)`, alerta **VALUE BET**.
+    * **Mercados Objetivo:** 1x2, Totales (Over/Under 1.5/2.5/3.5) y Ambos Marcan (Yes/No).
 * **GetTopEvents & GetPopularBets:** Para identificar liquidez y partidos relevantes.
 * **GetStreamingEvents:** Prioridad alta. Si hay video, la data es más rápida.
 * **GetFavouritesChamps:** Para generar menú de navegación.
@@ -142,30 +144,428 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 **Estructura del JSON recibido (Ejemplo Genérico - Relacional):**
 ```json
 {
-  "events": [
-    {
-      "id": 1001,
-      "name": "Team A vs Team B",
-      "marketIds": [ 2005 ],
-      "competitorIds": [ 3001, 3002 ]
-    }
-  ],
-  "markets": [
-    {
-      "id": 2005,
-      "name": "1x2",
-      "oddIds": [ 4001, 4002, 4003 ]
-    }
-  ],
-  "odds": [
-    { "id": 4001, "name": "1", "price": 2.50 },
-    { "id": 4002, "name": "X", "price": 3.10 },
-    { "id": 4003, "name": "2", "price": 2.80 }
-  ],
-  "competitors": [
-    { "id": 3001, "name": "Team A" },
-    { "id": 3002, "name": "Team B" }
-  ]
+    "topSports": [
+        {
+            "id": 66,
+            "name": "Fútbol",
+            "iconName": "soccer",
+            "hasStream": false,
+            "count": 0
+        }
+    ],
+    "headers": [
+        {
+            "typeId": 1,
+            "name": "1x2",
+            "mst": 0,
+            "odds": [
+                {
+                    "id": 1,
+                    "name": "1"
+                },
+                {
+                    "id": 2,
+                    "name": "empate"
+                },
+                {
+                    "id": 3,
+                    "name": "2"
+                }
+            ]
+        },
+        {
+            "typeId": 18,
+            "name": "Total",
+            "mst": 0,
+            "odds": [
+                {
+                    "id": 12,
+                    "name": "más de"
+                },
+                {
+                    "id": 13,
+                    "name": "menos de"
+                }
+            ],
+            "specialOdd": {
+                "typeId": 1,
+                "name": "Goles"
+            }
+        },
+        {
+            "typeId": 29,
+            "name": "Ambos equipos marcan",
+            "mst": 0,
+            "odds": [
+                {
+                    "id": 74,
+                    "name": "sí"
+                },
+                {
+                    "id": 76,
+                    "name": "no"
+                }
+            ]
+        }
+    ],
+    "pageCount": 1,
+    "page": 1,
+    "markets": [
+        {
+            "oddIds": [
+                3348420078,
+                3348420079,
+                3348420080
+            ],
+            "typeId": 1,
+            "isMB": false,
+            "sportMarketId": 70472,
+            "id": 1351757720,
+            "name": "1x2"
+        },
+        {
+            "oddIds": [
+                3348419941,
+                3348419942
+            ],
+            "typeId": 18,
+            "isMB": true,
+            "sportMarketId": 70520,
+            "sv": "2.5",
+            "sn": "2.5",
+            "id": 1351757682,
+            "name": "Total"
+        },
+        {
+            "oddIds": [
+                3348419989,
+                3348419990
+            ],
+            "typeId": 29,
+            "isMB": false,
+            "sportMarketId": 70545,
+            "id": 1351757706,
+            "name": "Ambos equipos marcan"
+        },
+        {
+            "oddIds": [
+                3368321926,
+                3368321927
+            ],
+            "typeId": 18,
+            "isMB": true,
+            "sportMarketId": 70520,
+            "sv": "3.5",
+            "sn": "3.5",
+            "id": 1359043082,
+            "name": "Total"
+        },
+        {
+            "oddIds": [
+                3360281023,
+                3360281024
+            ],
+            "typeId": 18,
+            "isMB": true,
+            "sportMarketId": 70520,
+            "sv": "1.5",
+            "sn": "1.5",
+            "id": 1356184822,
+            "name": "Total"
+        }
+    ],
+    "odds": [
+        {
+            "typeId": 1,
+            "price": 3.4000,
+            "isMB": false,
+            "oddStatus": 0,
+            "competitorId": 56784,
+            "id": 3348420078,
+            "name": "Western Sydney Wanderers (F)"
+        },
+        {
+            "typeId": 2,
+            "price": 4.0000,
+            "isMB": false,
+            "oddStatus": 0,
+            "id": 3348420079,
+            "name": "Empate"
+        },
+        {
+            "typeId": 3,
+            "price": 1.8000,
+            "isMB": false,
+            "oddStatus": 0,
+            "competitorId": 50696,
+            "id": 3348420080,
+            "name": "Brisbane Roar (F)"
+        },
+        {
+            "typeId": 12,
+            "price": 1.5556,
+            "isMB": true,
+            "oddStatus": 0,
+            "id": 3348419941,
+            "name": "Más de 2.5"
+        },
+        {
+            "typeId": 13,
+            "price": 2.2858,
+            "isMB": true,
+            "oddStatus": 0,
+            "id": 3348419942,
+            "name": "Menos de 2.5"
+        },
+        {
+            "typeId": 74,
+            "price": 1.5455,
+            "isMB": false,
+            "oddStatus": 0,
+            "id": 3348419989,
+            "name": "Sí"
+        },
+        {
+            "typeId": 76,
+            "price": 2.2500,
+            "isMB": false,
+            "oddStatus": 0,
+            "id": 3348419990,
+            "name": "No"
+        },
+        {
+            "typeId": 12,
+            "price": 2.2858,
+            "isMB": true,
+            "oddStatus": 0,
+            "id": 3368321926,
+            "name": "Más de 3.5"
+        },
+        {
+            "typeId": 13,
+            "price": 1.5556,
+            "isMB": true,
+            "oddStatus": 0,
+            "id": 3368321927,
+            "name": "Menos de 3.5"
+        },
+        {
+            "typeId": 12,
+            "price": 1.6667,
+            "isMB": true,
+            "oddStatus": 0,
+            "id": 3360281023,
+            "name": "Más de 1.5"
+        },
+        {
+            "typeId": 13,
+            "price": 2.0000,
+            "isMB": true,
+            "oddStatus": 0,
+            "id": 3360281024,
+            "name": "Menos de 1.5"
+        }
+    ],
+    "events": [17222-206096
+        {
+            "marketIds": [
+                1351757720,
+                1351757777,
+                1351757714,
+                1351757723,
+                1351757682,
+                1351757706
+            ],
+            "isBooked": true,
+            "isParlay": false,
+            "offers": [
+                {
+                    "type": 6
+                }
+            ],
+            "code": 4508,
+            "hasStream": false,
+            "extId": "fp32_ar:match:401858",
+            "sc": 1184,
+            "mc": 140,
+            "rc": false,
+            "pId": 32,
+            "et": 0,
+            "hasStats": true,
+            "competitorIds": [
+                56784,
+                50696
+            ],
+            "sportId": 66,
+            "catId": 550,
+            "champId": 3117,
+            "status": 0,
+            "startDate": "2026-01-16T08:00:00Z",
+            "id": 14120778,
+            "name": "Western Sydney Wanderers (F) vs. Brisbane Roar (F)"
+        },
+        {
+            "marketIds": [
+                1359043088,
+                1359043097,
+                1359043086,
+                1359043090,
+                1359043082,
+                1359043084
+            ],
+            "isBooked": true,
+            "isParlay": false,
+            "offers": [
+                {
+                    "type": 6
+                }
+            ],
+            "code": 2721,
+            "hasStream": false,
+            "extId": "fp32_ar:match:421157",
+            "sc": 485,
+            "mc": 32,
+            "rc": false,
+            "pId": 32,
+            "et": 0,
+            "hasStats": false,
+            "competitorIds": [
+                65023,
+                2013518
+            ],
+            "sportId": 66,
+            "catId": 567,
+            "champId": 32128,
+            "status": 0,
+            "startDate": "2026-01-16T08:30:00Z",
+            "id": 15281244,
+            "name": "Garhwal FC vs. M2M FC"
+        },
+        {
+            "marketIds": [
+                1356184833,
+                1356184853,
+                1356184829,
+                1356184836,
+                1356184822
+            ],
+            "isBooked": true,
+            "isParlay": false,
+            "offers": [
+                {
+                    "type": 6
+                }
+            ],
+            "code": 2348,
+            "hasStream": false,
+            "extId": "fp32_ar:match:416186",
+            "sc": 634,
+            "mc": 57,
+            "rc": false,
+            "pId": 32,
+            "et": 0,
+            "hasStats": true,
+            "competitorIds": [
+                729888,
+                65217
+            ],
+            "sportId": 66,
+            "catId": 564,
+            "champId": 3060,
+            "status": 0,
+            "startDate": "2026-01-16T10:00:00Z",
+            "id": 15214883,
+            "name": "Sheger Ketema vs. Fasil Kenema"
+        }
+    ],
+    "sports": [
+        {
+            "catIds": [
+                550,
+                567,
+                564
+            ],
+            "typeId": 1,
+            "iconName": "soccer",
+            "hasLiveEvents": false,
+            "id": 66,
+            "name": "Fútbol"
+        }
+    ],
+    "categories": [
+        {
+            "champIds": [
+                3117,
+                3032
+            ],
+            "iso": "AUS",
+            "hasLiveEvents": false,
+            "id": 550,
+            "name": "Australia"
+        },
+        {
+            "champIds": [
+                32128
+            ],
+            "iso": "IND",
+            "hasLiveEvents": false,
+            "id": 567,
+            "name": "India"
+        },
+        {
+            "champIds": [
+                3060
+            ],
+            "iso": "ETH",
+            "hasLiveEvents": false,
+            "id": 564,
+            "name": "Etiopía"
+        }
+    ],
+    "champs": [
+        {
+            "offers": [
+                {
+                    "type": 6
+                }
+            ],
+            "hasLiveEvents": false,
+            "id": 3117,
+            "name": "A-League, Feminino"
+        },
+        {
+            "offers": [
+                {
+                    "type": 6
+                }
+            ],
+            "hasLiveEvents": false,
+            "id": 32128,
+            "name": "Delhi Senior Division"
+        },
+        {
+            "offers": [
+                {
+                    "type": 6
+                }
+            ],
+            "hasLiveEvents": false,
+            "id": 3060,
+            "name": "Liga Premier"
+        }
+    ],
+    "competitors": [
+        {
+            "hasConfigLogo": true,
+            "id": 56784,
+            "name": "Western Sydney Wanderers (F)"
+        },
+        {
+            "hasConfigLogo": true,
+            "id": 50696,
+            "name": "Brisbane Roar (F)"
+        }
+    ]
 }
 ```
 
@@ -174,11 +574,16 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 2.  Iterar sobre `events`.
 3.  Para cada evento, iterar sobre sus `marketIds`.
 4.  Buscar el mercado correspondiente en el Map de mercados.
-5.  Si el mercado es "1x2" (Generalmente typeId: 1 o name: "1x2"), iterar sobre sus `oddIds`.
-6.  Buscar la cuota en el Map de odds.
+5.  Si el mercado es "1x2" (Generalmente typeId: 1 o name: "1x2"), iterar sobre sus `oddIds` y buscar la cuota en el Map de odds.
     * Odd TypeId 1 = Local (Home)
     * Odd TypeId 2 = Empate (Draw)
     * Odd TypeId 3 = Visita (Away)
+6.  **NUEVO (Value Bets Totales):** Si el mercado es "Total" (typeId: 18), verificar el valor `sv` (Special Value) que indica la línea (1.5, 2.5, 3.5).
+    * Odd TypeId 12 = Más de (Over)
+    * Odd TypeId 13 = Menos de (Under)
+7.  **NUEVO (Value Bets BTTS):** Si el mercado es "Ambos equipos marcan" (typeId: 29).
+    * Odd TypeId 74 = Sí (Yes)
+    * Odd TypeId 76 = No (No)
 
 #### A. getUpcomingMatches(limit = 20)
 * **Endpoint:** `/GetUpcoming`
