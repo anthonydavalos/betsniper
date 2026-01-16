@@ -25,89 +25,156 @@ export const getPortfolio = async () => {
     return db.data.portfolio;
 };
 
+
+// Global Set to track bets currently being processed (Prevent Race Conditions)
+const processingBets = new Set();
+
 /**
  * Coloca una apuesta automática si no existe ya una para ese evento.
  */
+const isDuplicateBet = (b, opportunity, pick) => {
+    // Match por ID (más seguro) o Nombre
+    // IMPORTANTE: Asegurar tipos iguales (numbers vs strings)
+    let isSameEvent = false;
+
+    if (b.eventId && opportunity.eventId) {
+        isSameEvent = String(b.eventId) === String(opportunity.eventId);
+    } else {
+        isSameEvent = b.match === opportunity.match;
+    }
+        
+    // Validar Selección usando el PICK normalizado (más robusto que string 'selection')
+    const isSamePick = b.pick === pick;
+
+    return isSameEvent && isSamePick;
+};
+
 export const placeAutoBet = async (opportunity) => {
-    await initDB();
-    const portfolio = db.data.portfolio;
-    const config = db.data.config || { bankroll: 1000, kellyFraction: 0.25 };
-
-    // 1. Evitar duplicados EXACTOS (mismo partido y misma selección)
-    const selectionKey = opportunity.action || opportunity.selection;
-    const alreadyBet = portfolio.activeBets.find(b => b.match === opportunity.match && b.selection === selectionKey);
-    
-    if (alreadyBet) {
-        // console.log(`   Rechazado: Ya existe apuesta para ${opportunity.match} -> ${selectionKey}`);
-        return null; // Ya tenemos esta apuesta específica
-    }
-
-    // 2. Calcular Stake (Kelly)
-    const realProb = opportunity.realProb || 50;
-    const odd = opportunity.odd || 2.0;          
-    
-    // Normalizar datos para Kelly
-    const kellyResult = calculateKellyStake(
-        realProb, 
-        odd, 
-        portfolio.balance, 
-        config.kellyFraction || 0.25
-    );
-
-    const stake = kellyResult.amount;
-    
-    // Validación mínima y Fondos
-    if (stake < 1) {
-        console.log(`⚠️ Stake Kelly muy bajo (${stake.toFixed(2)} PEN). Omitiendo apuesta para ${opportunity.match}.`);
-        return null; 
-    }
-    
-    if (portfolio.balance < stake) {
-        console.log("❌ Fondos insuficientes para apostar.");
-        return null;
-    }
-
-    // 3. Determinar qué elegimos (Home/Away) para comprobar resultado después
-    // LIVE: action suele tener "Apostar a LOCAL"
-    // PRE: selection suele ser "Home", "Away", "Draw"
+    // 0. Pre-cálculo del PICK (Necesario para deduplicación robusta)
     let pick = 'unknown';
     const actionStr = (opportunity.action || "").toUpperCase();
     const selectionStr = (opportunity.selection || "").toUpperCase();
 
+    // A) 1X2 Standard
     if (actionStr.includes('LOCAL') || selectionStr === 'HOME') pick = 'home';
     else if (actionStr.includes('VISITA') || selectionStr === 'AWAY') pick = 'away';
     else if (actionStr.includes('EMPATE') || selectionStr === 'DRAW') pick = 'draw';
 
-    // 4. Registrar Apuesta
-    const newBet = {
-        id: Date.now().toString(),
-        createdAt: new Date().toISOString(), // Fecha de transacción
-        matchDate: opportunity.date || null, // Fecha del partido (si disponible)
-        eventId: opportunity.eventId, // ID Altenar para tracking robusto
-        sportId: opportunity.sportId,
-        catId: opportunity.catId,
-        champId: opportunity.champId,
-        match: opportunity.match,
-        league: opportunity.league,
-        type: opportunity.type, 
-        selection: opportunity.action || opportunity.selection, // Texto legible
-        pick: pick, // Código interno para settlement (home/away/draw)
-        odd: odd,
-        realProb: realProb,
-        stake: stake,         
-        status: 'PENDING',
-        initialScore: opportunity.score || "0-0", // Guardamos score inicial
-        lastKnownScore: opportunity.score || "0-0",
-        lastUpdate: new Date().toISOString()
-    };
+    // B) Totals (Over/Under)
+    if (selectionStr.includes('OVER') || selectionStr.includes('MÁS')) {
+        const line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+        pick = `over_${line}`; 
+    } else if (selectionStr.includes('UNDER') || selectionStr.includes('MENOS')) {
+        const line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+        pick = `under_${line}`; 
+    }
 
-    // 5. Actualizar DB
-    portfolio.balance -= stake;
-    portfolio.activeBets.push(newBet);
-    await db.write();
+    // C) BTTS
+    if (selectionStr.includes('BTTS PRE') || selectionStr.includes('AMBOS SI') || (selectionStr.includes('BTTS') && selectionStr.includes('YES'))) {
+        pick = 'btts_yes';
+    } else if (selectionStr.includes('BTTS NO') || (selectionStr.includes('BTTS') && selectionStr.includes('NO'))) {
+        pick = 'btts_no';
+    }
 
-    console.log(`💰 APUESTA KELLY COLOCADA: ${stake.toFixed(2)} PEN en ${opportunity.match} [PICK: ${pick}]`);
-    return newBet;
+    if (pick === 'unknown') {
+        // console.log(`⚠️ No se pudo determinar el PICK para: ${opportunity.match}. Omitiendo.`);
+        return null;
+    }
+
+    // Identificador único para control de concurrencia
+    const lockKey = `${opportunity.eventId || opportunity.match}_${pick}`;
+    if (processingBets.has(lockKey)) {
+        // console.log(`🔒 Bloqueo de concurrencia: ${lockKey} ya se está procesando.`);
+        return null;
+    }
+
+    // AÑADIR LOCK
+    processingBets.add(lockKey);
+
+    try {
+        await initDB();
+        // FORCE READ AGAIN TO BE SAFE (Paranoia Mode for Duplicates)
+        await db.read(); 
+        
+        const portfolio = db.data.portfolio;
+        const config = db.data.config || { bankroll: 1000, kellyFraction: 0.25 };
+
+        // 1. Evitar duplicados EXACTOS (activeBets O history)
+        
+        // Verificar si existe en ACTIVAS
+        const activeDuplicate = portfolio.activeBets.find(b => isDuplicateBet(b, opportunity, pick));
+        
+        // Verificar si existe en HISTORIAL
+        const historyDuplicate = portfolio.history.find(b => isDuplicateBet(b, opportunity, pick));
+
+        if (activeDuplicate || historyDuplicate) {
+             // console.log(`🔁 Duplicado detectado para ${lockKey}. Ignorando.`);
+             return null; 
+        }
+
+        // 2. Calcular Stake (Kelly)
+        const realProb = opportunity.realProb || 50;
+        const odd = opportunity.odd || 2.0;          
+        
+        // Normalizar datos para Kelly
+        const kellyResult = calculateKellyStake(
+            realProb, 
+            odd, 
+            portfolio.balance, 
+            config.kellyFraction || 0.25
+        );
+
+        const stake = kellyResult.amount;
+        
+        // Validación mínima y Fondos
+        if (stake < 1) {
+            console.log(`⚠️ Stake Kelly muy bajo (${stake.toFixed(2)} PEN). Omitiendo apuesta para ${opportunity.match}.`);
+            return null; 
+        }
+        
+        if (portfolio.balance < stake) {
+            console.log("❌ Fondos insuficientes para apostar.");
+            return null;
+        }
+
+        // 4. Registrar Apuesta
+        const newBet = {
+            id: Date.now().toString(),
+            createdAt: new Date().toISOString(), // Fecha de transacción
+            matchDate: opportunity.date || null, // Fecha del partido (si disponible)
+            eventId: opportunity.eventId, // ID Altenar para tracking robusto
+            sportId: opportunity.sportId,
+            catId: opportunity.catId,
+            champId: opportunity.champId,
+            match: opportunity.match,
+            league: opportunity.league,
+            type: opportunity.type, 
+            selection: opportunity.action || opportunity.selection, // Texto legible
+            pick: pick, // Código interno calculado arriba
+            odd: odd,
+            realProb: realProb,
+            stake: stake,         
+            status: 'PENDING',
+            initialScore: opportunity.score || "0-0", // Guardamos score inicial
+            lastKnownScore: opportunity.score || "0-0",
+            lastUpdate: new Date().toISOString()
+        };
+
+        // 5. Actualizar DB
+        portfolio.balance -= stake;
+        portfolio.activeBets.push(newBet);
+        await db.write();
+
+        console.log(`💰 APUESTA KELLY COLOCADA: ${stake.toFixed(2)} PEN en ${opportunity.match} [PICK: ${pick}]`);
+        return newBet;
+
+    } catch (e) {
+        console.error("Error placing bet:", e);
+        return null;
+    } finally {
+        // LIBERAR LOCK (Retraso opcional para evitar rebote inmediato)
+        setTimeout(() => processingBets.delete(lockKey), 5000);
+    }
 };
 
 import { getEventDetails, getEventResult } from './liveScannerService.js';
@@ -136,6 +203,30 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
 
     for (const bet of portfolio.activeBets) {
         
+        // [SELF-HEALING] Reparar picks corruptos o legacy ("unknown")
+        if (bet.pick === 'unknown' && bet.selection) {
+            const sel = bet.selection.toUpperCase();
+            if (sel.includes('OVER') || sel.includes('MÁS')) {
+                const line = parseFloat(sel.match(/\d+(\.\d+)?/)?.[0] || 0);
+                bet.pick = `over_${line}`;
+                hasChanges = true;
+            } else if (sel.includes('UNDER') || sel.includes('MENOS')) {
+                const line = parseFloat(sel.match(/\d+(\.\d+)?/)?.[0] || 0);
+                bet.pick = `under_${line}`;
+                hasChanges = true;
+            } else if (sel.includes('HOME') || sel.includes('LOCAL')) {
+                bet.pick = 'home';
+                hasChanges = true;
+            } else if (sel.includes('AWAY') || sel.includes('VISITA')) {
+                bet.pick = 'away';
+                hasChanges = true;
+            } else if (sel.includes('DRAW') || sel.includes('EMPATE')) {
+                bet.pick = 'draw';
+                hasChanges = true;
+            }
+            if (bet.pick !== 'unknown') console.log(`🔧 Pick reparado para ${bet.match}: ${bet.pick}`);
+        }
+
         // Intentar encontrar por ID primero, luego por Nombre
         let liveEvent = bet.eventId ? liveMap.get(bet.eventId) : liveMap.get(bet.match);
 
@@ -170,6 +261,50 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
             if (!bet.eventId && liveEvent.id) {
                 bet.eventId = liveEvent.id;
                 hasChanges = true;
+            }
+
+            // [NUEVO] Early Settlement Check (Liquidación Anticipada)
+            // Si la apuesta ya se ganó matemáticamente (ej. Over 2.5 y van 3-0), cerramos YA.
+            let earlyWin = false;
+            const currentTotal = liveEvent.score[0] + liveEvent.score[1];
+            
+            // 1. Check Over
+            if (bet.pick && bet.pick.startsWith('over_')) {
+                const line = parseFloat(bet.pick.split('_')[1]);
+                if (currentTotal > line) earlyWin = true;
+            }
+            
+            // 2. Check BTTS Yes
+            if (bet.pick === 'btts_yes') {
+                 if (liveEvent.score[0] > 0 && liveEvent.score[1] > 0) earlyWin = true;
+            }
+
+            // [NUEVO] Si ya se pagó (Early Payout), no recalcular trigger, solo mantener activo
+            if (bet.payoutReceived) {
+                updatedActiveBets.push(bet);
+                continue;
+            }
+
+            if (earlyWin) {
+                console.log(`⚡ EARLY SETTLEMENT (PAYOUT): ${bet.match} - ${bet.pick} [Score: ${currentScoreStr}]. Keeping active.`);
+                
+                // Calcular retorno
+                const returnAmt = (bet.stake * bet.odd);
+                const profit = returnAmt - bet.stake;
+                
+                // 1. Pagar YA (Actualizar Balance en Memoria)
+                portfolio.balance += returnAmt; 
+                
+                // 2. Marcar como pagada pero MANTENER ACTIVA (para tracking visual)
+                bet.payoutReceived = true;
+                bet.earlyPayoutCollected = true;
+                bet.status = 'WON'; 
+                bet.profit = profit;
+                bet.return = returnAmt;
+                
+                updatedActiveBets.push(bet);
+                hasChanges = true;
+                continue; 
             }
 
             updatedActiveBets.push(bet);
@@ -209,7 +344,11 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
             let shouldCheckResult = false;
             const now = Date.now();
 
-            if (bet.matchDate) {
+            // [FIX] Si ya teníamos tracking en vivo (minutos > 0) y desapareció del feed,
+            // asumimos interrupción o fin. Verificar resultado INMEDIATAMENTE ignorando el timer.
+            const wasLive = bet.liveTime && bet.liveTime !== "0'" && bet.liveTime !== "" && !bet.liveTime.includes("00:00");
+
+            if (bet.matchDate && !wasLive) {
                 const matchTime = new Date(bet.matchDate).getTime();
                 const hoursSinceStart = (now - matchTime) / (1000 * 60 * 60); // Horas pasadas
                 
@@ -218,7 +357,7 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
                     shouldCheckResult = true;
                 }
             } else {
-                // Si no tiene fecha (Live Snipe) y desaparece del feed, 
+                // Si no tiene fecha (Live Snipe) O YA ESTABA VIVO y desaparece, 
                 // asumimos que acaba de terminar. Verificación inmediata (sin espera).
                 shouldCheckResult = true;
             }
@@ -288,13 +427,16 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
                                     // 3. Backup: Si la apuesta tiene más de 3 horas de creada (seguro de vida)
                                     const hoursSinceCreation = (Date.now() - new Date(bet.createdAt).getTime()) / 3600000;
                                     if (hoursSinceCreation > 3) safeToClose = true;
+
+                                    // 4. Force Close Extreme (Anti-Stuck): Si el evento tiene más de 120 mins de vida teórica
+                                    if (timeVal > 120) safeToClose = true;
                                     
                                 } catch (err) {
                                     safeToClose = true; // Ante error de cálculo, asumir cerrado para evitar bloqueos
                                 }
 
                                 if (safeToClose) {
-                                    console.log(`⚠️ Evento ${bet.eventId} no encontrado y tiempo cumplido. Asumiendo finalizado (Zombie Bet).`);
+                                    console.log(`⚠️ Evento ${bet.eventId} (${bet.match}) tiempo cumplido/no encontrado. Cerrando.`);
                                     isFinished = true;
                                 } else {
                                     // Si desaparece al minuto 80, NO cerramos aún. Esperamos que el reloj virtual avance.
@@ -320,8 +462,26 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
                         finalScore = [parseInt(parts[0]), parseInt(parts[1])];
                     }
                     
-                    const result = settleBet(bet, finalScore);
-                    settledBets.push(result);
+                    if (bet.payoutReceived) {
+                        // Ya se cobró. Cierre administrativo.
+                        bet.finalScore = `${finalScore[0]}-${finalScore[1]}`;
+                        bet.closedAt = new Date().toISOString();
+                        
+                        // Validar profit por integridad
+                        if (bet.profit === undefined) {
+                             const ret = bet.stake * bet.odd;
+                             bet.profit = ret - bet.stake;
+                             bet.return = ret;
+                        }
+
+                        // Push a settledBets para mover a history
+                        settledBets.push(bet);
+                    } else {
+                        // Liquidación Estandar (Late Win o Loss)
+                        const result = settleBet(bet, finalScore);
+                        settledBets.push(result);
+                    }
+                    
                     hasChanges = true;
                     continue; // No agregamos a updatedActiveBets porque ya se cerró
                 }
@@ -336,7 +496,13 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
     if (hasChanges || settledBets.length > 0) {
         portfolio.activeBets = updatedActiveBets;
         portfolio.history.push(...settledBets);
-        portfolio.balance += settledBets.reduce((acc, b) => acc + (b.return || 0), 0);
+
+        // Sumar SOLO los returns que no se hayan cobrado anticipadamente
+        const pendingReturns = settledBets
+            .filter(b => !b.earlyPayoutCollected)
+            .reduce((acc, b) => acc + (b.return || 0), 0);
+
+        portfolio.balance += pendingReturns;
         await db.write();
         
         if (settledBets.length > 0) {
@@ -350,14 +516,41 @@ const settleBet = (bet, score) => {
     // [0] = home, [1] = away
     const homeGoals = score[0];
     const awayGoals = score[1];
+    const totalGoals = homeGoals + awayGoals;
     
     let outcome = 'LOSE';
-    if (homeGoals > awayGoals && bet.pick === 'home') outcome = 'WIN';
-    else if (awayGoals > homeGoals && bet.pick === 'away') outcome = 'WIN';
-    else if (homeGoals === awayGoals && bet.pick === 'draw') outcome = 'WIN';
+    const pick = bet.pick || "";
+
+    // A) 1x2 Logic
+    if (pick === 'home' && homeGoals > awayGoals) outcome = 'WIN';
+    else if (pick === 'away' && awayGoals > homeGoals) outcome = 'WIN';
+    else if (pick === 'draw' && homeGoals === awayGoals) outcome = 'WIN';
+
+    // B) Totals Logic (over_2.5, under_3.5)
+    else if (pick.startsWith('over_')) {
+        const line = parseFloat(pick.split('_')[1]);
+        if (totalGoals > line) outcome = 'WIN';
+    }
+    else if (pick.startsWith('under_')) {
+        const line = parseFloat(pick.split('_')[1]);
+        if (totalGoals < line) outcome = 'WIN';
+    }
+
+    // C) BTTS Logic
+    else if (pick === 'btts_yes') {
+        if (homeGoals > 0 && awayGoals > 0) outcome = 'WIN';
+    }
+    else if (pick === 'btts_no') {
+        if (homeGoals === 0 || awayGoals === 0) outcome = 'WIN';
+    }
     
-    const profit = outcome === 'WIN' ? (bet.stake * bet.odd) - bet.stake : -bet.stake;
+    // Calcular Profit (Solo si ganamos, descontamos base si perdemos ya se descontó al inicio)
+    // PEROO JOJO: En paperTrading al inicio restamos portfolio.balance -= stake.
+    // Así que si perdemos, profit es -stake (ya descontado) y returnAmount es 0.
+    // Si ganamos, returnAmount es (stake * odd).
+    
     const returnAmt = outcome === 'WIN' ? (bet.stake * bet.odd) : 0;
+    const profit = outcome === 'WIN' ? (returnAmt - bet.stake) : -bet.stake;
 
     return {
         ...bet,

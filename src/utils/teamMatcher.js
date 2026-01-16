@@ -9,7 +9,8 @@ const STOP_WORDS = [
     'u20', 'u21', 'u23', 'u19',
     '(f)', '(res.)', 'women', 'w', 'reserves',
     'olympic', 'belediye', 'spor', 'buyuksehir', 'bb',
-    'borough', 'ketema', 'kenema', 'iii', 'ii', 'b' // 'b' para equipos B si es token aislado, cuidado aquí.
+    'borough', 'ketema', 'kenema', 'iii', 'ii', 'b', // 'b' para equipos B
+    'tzeirey', 'hapoel', 'maccabi', 'beitar', 'ironi', 'bnei', 'sectzia', 'ahva' // PREFIJOS ISRAELIES COMUNES (Evitan matches falsos por prefijo)
     // 'royal', 'real', 'sporting', 'athletic', 'atletico' -> COMENTADO POR SEGURIDAD
   ];
 
@@ -122,8 +123,57 @@ const TEAM_ALIASES = {
     if (longer.length === 0) return 1.0;
     return (longer.length - levenshteinDistance(s1, s2)) / longer.length;
   };
+
+  // Calcula similitud de tokens (palabras completas)
+  const getTokenSimilarity = (name1, name2) => {
+    const tokens1 = new Set(name1.split(/\s+/));
+    const tokens2 = new Set(name2.split(/\s+/));
+    
+    // Intersección
+    let intersection = 0;
+    tokens1.forEach(t => {
+        // Buscamos coincidencia exacta o muy cercana (plurales simples, leones vs leon)
+        if (tokens2.has(t)) {
+            intersection++;
+        } else {
+            // Check singular/plural simple (spanish/english)
+            const singular = t.endsWith('s') ? t.slice(0, -1) : t;
+            const plural = t + 's';
+            if (tokens2.has(singular) || tokens2.has(plural)) intersection++;
+        }
+    });
+
+    const union = new Set([...tokens1, ...tokens2]).size;
+    return union === 0 ? 0 : intersection / union;
+  };
   
-  export const isTimeMatch = (dateStr1, dateStr2, toleranceMinutes = 1440) => { // Tolerancia ampliada a 24h (1440 min)
+  // Detecta discrepancias graves de categoría (Reservas, Femenino, Youth)
+  const isCategoryMismatch = (rawTarget, rawCandidate) => {
+      const t = rawTarget.toLowerCase();
+      const c = rawCandidate.toLowerCase();
+
+      // Lista de tokens peligrosos que deben coincidir si aparecen
+      const CRITICAL_TOKENS = ['u20', 'u19', 'u21', 'u23', 'reserve', 'res.', 'women', '(f)', 'fem', 'ii', 'iii', ' b ']; // ' b ' con espacios para evitar subset
+      
+      for (const token of CRITICAL_TOKENS) {
+          const tHas = t.includes(token);
+          const cHas = c.includes(token);
+          
+          if (tHas !== cHas) {
+              // Excepción: Si uno es "Women" y el otro "(F)" se considera igual.
+              const isWomenVar = (token === 'women' || token === '(f)' || token === 'fem');
+              if (isWomenVar) {
+                   const tIsFem = t.includes('women') || t.includes('(f)') || t.includes('fem');
+                   const cIsFem = c.includes('women') || c.includes('(f)') || c.includes('fem');
+                   if (tIsFem === cIsFem) continue; // Ambos son femeninos
+              }
+              return true; // Mismatch detectado
+          }
+      }
+      return false;
+  };
+
+  export const isTimeMatch = (dateStr1, dateStr2, toleranceMinutes = 180) => { // Tolerancia reducida a 3h (180 min) para mayor precisión
     const d1 = new Date(dateStr1).getTime();
     const d2 = new Date(dateStr2).getTime();
     const diffMs = Math.abs(d1 - d2);
@@ -153,7 +203,8 @@ const TEAM_ALIASES = {
     // 2. Comparar Nombres
     for (const candidate of timeCandidates) {
         let candidateNameRaw = candidate.home || candidate.name; 
-        
+        const originalCandidateName = candidateNameRaw; // Backup para check de categoría
+
         // ROBUST SPLITTER: Split by " vs " or " vs. " or "vs" with surrounding spaces/tabs
         // Handles multiple spaces/tabs like "Wolfsburg               vs. FC St Pauli"
         const splitMatch = candidateNameRaw.match(/\s+vs\.?\s+/i);
@@ -161,6 +212,13 @@ const TEAM_ALIASES = {
             candidateNameRaw = candidateNameRaw.split(splitMatch[0])[0];
         } else if (candidateNameRaw.includes(' vs ')) {
              candidateNameRaw = candidateNameRaw.split(' vs ')[0];
+        }
+
+        // 0. SAFETY CHECK: Categoría (Evita Reserves vs Pro, Women vs Men)
+        // Usamos targetTeamName original y originalCandidateName
+        if (isCategoryMismatch(targetTeamName, originalCandidateName)) {
+             // console.log(`Ignorando mismatch categoría: ${targetTeamName} vs ${originalCandidateName}`);
+             continue;
         }
 
         const normCandidate = normalizeName(candidateNameRaw);
@@ -178,11 +236,16 @@ const TEAM_ALIASES = {
              return { match: candidate, score: 1.0, method: 'alias_reverse' };
         }
   
-        // B. Inclusión
-        if (normTarget.includes(normCandidate) || normCandidate.includes(normTarget)) {
-             if (0.9 > highestScore) {
-                 highestScore = 0.9;
-                 bestMatch = { match: candidate, score: 0.9, method: 'includes' };
+        // B. Token Matching (Mejorado sobre .includes)
+        // Reemplaza la lógica simple de includes que causaba "Club Leon" == "Leones Negros"
+        const tokenScore = getTokenSimilarity(normTarget, normCandidate);
+        if (tokenScore >= 0.5) { // al menos 50% de overlap de palabras
+             // Si target es corto (1 palabra), requiere 100% de esa palabra (exactitud)
+             // "Leon" vs "Leones" -> tokenScore bajo si no matchea plural.
+             
+             if (tokenScore > highestScore) {
+                 highestScore = tokenScore;
+                 bestMatch = { match: candidate, score: tokenScore, method: 'token_match' };
              }
         }
   
@@ -194,7 +257,7 @@ const TEAM_ALIASES = {
         }
     }
   
-    if (highestScore >= 0.65) {
+    if (highestScore >= 0.77) {
         return bestMatch;
     }
   

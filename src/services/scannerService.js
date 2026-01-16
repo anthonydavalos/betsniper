@@ -66,7 +66,8 @@ export const startBackgroundScanner = () => {
             // 3. MONITORING (Actualizar salidas)
             // ---------------------------------------------------------
             // Usamos los rawEvents para el tracking.
-            if (rawEvents && rawEvents.length > 0) {
+            // IMPORTANTE: Ejecutar siempre, incluso si rawEvents está vacío, para detectar partidos finalizados (Zombies)
+            if (rawEvents) {
                 await updateActiveBetsWithLiveData(rawEvents);
             }
 

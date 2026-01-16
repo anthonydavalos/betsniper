@@ -9,16 +9,43 @@ import { calculateKellyStake } from '../utils/mathUtils.js';
 
 /**
  * Obtiene un resumen ligero de TODOS los partidos en vivo de fútbol.
+ * Actualizado a /GetLivenow para soporte de tiempo extra y más mercados.
  */
 export const getLiveOverview = async () => {
     try {
         // sportId=66 (Fútbol), categoryId=0 (Mundo)
-        const { data } = await altenarClient.get('/GetLiveOverview', {
-            params: { sportId: 66, categoryId: 0 }
+        // Usamos GetLivenow en lugar de GetLiveOverview
+        const { data } = await altenarClient.get('/GetLivenow', {
+            params: { sportId: 66, categoryId: 0, eventCount: 100 }
         });
-        return data.events || [];
+        
+        // Normalización de Tiempos (Fix Visual 103' -> 90'+ y estado)
+        // Usamos la propiedad 'ls' (Live Status) para detectar tiempos extra
+        return (data.events || []).map(ev => {
+             const status = ev.ls || ""; 
+             let cleanTime = ev.liveTime;
+             const minutes = parseInt((ev.liveTime || "0").replace("'", "")) || 0;
+
+             // Detectar Extra Time / Prórrogas (>90 min)
+             // El usuario prefiere marcar como "Finalizado" (Settled) si entramos a tiempos extra.
+             // Updated: >= 90 para capturar también el "90'+" y forzar cierre visual.
+             const isExtraTime = minutes >= 90 || 
+                               status.toLowerCase().includes('adicional') || 
+                               status.toLowerCase().includes('prórroga') ||
+                               status.toLowerCase().includes('penal');
+
+             if (isExtraTime) {
+                 cleanTime = "Final"; // "Final" triggerea settlement inmediato en paperTradingService y se muestra limpio en UI.
+             }
+             
+             return {
+                 ...ev,
+                 liveTime: cleanTime,
+                 rawStatus: status
+             };
+        });
     } catch (error) {
-        console.error('❌ Error en GetLiveOverview:', error.message);
+        console.error('❌ Error en GetLivenow:', error.message);
         return [];
     }
 };
@@ -156,44 +183,222 @@ export const scanLiveOpportunities = async () => {
                         // Para V1, asumimos que la cuota actual en vivo paga MUCHO más que la pre-match.
                         // Usaremos la prob original como "target confidence".
                         
-                        // Simulamos encontrar la cuota en vivo (en producción es compleja de parsear)
-                        // Asumiremos cuota 2.50+ si va perdiendo
-                        const estimatedLiveOdd = 3.00; 
+                        // -----------------------------------------------------------
+                        // 4. ESTRATEGIA PURA (ARCADIA LIVE TRUTH)
+                        // -----------------------------------------------------------
+                        
+                        // A) Obtener Cuota Altenar (Value)
+                        let altenarOdd = 0;
+                        const targetSide = condition.side; // 'home' o 'away'
 
+                        if (details.markets && details.markets.length > 0) {
+                            const market1x2 = details.markets.find(m => m.typeId === 1 || m.name === '1x2' || m.name === 'Match Result');
+                            if (market1x2 && market1x2.odds) {
+                                const targetOddId = targetSide === 'home' ? 1 : 3; 
+                                const oddObj = market1x2.odds.find(o => o.typeId === targetOddId);
+                                if (oddObj) altenarOdd = oddObj.price;
+                            }
+                        }
+
+                        // B) Obtener Probabilidad Real (Pinnacle Arcadia Live)
+                        let realProb = 0;
+                        let isLivePinnacle = false;
+
+                        // Import dinámico para evitar ciclos si fuera necesario, o directo arriba
+                        const { getPinnacleLiveOdds, calculateNoVigProb } = await import('./pinnacleService.js');
+                        
+                        if (pinMatch.id) {
+                            const pinLiveOdds = await getPinnacleLiveOdds(pinMatch.id);
+                            if (pinLiveOdds) {
+                                // Calcular Total Implied Prob (Suma de inversas)
+                                const invHome = 1 / pinLiveOdds.home;
+                                const invAway = 1 / pinLiveOdds.away;
+                                const invDraw = pinLiveOdds.draw > 1 ? (1 / pinLiveOdds.draw) : 0; // Draw puede no existir o ser bajo
+                                const totalImplied = invHome + invAway + invDraw;
+                                
+                                // Seleccionar cuota objetivo
+                                const targetPinOdd = targetSide === 'home' ? pinLiveOdds.home : pinLiveOdds.away;
+                                
+                                // Calcular Prob Real sin Vig
+                                realProb = calculateNoVigProb(targetPinOdd, totalImplied);
+                                isLivePinnacle = true;
+                                console.log(`   🎯 Pinnacle Live Found: Home=${pinLiveOdds.home}, Away=${pinLiveOdds.away} -> RealProb(${targetSide})=${realProb.toFixed(1)}%`);
+                            }
+                        }
+
+                        // FALLBACK: Si Pinnacle no da live odds, usar lógica antigua de decaimiento sobre prematch
+                        if (!isLivePinnacle) {
+                            // Aplicar penalización por tiempo transcurrido si no tenemos dato real
+                            const minute = parseInt((event.liveTime||"0").replace("'", ""));
+                            const timeDecayFactor = Math.max(0.3, 1 - (minute / 120)); // Reduce prob conforme avanza tiempo
+                            realProb = condition.prematchProb * timeDecayFactor;
+                        }
+
+                        // C) Validar EV+ y Kelly
+                        // Si no hay cuota Altenar, no podemos apostar
+                        if (altenarOdd <= 1) {
+                            // console.log("   ❌ Altenar Odd no disponible o bloqueada.");
+                            continue; 
+                        }
+
+                        // Cálculo Kelly
+                        const kellyResult = calculateKellyStake(
+                            realProb, 
+                            altenarOdd, 
+                            db.data.portfolio.balance || 1000
+                        );
+                        
+                        // Solo push si hay valor positivo
+                        if (kellyResult.amount > 0) {
+                             opportunities.push({
+                                type: 'LIVE_SNIPE',
+                                eventId: event.id,
+                                match: event.name,
+                                league: pinMatch.league.name,
+                                sportId: event.sportId || 66,
+                                catId: event.catId || event.categoryId,
+                                champId: event.champId || event.championshipId,
+                                time: event.liveTime,
+                                score: condition.currentScore,
+                                favorite: condition.favorite,
+                                selection: condition.side === 'home' ? 'Home' : 'Away',
+                                
+                                reason: isLivePinnacle 
+                                    ? `EV+ Real detectado (Pin Live: ${(100/realProb).toFixed(2)})` 
+                                    : `Favorito perdiendo (Prob Est: ${realProb.toFixed(1)}%)`,
+                                    
+                                action: `Apostar a ${condition.side === 'home' ? 'LOCAL' : 'VISITA'}`,
+                                redCards: details.rc || 0,
+                                
+                                realProb: realProb, 
+                                odd: altenarOdd,
+                                ev: (((realProb)/100 * altenarOdd) - 1) * 100,
+                                kellyStake: kellyResult.amount
+                            });
+                        }
+                    }
+                } catch(error) {
+                    console.error(`Error details ${event.id}`, error);
+                }
+            }
+
+            // --- NUEVA ESTRATEGIA: NEXT GOAL VALUE (TOTALS) ---
+            const goalValue = checkGoalPressure(event, pinMatch);
+            if (goalValue) {
+                try {
+                    console.log(`   ⚽ Posible Gol Próximo: ${event.name} (Buscando Over ${goalValue.line})...`);
+                    
+                    // fetch details si no existían
+                    const details = await getEventDetails(event.id);
+                    let realOdd = 0;
+
+                    if (details && details.markets) {
+                        // Buscar mercado de Totales (Over/Under)
+                        // Altenar suele llamarlo "Total Goals", "Goals Over/Under", etc. typeId suele ser 2 o similar.
+                        const totalMarket = details.markets.find(m => 
+                            m.name.includes('Over/Under') || m.name.includes('Total Goals') || 
+                            m.name.includes('Total')
+                        );
+
+                        if (totalMarket && totalMarket.odds) {
+                            // Buscar la linea especifica (ej. 0.5, 1.5, 2.5)
+                            // Altenar prices tienen "line": 2.5
+                            // Ojo: "typeId": 4 suele ser Over, 5 Under (varía según config).
+                            // Confiamos en el "name" o estructura.
+                            
+                            // Filtrar por linea
+                            // Muchos mercados están agrupados. Buscamos el odd que tenga line == goalValue.line
+                            const overOdd = totalMarket.odds.find(o => 
+                                Math.abs(o.line - goalValue.line) < 0.1 && 
+                                (o.name || "").toLowerCase().includes("over") 
+                            );
+
+                            if (overOdd) {
+                                realOdd = overOdd.price;
+                            }
+                        }
+                    }
+
+                    if (realOdd > 1.2) { // Filtro minimo de cuota
+                        const estimatedProb = 55; // Mantenemos prob fija por ahora (TODO: Calcular real based on Live Vig)
+                        
                         opportunities.push({
-                            type: 'LIVE_SNIPE',
-                            eventId: event.id, // ID Vital para tracking
+                            type: 'LIVE_VALUE',
+                            eventId: event.id,
                             match: event.name,
                             league: pinMatch.league.name,
                             sportId: event.sportId || 66,
                             catId: event.catId || event.categoryId,
                             champId: event.champId || event.championshipId,
                             time: event.liveTime,
-                            score: condition.currentScore,
-                            favorite: condition.favorite,
-                            reason: `Favorito pre-match perdiendo por 1 gol.`,
-                            action: `Apostar a ${condition.side === 'home' ? 'LOCAL' : 'VISITA'}`,
-                            redCards: details.rc || 0, // Info de tarjetas
+                            score: goalValue.currentScore,
+                            market: 'Total',
+                            selection: `Apostar MÁS DE ${goalValue.line} GOLES`, // Action name for uniqueness
+                            pick: `over_${goalValue.line}`,
+                            reason: goalValue.reason,
+                            action: `Apostar MÁS DE ${goalValue.line} GOLES`,
                             
-                            // Datos financieros para Kelly Strategy
-                            realProb: condition.prematchProb * 0.7, // Ajuste conservador por ir perdiendo
-                            odd: estimatedLiveOdd,
-                            ev: 10, // Placeholder EV
-                            kellyStake: calculateKellyStake(
-                                (condition.prematchProb * 0.7) * 100, 
-                                estimatedLiveOdd, 
-                                db.data.portfolio.balance || 1000
-                            ).amount
+                            realProb: estimatedProb,
+                            odd: realOdd, // Cuota real obtenida
+                            ev: ((estimatedProb/100 * realOdd) - 1) * 100,
+                            kellyStake: calculateKellyStake(estimatedProb, realOdd, db.data.portfolio.balance || 1000).amount * 0.25 
                         });
+                    } else {
+                        // console.log(`   ❌ Cuota para Over ${goalValue.line} no encontrada o muy baja.`);
                     }
-                } catch(error) {
-                    console.error(`Error details ${event.id}`, error);
+
+                } catch (e) {
+                    console.error("Error fetching details for Goal Value", e);
                 }
             }
         }
     }
-
-    // [ELIMINADO] Bloque de Simulación TEST (Real Madrid vs Barcelona)
     
     return opportunities;
+};
+
+/**
+ * [NUEVO] Analiza si hay presión para un gol inminente (Especulativo basado en Pinnacle Pre-Match)
+ * Un favorito claro + marcador bajo/empate + tiempo avanzando = Probabilidad de gol subiendo.
+ */
+const checkGoalPressure = (liveEvent, pinnacleMatch) => {
+    
+    // 1. Filtrar Tiempo: Partidos "maduros" donde el gol apremia (35'-45' o 65'-85')
+    const timeStr = liveEvent.liveTime || "";
+    const min = parseInt(timeStr.replace("'", "")) || 0;
+    const isPressureTime = (min >= 35 && min <= 45) || (min >= 65 && min <= 85);
+    
+    if (!isPressureTime) return null;
+
+    // 2. ¿Se espera gol? (Over 2.5 Pinnacle era bajo aka < 1.90?)
+    // Si Pinnacle pre-match daba Over 2.5 < 1.80, es un partido de goles.
+    let expectedGoalsHigh = false;
+    if (pinnacleMatch.odds && pinnacleMatch.odds.totals) {
+         // Buscar linea 2.5
+         const line25 = pinnacleMatch.odds.totals.find(t => Math.abs(t.line - 2.5) < 0.1);
+         if (line25) {
+             // Convertir prob implicita
+             const probOver = 1 / line25.over; 
+             if (probOver > 0.55) expectedGoalsHigh = true; // > 55% de esperanza de over
+         }
+    }
+
+    if (!expectedGoalsHigh) return null;
+
+    // 3. Marcador Actual Bajo
+    // Si se esperaban goles y vamos 0-0 o 1-0/0-1, hay presión.
+    const [h, a] = liveEvent.score || [0, 0];
+    const totalGoals = h + a;
+    
+    if (totalGoals > 2) return null; // Ya hubo fiesta, riesgo de que se cierren
+
+    // 4. Determinar Línea a Atacar (Current Total + 0.5)
+    // Altenar suele ofrecer Over X.5. Si van 1-0 (Total 1), buscamos Over 1.5.
+    const targetLine = totalGoals + 0.5;
+
+    return {
+        line: targetLine,
+        currentScore: `${h}-${a}`,
+        reason: `Partido de alta expectativa de gol (Prematch) con marcador bajo en minuto ${min}'.`
+    };
 };

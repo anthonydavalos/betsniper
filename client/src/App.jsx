@@ -129,11 +129,56 @@ function App() {
     if (activeTab === 'LIVE') {
         return liveOps; // Siempre muestra todo lo live
     } else if (activeTab === 'FINISHED') {
-        return portfolio.history.map(h => ({
+        // 1. Historial Real (Ya liquidadas)
+        const historyData = portfolio.history.map(h => ({
             ...h,
-            date: h.closedAt, // Adapter
+            date: h.closedAt, 
             isFinished: true
         }));
+
+        // 2. Activas "Maduras" (Probablemente finalizadas pero esperando API Results)
+        // Criterio Mejorado: Usar liveTime y lastUpdate para ser más agresivos moviendo a "Finalizados"
+        const pendingFinishData = (portfolio.activeBets || []).filter(b => {
+             const betTime = new Date(b.createdAt).getTime();
+             const minutesSinceBet = (Date.now() - betTime) / 60000;
+             
+             // Si tiene liveTime (ej: "82'")
+             if (b.liveTime) {
+                 const lastKnownMinute = parseInt(b.liveTime) || 0;
+                 // Tiempo desde la última actualización (feed vivo)
+                 const lastUpdate = new Date(b.lastUpdate || b.createdAt).getTime();
+                 const minutesSinceUpdate = (Date.now() - lastUpdate) / 60000;
+
+                 // Si la última vez que lo vimos iba por el 15', 30'... es ACTIVE, no Finished.
+                 // Solo mover a Finished si:
+                 // A. Calculamos que ya pasó el minuto 105
+                 const estimatedCurrentMinute = lastKnownMinute + minutesSinceUpdate;
+                 if (estimatedCurrentMinute > 105) return true;
+                 
+                 // B. Estaba en min 80+ y hace más de 7 min no actualiza (se acabó feed)
+                 if (lastKnownMinute > 80 && minutesSinceUpdate > 7) return true;
+             } else {
+                // Fallback para PreMatch o Snipes sin tiempo capturado
+                const eventStartTime = new Date(b.matchDate || b.createdAt).getTime();
+                const minutesSinceStart = (Date.now() - eventStartTime) / 60000;
+             
+                // Si pasaron más de 140 minutos desde el inicio
+                if (minutesSinceStart > 140) return true;
+             }
+
+             return false;
+        }).map(b => ({
+            ...b,
+            date: b.createdAt,
+            // Flag especial para que la tabla sepa renderizarlo diferente
+            manualStatus: 'WAIT_RES' 
+        }));
+
+        // Ordenar por fecha reciente
+        const allFinished = [...pendingFinishData, ...historyData].sort((a,b) => new Date(b.date) - new Date(a.date));
+        
+        // Filtro por fecha (solicitado por user)
+        return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
     } else {
         // TAB: ALL o PRÓXIMOS
         // Comportamiento Flashscore: Mostrar Live + Prematch del día seleccionado
@@ -209,10 +254,10 @@ function App() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <main className="max-w-7xl mx-auto space-y-6">
         
-        {/* --- LEFT COLUMN --- */}
-        <div className="lg:col-span-2 space-y-0">
+        {/* PANEL PRINCIPAL UNIFICADO */}
+        <div className="space-y-0">
             
             {/* 1. TABS DE NAVEGACIÓN (ALL | LIVE | FINISHED) */}
             <div className="flex bg-slate-800 rounded-t-xl border-b border-slate-700 overflow-hidden">
@@ -238,7 +283,7 @@ function App() {
             </div>
 
             {/* 2. DATE FILTER BAR (Solo visible si no es FINISHED/LIVE puro) */}
-            {activeTab === 'ALL' && (
+            {(activeTab === 'ALL' || activeTab === 'FINISHED') && (
                 <div className="bg-slate-800 border-b border-slate-700 p-2 flex justify-between items-center select-none">
                     <button onClick={() => changeDate(-1)} className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors">
                         <ChevronLeft className="w-4 h-4" />
@@ -271,15 +316,16 @@ function App() {
                                 <th className="p-3 w-32">Status / Hora</th>
                                 <th className="p-3">Evento</th>
                                 <th className="p-3 text-center">Selección</th>
-                                <th className="p-3 text-center">Cuota (Dorado)</th>
+                                <th className="p-3 text-center">Cuota</th>
                                 <th className="p-3 text-center">EV%</th>
                                 <th className="p-3 text-center">Stake (Kelly)</th>
+                                <th className="p-3 text-center">Resultado</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-700">
                              {filteredOps.length === 0 ? (
                                 <tr>
-                                    <td colSpan="6" className="p-12 text-center text-slate-500 italic flex flex-col items-center justify-center gap-2">
+                                    <td colSpan="7" className="p-12 text-center text-slate-500 italic flex flex-col items-center justify-center gap-2">
                                         <Filter className="w-8 h-8 opacity-20" />
                                         No hay partidos para el filtro seleccionado.
                                     </td>
@@ -290,63 +336,109 @@ function App() {
                                     // Fix: Evitar que partidos viejos (>150 min) sin resultado se muestren como "Live 600'"
                                     const isReallyLiveType = op.type === 'LIVE_SNIPE' || op.type === 'LIVE_VALUE' || op.type === 'LA_VOLTEADA';
                                     const minutesElapsed = op.date ? Math.floor((new Date() - new Date(op.date))/60000) : 0;
-                                    const isLive = isReallyLiveType || (new Date(op.date) < new Date() && !op.isFinished && minutesElapsed < 150);
                                     
+                                    // [MOD] Lógica Visual Strict: Si dice "Final", NO es live, aunque sea 'LIVE_SNIPE'.
+                                    const isExplicitlyFinished = op.time === 'Final' || op.liveTime === 'Final' || (minutesElapsed > 120 && isReallyLiveType);
+                                    
+                                    const isLive = !isExplicitlyFinished && (isReallyLiveType || (new Date(op.date) < new Date() && !op.isFinished && minutesElapsed < 150));
+                                    
+                                    // Búsqueda en historial para ver si esta operación fue ejecutada
+                                    // Fix: Linkeo robusto por eventId + selection (manejo de fallback)
+                                    const opSelection = op.selection || op.action;
+                                    const historyMatch = portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
+                                    const activeMatch = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
+                                    
+                                    const executionStatus = historyMatch ? 'FINISHED' : (activeMatch ? 'ACTIVE' : 'PENDING');
+                                    const betData = historyMatch || activeMatch || op; 
+
+                                    // Display Logic Fixes: Include Explicit Finish here
+                                    const showFinished = executionStatus === 'FINISHED' || op.isFinished || isExplicitlyFinished;
+
                                     return (
                                     <tr key={idx} className={`hover:bg-slate-700/50 transition-colors ${isLive ? 'bg-slate-800/80 border-l-2 border-red-500' : ''}`}>
                                         <td className="p-3">
                                             {/* LOGICA DE STATUS/HORA */}
                                             {isLive ? (
                                                 <div className="flex flex-col gap-1">
-                                                    <span className="flex items-center gap-1 text-red-500 animate-pulse font-bold bg-red-500/10 px-2 py-0.5 rounded w-fit">
+                                                    <span className="flex items-center gap-1 text-red-500 animate-pulse font-bold bg-red-500/10 px-2 py-0.5 rounded w-fit text-[10px]">
                                                        <Clock className="w-3 h-3" />
-                                                       {typeof op.time === 'string' ? op.time : `${minutesElapsed}'`}
+                                                       {/* Live Timer */}
+                                                       {typeof op.time === 'string' && op.time.length < 10 
+                                                            ? op.time
+                                                            : (minutesElapsed > 90 ? `90'+` : `${minutesElapsed}'`)}
                                                     </span>
-                                                    {op.score && <span className="font-mono font-bold text-white pl-1">{op.score}</span>}
+                                                    {/* SCORE MOVED HERE BELOW TIMER */}
+                                                    <span className="font-mono font-bold text-white text-xs pl-0.5">
+                                                        {Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0'}
+                                                    </span>
                                                 </div>
-                                            ) : op.isFinished ? (
-                                                <span className="text-emerald-500 font-bold bg-emerald-500/10 px-2 py-1 rounded text-[10px] border border-emerald-500/20">FIN</span>
-                                            ) : (minutesElapsed > 150) ? (
+                                            ) : showFinished ? (
                                                 <div className="flex flex-col gap-1">
-                                                     <span className="text-amber-500 font-bold bg-amber-500/10 px-2 py-1 rounded text-[10px] w-fit">
-                                                        PEND
+                                                    <div className="flex items-center gap-1 text-emerald-500 font-bold bg-emerald-500/10 px-2 py-0.5 rounded text-[10px] border border-emerald-500/20 w-fit">
+                                                        <span>FIN</span>
+                                                    </div>
+                                                    {/* SCORE BELOW FIN */}
+                                                     <span className="font-mono font-bold text-slate-300 text-xs pl-0.5">
+                                                        {betData.finalScore || betData.lastKnownScore || betData.score || '?-?'}
                                                      </span>
+                                                     {/* DATE BELOW SCORE */}
+                                                     <span className="text-[9px] text-slate-500 leading-tight">
+                                                        {new Date(op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                     </span>
+                                                </div>
+                                            ) : (op.manualStatus === 'WAIT_RES' || minutesElapsed > 150) ? (
+                                                <div className="flex flex-col gap-1">
+                                                     <div className="flex items-center gap-1 text-amber-500 font-bold bg-amber-500/10 px-2 py-1 rounded text-[10px] w-fit">
+                                                        <span>VERIFICANDO</span>
+                                                        {betData.liveTime && <span className="text-[9px] opacity-75">({betData.liveTime})</span>}
+                                                     </div>
                                                      <span className="text-[10px] text-slate-500">Esperando Res.</span>
+                                                     {(betData.finalScore || betData.lastKnownScore) && <span className="font-mono font-bold text-slate-400 pl-1 text-[10px]">{betData.finalScore || betData.lastKnownScore}</span>}
                                                 </div>
                                             ) : (
                                                 <div className="flex flex-col">
                                                     <span className="text-slate-200 font-mono font-bold">
                                                         {new Date(op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
                                                     </span>
+                                                    <span className="text-[10px] text-slate-500">
+                                                        {new Date(op.date).toLocaleDateString()}
+                                                    </span>
                                                 </div>
                                             )}
                                         </td>
                                         <td className="p-3">
-                                            <div className="text-slate-200 font-bold text-sm">{op.match}</div>
+                                            <div className="text-slate-200 font-bold text-sm text-wrap max-w-[200px] md:max-w-none">{op.match}</div>
                                             <div className="text-slate-500 text-[10px] flex gap-2">
                                                 <span>{op.league}</span>
+                                                <span className="text-slate-600">|</span>
+                                                <span>{op.market || '1x2'}</span>
                                             </div>
                                         </td>
                                         <td className="p-3 text-center">
-                                            <span className={`font-bold px-2 py-1 rounded border text-[10px] ${
+                                            <span className={`font-bold px-2 py-1 rounded border text-[10px] whitespace-nowrap ${
                                                 op.selection?.includes('Home') || op.action?.includes('LOCAL') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 
                                                 op.selection?.includes('Away') || op.action?.includes('VISITA') ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 
                                                 'bg-slate-700 text-slate-300 border-slate-600'
                                             }`}>
-                                                {op.selection === 'Home' || op.action?.includes('LOCAL') ? 'LOCAL (1)' : 
-                                                 op.selection === 'Away' || op.action?.includes('VISITA') ? 'VISITA (2)' : 'EMPATE (X)'}
+                                                {op.selection}
                                             </span>
                                         </td>
                                         <td className="p-3 text-center">
-                                            <span className="font-mono text-white font-bold bg-slate-900/40 px-2 py-1 rounded">
-                                                {(op.odd || 0).toFixed(2)}
-                                            </span>
+                                            <div className="flex flex-col items-center">
+                                                <span className="font-mono text-white font-bold bg-slate-900/40 px-2 py-1 rounded">
+                                                    {/* Mostrar LIVE ODD si disponible y es live */}
+                                                    {(op.odd || 0).toFixed(2)}
+                                                </span>
+                                                {isLive && (
+                                                    <span className="text-[8px] text-red-400 font-bold uppercase tracking-wider mt-0.5 animate-pulse">
+                                                        LIVE
+                                                    </span>
+                                                )}
+                                            </div>
                                         </td>
                                         <td className="p-3 text-center">
-                                             {op.isFinished ? (
-                                                 <span className={`font-bold ${op.status === 'WON' ? 'text-emerald-400' : 'text-red-400'}`}>
-                                                    {op.status}
-                                                 </span>
+                                             {executionStatus === 'FINISHED' ? (
+                                                 <span className="text-slate-500 font-mono text-xs">-</span>
                                              ) : (
                                                 <span className={`px-1.5 py-0.5 rounded font-bold ${op.ev > 5 ? 'text-emerald-400' : 'text-blue-400'}`}>
                                                     +{op.ev ? op.ev.toFixed(1) : '0.0'}%
@@ -354,121 +446,81 @@ function App() {
                                              )}
                                         </td>
                                         <td className="p-3 text-center">
-                                            {op.isFinished ? (
-                                                <span className={`font-mono font-bold ${op.profit > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                                                    {op.profit > 0 ? '+' : ''}{op.profit?.toFixed(2)}
-                                                </span>
-                                            ) : (
-                                                <div className="font-mono text-white text-sm bg-slate-900/50 px-2 py-1 rounded inline-block">
-                                                    S/. {(op.kellyStake || 0).toFixed(2)}
+                                            {/* STAKE EN JUEGO VS VIRTUAL */}
+                                            {executionStatus === 'FINISHED' || executionStatus === 'ACTIVE' ? (
+                                                <div className="flex flex-col items-center">
+                                                     <span className="font-mono text-xs text-slate-400 mb-0.5">Apostado</span>
+                                                     <div className={`font-mono font-bold text-sm px-2 py-0.5 rounded ${executionStatus === 'ACTIVE' ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700 text-slate-300'}`}>
+                                                        S/. {betData.stake ? betData.stake.toFixed(2) : op.kellyStake?.toFixed(2)}
+                                                     </div>
                                                 </div>
+                                            ) : (
+                                                <div className="flex flex-col items-center opacity-70">
+                                                    <span className="font-mono text-xs text-slate-500 mb-0.5">Sugerido</span>
+                                                    <div className="font-mono text-white text-sm bg-slate-900/50 px-2 py-0.5 rounded inline-block border border-dashed border-slate-600">
+                                                        S/. {(op.kellyStake || 0).toFixed(2)}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </td>
+                                        <td className="p-3 text-center">
+                                            {op.manualStatus === 'WAIT_RES' ? (
+                                                <div className="flex flex-col items-center">
+                                                    <span className="text-[10px] text-amber-500 font-bold bg-amber-900/20 px-2 py-1 rounded border border-amber-500/20 animate-pulse">
+                                                        VERIFICANDO
+                                                    </span>
+                                                    <span className="text-[9px] text-slate-500 mt-1">API RESULTADOS</span>
+                                                </div>
+                                            ) : (executionStatus === 'FINISHED' || op.isFinished) ? (
+                                                <div className="flex flex-col items-center justify-center p-1 rounded bg-slate-800/50">
+                                                    <span className={`font-bold text-xs ${betData.status === 'WON' ? 'text-emerald-400' : 'text-red-400'}`}>
+                                                        {betData.status === 'WON' ? 'GANADA' : 'PERDIDA'}
+                                                    </span>
+                                                    <span className={`font-mono font-bold text-sm ${betData.profit > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                                        {betData.profit > 0 ? '+' : ''}{betData.profit?.toFixed(2)}
+                                                    </span>
+                                                </div>
+                                            ) : executionStatus === 'ACTIVE' ? (
+                                                <span className="text-[10px] text-amber-400 animate-pulse font-bold">EN JUEGO</span>
+                                            ) : (
+                                                <span className="text-[10px] text-slate-600">--</span>
                                             )}
                                         </td>
                                     </tr>
                                 )})
                              )}
                         </tbody>
+                        {/* FOOTER TOTALES */}
+                        {filteredOps.length > 0 && (
+                            <tfoot className="bg-slate-900 font-bold text-slate-300 border-t-2 border-slate-700">
+                                <tr>
+                                    <td colSpan="5" className="p-3 text-right uppercase text-xs tracking-wider text-slate-500">
+                                        Total Apostado (Fecha):
+                                    </td>
+                                    <td className="p-3 text-center">
+                                        <div className="font-mono text-emerald-400 bg-emerald-900/10 px-2 py-1 rounded border border-emerald-500/20">
+                                            S/. {filteredOps.reduce((acc, op) => {
+                                                // Calcular total apostado REAL (si ya se ejecutó) o SUGERIDO (si es pending)
+                                                // Priorizar stake real de activeBets/history
+                                                const opSelection = op.selection || op.action;
+                                                const historyMatch = portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
+                                                const activeMatch = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
+                                                const betData = historyMatch || activeMatch || op;
+                                                
+                                                const stake = betData.stake || betData.kellyStake || 0;
+                                                return acc + stake;
+                                            }, 0).toFixed(2)}
+                                        </div>
+                                    </td>
+                                    <td className="p-3 text-center text-xs text-slate-500">
+                                        {filteredOps.length} Ops
+                                    </td>
+                                </tr>
+                            </tfoot>
+                        )}
                     </table>
                 </div>
             </section>
-        </div>
-
-        {/* --- RIGHT COLUMN --- */}
-        <div className="space-y-6">
-            
-            {/* ACTIVE BETS */}
-            <section className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-lg">
-                <div className="p-4 bg-slate-900/50 border-b border-slate-700">
-                    <h2 className="font-bold flex items-center gap-2 text-white text-xs uppercase tracking-wider">
-                        <Activity className="w-4 h-4 text-emerald-400" />
-                        Apuestas en Juego ({portfolio.activeBets.length})
-                    </h2>
-                </div>
-                <div className="max-h-80 overflow-y-auto">
-                    {portfolio.activeBets.length === 0 ? (
-                        <div className="p-6 text-center text-slate-500 text-xs">Esperando entrada automática...</div>
-                    ) : (
-                        <div className="divide-y divide-slate-700">
-                            {portfolio.activeBets.map((bet) => (
-                                <div className="p-3 hover:bg-slate-700/50 transition-colors">
-                                    <div className="flex justify-between items-start mb-1">
-                                         <div className="flex flex-col w-3/4">
-                                            {/* Si está en Vivo (tiene liveTime), mostramos tiempo actual */}
-                                            {bet.liveTime ? (
-                                                <div className="flex items-center gap-1 text-[10px] text-red-400 font-mono font-bold mb-0.5 animate-pulse">
-                                                     <Clock className="w-3 h-3" />
-                                                     LIVE {bet.liveTime}
-                                                </div>
-                                            ) : bet.matchDate ? (
-                                                /* Si es futuro, mostramos hora de inicio */
-                                                <div className="flex items-center gap-1 text-[10px] text-amber-500 font-mono mb-0.5">
-                                                     <Clock className="w-3 h-3" />
-                                                     {new Date(bet.matchDate).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
-                                                </div>
-                                            ) : null}
-
-                                            <span className="font-bold text-white text-xs truncate" title={bet.match}>{bet.match}</span>
-                                        </div>
-                                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${bet.status === 'PENDING' ? 'bg-yellow-500/20 text-yellow-400' : 'text-slate-300'}`}>
-                                            {bet.status}
-                                        </span>
-                                    </div>
-                                    <div className="flex justify-between text-xs text-slate-400 mb-2">
-                                        <span>Pick: <b className="text-emerald-400">{bet.selection}</b></span>
-                                        <span className="font-mono">@{bet.odd.toFixed(2)}</span>
-                                    </div>
-                                    <div className="flex justify-between items-center text-[10px] bg-slate-900/50 p-2 rounded">
-                                        <span>Score Actual: <b className="text-white">{bet.lastKnownScore}</b></span>
-                                        <span>Stake: {bet.stake.toFixed(2)}</span>
-                                    </div>
-                                    {/* Progress Bar (Simulated or Real Tracking) */}
-                                    <div className="mt-2 w-full bg-slate-700 h-1 rounded-full overflow-hidden">
-                                        <div className="bg-emerald-500 h-full w-1/3 animate-[shimmer_3s_infinite]"></div>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-            </section>
-
-             {/* HISTORY LOG */}
-             <section className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-lg flex-1">
-                <div className="p-4 bg-slate-900/50 border-b border-slate-700">
-                    <h2 className="font-bold flex items-center gap-2 text-white text-xs uppercase tracking-wider">
-                        <Archive className="w-4 h-4 text-slate-400" />
-                        Bitácora (Resueltas)
-                    </h2>
-                </div>
-                <div className="max-h-80 overflow-y-auto">
-                     {portfolio.history.length === 0 ? (
-                        <div className="p-6 text-center text-slate-500 text-xs">Sin historial de operaciones.</div>
-                    ) : (
-                        <div className="divide-y divide-slate-700">
-                            {portfolio.history.map((bet) => (
-                                <div key={bet.id} className="p-3 hover:bg-slate-700/50 transition-colors border-l-2 border-transparent hover:border-slate-500">
-                                    <div className="flex justify-between items-center mb-1">
-                                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${bet.status === 'WON' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
-                                            {bet.status} {bet.finalScore ? `(${bet.finalScore})` : ''}
-                                        </span>
-                                        <span className="text-[10px] text-slate-500 font-mono">
-                                            {new Date(bet.closedAt).toLocaleTimeString()}
-                                        </span>
-                                    </div>
-                                    <div className="font-medium text-slate-300 text-xs mb-1 truncate">{bet.match}</div>
-                                    <div className="flex justify-between items-center text-xs">
-                                        <span className="text-emerald-500/70">{bet.selection}</span>
-                                        <span className={`font-mono font-bold ${bet.profit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                                            {bet.profit >= 0 ? '+' : ''}{bet.profit.toFixed(2)} PEN
-                                        </span>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-            </section>
-
         </div>
       </main>
     </div>

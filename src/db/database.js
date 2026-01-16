@@ -36,17 +36,27 @@ const db = new Low(adapter, defaultData);
 export const initDB = async () => {
   await db.read();
   
+  let modified = false;
+
   // Si falta data, escribir los defaults
-  db.data ||= defaultData; 
+  if (!db.data) {
+    db.data = defaultData;
+    modified = true;
+  }
   
   // Asegurar que existan todas las claves principales
-  db.data.upcomingMatches ||= [];
-  db.data.config ||= defaultData.config;
-  db.data.mappedTeams ||= defaultData.mappedTeams;
-  db.data.liveTracking ||= [];
-
-  await db.write();
-  console.log('✅ Base de Datos LowDB (JSON) cargada correctamente.');
+  if (!db.data.upcomingMatches) { db.data.upcomingMatches = []; modified = true; }
+  if (!db.data.config) { db.data.config = defaultData.config; modified = true; }
+  if (!db.data.mappedTeams) { db.data.mappedTeams = defaultData.mappedTeams; modified = true; }
+  if (!db.data.liveTracking) { db.data.liveTracking = []; modified = true; }
+  
+  // Solo escribir si hubo cambios estructurales (evita trigger nodemon loop)
+  if (modified) {
+      await db.write();
+      console.log('✅ Base de Datos LowDB (JSON) inicializada y guardada.');
+  } else {
+      // console.log('✅ Base de Datos LowDB (JSON) cargada.');
+  }
 };
 
 export default db;

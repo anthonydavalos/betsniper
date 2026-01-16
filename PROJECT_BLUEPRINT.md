@@ -366,7 +366,7 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
             "name": "Menos de 1.5"
         }
     ],
-    "events": [17222-206096
+    "events":
         {
             "marketIds": [
                 1351757720,
@@ -609,6 +609,130 @@ El principal desafío aquí es la normalización de dos factores críticos:
 #### B. getLiveMatches()
 * **Endpoint:** `/GetLivenow`
 * **Params:** `eventCount=50` (Traer suficientes para escanear)
+
+*Estructura del JSON recibido (Ejemplo Live):*
+```json
+{
+    "topSports": [...],
+    "headers": [...],
+    "pageCount": 0,
+    "page": 0,
+    "markets": [
+        {
+            "oddIds": [3373640465, 3373640466, 3373640467],
+            "isAlt": true,
+            "typeId": 1,
+            "isMB": false,
+            "sportMarketId": 0,
+            "id": 3373640465,
+            "name": "Prórroga - 1x2"
+        },
+        {
+            "oddIds": [3373640465, 3373640466, 3373640467],
+            "typeId": 113,
+            "isMB": false,
+            "sportMarketId": 70681,
+            "id": 1360936639,
+            "name": "Prórroga - 1x2"
+        },
+        {
+            "oddIds": [3373398558, 3373398559],
+            "typeId": 29,
+            "isMB": false,
+            "sportMarketId": 70545,
+            "id": 1360851590,
+            "name": "Ambos equipos marcan"
+        },
+        {
+            "oddIds": [3373369213, 3373369212],
+            "typeId": 18,
+            "isMB": true,
+            "sportMarketId": 70520,
+            "sv": "3.5",
+            "sn": "3,5",
+            "id": 1360839697,
+            "name": "Total"
+        },
+        {
+            "oddIds": [3373595420, 3373595421],
+            "typeId": 18,
+            "isMB": true,
+            "sportMarketId": 70520,
+            "sv": "1.5",
+            "sn": "1,5",
+            "id": 1360918766,
+            "name": "Total"
+        },
+        {
+            "oddIds": [3370637335, 3370637336],
+            "typeId": 18,
+            "isMB": true,
+            "sportMarketId": 70520,
+            "sv": "2.5",
+            "sn": "2,5",
+            "id": 1359970567,
+            "name": "Total"
+        }
+    ],
+    "odds": [...],
+    "events": [
+        {
+            "liveTime": "103'",
+            "ls": "1ª Parte Adicional",
+            "score": [1, 1],
+            "marketIds": [3373640465, 1360936639, 1360936641],
+            "isBooked": true,
+            "isParlay": false,
+            "code": 1422,
+            "hasStream": false,
+            "extId": "fp32_ar:match:419134",
+            "sc": 14,
+            "mc": 4,
+            "rc": false,
+            "pId": 32,
+            "et": 0,
+            "hasStats": false,
+            "competitorIds": [47201, 47200],
+            "sportId": 66,
+            "catId": 499,
+            "champId": 2968,
+            "status": 1,
+            "startDate": "2026-01-16T15:00:00Z",
+            "id": 15214887,
+            "name": "CS Constantine vs. ES Sétif"
+        },
+        {
+            "liveTime": "94'",
+            "lst": "2026-01-16T15:51:00Z",
+            "ls": "2ª parte",
+            "score": [2, 2],
+            "marketIds": [],
+            "isBooked": true,
+            "isParlay": false,
+            "offers": [{"type": 6}],
+            "code": 3761,
+            "hasStream": false,
+            "extId": "fp32_ar:match:419983",
+            "sc": 101,
+            "mc": 13,
+            "rc": false,
+            "pId": 32,
+            "et": 0,
+            "hasStats": false,
+            "competitorIds": [172812, 47092],
+            "sportId": 66,
+            "catId": 1131,
+            "champId": 3099,
+            "status": 1,
+            "startDate": "2026-01-16T15:30:00Z",
+            "id": 15266367,
+            "name": "Vietnam Sub-23 vs. United Arab Emirates Sub-23"
+        }
+    ],
+    "sports": [...],
+    "categories": [...]
+}
+```
 
 ---
 
@@ -984,10 +1108,10 @@ El principal desafío aquí es la normalización de dos factores críticos:
 
 **MÓDULO: LIVE SCANNER (GetLiveOverview)**
 * **Objetivo:** Escaneo masivo de partidos en vivo para detectar oportunidades.
-* **Endpoint:** `/GetLiveOverview`
-* **Params:** `sportId=66` (Fútbol), `categoryId=0` (Mundo).
+* **Endpoint:** `/GetLivenow` (Actualizado desde `/GetLiveOverview` para mejor soporte de mercados y tiempos).
+* **Params:** `sportId=66` (Fútbol), `categoryId=0` (Mundo), `eventCount=100`.
 * **Procesamiento de Datos:**
-    1.  **LiveTime:** Convertir string "35'" a entero.
+    1.  **LiveTime "Final":** Si m > 90 o status indica prórroga, retornar string "Final" para gatillar liquidación inmediata.
     2.  **Score:** Viene como array `[1, 0]`.
     3.  **Mapeo:** Cruzar markets para buscar líneas de gol y hándicap.
 
@@ -1580,20 +1704,28 @@ Este módulo debe correr en un bucle (`setInterval`) inteligente.
 
 #### D. MOTOR DE LIQUIDACIÓN Y PAPER TRADING (Settlement Engine)
 
-El sistema de Paper Trading debe gestionar de forma inteligente el ciclo de vida de la apuesta para evitar falsos negativos.
+El sistema de Paper Trading debe gestionar de forma inteligente el ciclo de vida de la apuesta para evitar falsos negativos y visualizar correctamente el estado.
 
 **Requisito de Persistencia:**
 Al crear una apuesta, **GUARDAR OBLIGATORIAMENTE**: `sportId`, `catId`, `champId`. Son necesarios para buscar el resultado oficial si el partido se vuelve "Zombie".
 
 **Reglas de Cierre de Apuestas:**
-1.  **Pre-Match Safety:** Las apuestas Pre-Match tienen un bloqueo de **2.2 horas** desde el inicio oficial (`matchDate`). No se verifica el resultado antes de este tiempo para evitar errores durante el entretiempo.
-2.  **Live Snipes (Smart Settlement):**
-    *   Si el evento desaparece del feed (`GetEventDetails` devuelve null):
-        *   **Zombie Protocol (Prioritario):** Consultar endpoint `GetEventResults` usando el `catId` y la fecha. Si devuelve score final, liquidar inmediatamente.
-        *   **Time Fallback:** Si no hay resultado en API de Resultados:
-            *   Si `liveTime` registrado era >= 90' → Liquidar inmediatamente.
-            *   Si `liveTime` < 90' → Calcular tiempo estimado. Si > 100' → Liquidar.
-    *   **Deadman Switch:** Si tras 3 horas de creada la apuesta sigue viva sin data ni resultados, forzar cierre para liberar recursos.
+1.  **Pre-Match Safety:** Las apuestas Pre-Match tienen un bloqueo de **2.2 horas** desde el inicio oficial (`matchDate`). NO se verifica el resultado antes de este tiempo salvo que el evento aparezca como "Final" en feeds oficiales.
+2.  **Live Snipes (Smart Settlement & Self-Healing):**
+    *   **Detección de Fin (Prórroga/Extra Time):** Si `liveTime >= 90'` o el estado contiene "Adicional/Prórroga", marcar inmediatamente como **"Final"** en Scanner y enviar a liquidación.
+    *   **Zombie Protocol (Prioritario):** Si el evento desaparece del feed (`GetEventDetails` devuelve null):
+        *   Consultar endpoint `GetEventResults` (API de Resultados) usando el `catId` y fecha. Si devuelve score, liquidar.
+        *   **Immediate Check:** Si el partido era LIVE (`wasLive=true`) y desaparece, verificar resultados de inmediato sin esperar buffers de tiempo.
+    *   **Time Fallback:** Si no hay API de resultados:
+        *   Si `liveTime` >= 90 o (tiempo registrado + transcurrido) > 100', liquidar.
+        *   **Frontend Cleanup:** Si han pasado > 120 minutos desde inicio y no hay data, visualizar como "Final" (FIN) para evitar bucles visuales de "90'+".
+
+## 3.1 MEJORAS DE MATCHING (CRUCE DE DATOS)
+Para evitar errores de cruce entre ligas dispares (Ej. Pro vs. U21/Reservas), se implementan reglas estrictas en `teamMatcher.js`:
+
+1.  **Categoría Mismatch (Blocker):** Si un nombre contiene tokens de categoría (`U19`, `U21`, `(Res.)`, `III`, `II`, `Women`, `(F)`) y el otro NO, el match es **rechazado automáticamente**, aunque el nombre base coincida.
+2.  **Token Similarity:** Se prioriza la coincidencia de palabras completas (Tokens) sobre `substrings` simples. Esto evita que "Leon" (4 letras) coincida con "Leones" (6 letras) solo por contener la raíz.
+3.  **Ventana Temporal Estrecha:** Reducción de tolerancia de tiempo de cruce a **3 horas** (180 min) para evitar conflictos en fechas consecutivas.
 
 ---
 
@@ -1614,8 +1746,10 @@ Implementar funciones puras en `mathUtils.js`:
 ## 5. REQUERIMIENTOS DEL FRONTEND (React)
 
 1.  **Dashboard Home:**
-    * Sección "Value Bets (Pre-match)": Tabla comparativa (Cuota Real vs DoradoBet | EV% | Kelly Stake).
-    * Sección "Live Snipes": Tarjetas de partidos en vivo que cumplen la condición de "Volteada".
+    *   Sección "Value Bets (Pre-match)": Tabla comparativa (Cuota Real vs DoradoBet | EV% | Kelly Stake).
+    *   Sección "Live Snipes": Tarjetas de partidos en vivo que cumplen la condición de "Volteada".
+    *   **Visualización de Estado:** Mostrar "FIN" para partidos finalizados en lugar de bucles de tiempo (Ej. "97'").
+    *   **Footer de Totales:** Barra inferior (`tfoot`) en las tablas de historial que sume automáticamente el Stake Total Real y Sugerido del día.
 2.  **Filtros:** Toggle para ver "Solo con Streaming".
 3.  **Config:** Input para definir mi Bankroll actual.
 4.  **Estructura Monorepo:** Mantener `/client` (Frontend) separado de la raíz (Backend) para evitar conflictos de `node_modules`.
