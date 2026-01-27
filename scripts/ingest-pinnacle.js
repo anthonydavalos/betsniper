@@ -1,42 +1,25 @@
-import axios from 'axios';
-import { randomUUID } from 'crypto';
 import { americanToDecimal } from '../src/utils/oddsConverter.js';
 import db, { initDB } from '../src/db/database.js';
-import fs from 'fs';
-import path from 'path';
+import { fileURLToPath } from 'url';
+import { pinnacleClient } from '../src/config/pinnacleClient.js';
 
 // --- CONFIGURATION ---
-const API_KEY = 'PINNACLE_API_KEY_PLACEHOLDER';
-const HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json',
-    'Content-Type': 'application/json',
-    'host': 'guest.api.arcadia.pinnacle.com',
-    'X-API-Key': API_KEY,
-};
+// Headers y API Key manejados por pinnacleClient
 
 // --- HELPERS ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fetchMarketsForMatch(matchId) {
-    const DEVICE_UUID = randomUUID(); // Use fresh UUID
     try {
-        const { data } = await axios.get(`https://guest.api.arcadia.pinnacle.com/0.1/matchups/${matchId}/markets/related/straight`, { 
-            headers: { ...HEADERS, 'X-Device-UUID': DEVICE_UUID } 
-        });
-        return data;
+        return await pinnacleClient.get(`/matchups/${matchId}/markets/related/straight`);
     } catch (e) {
         return [];
     }
 }
 
 async function fetchRelated(matchId) {
-    const DEVICE_UUID = randomUUID();
     try {
-        const { data } = await axios.get(`https://guest.api.arcadia.pinnacle.com/0.1/matchups/${matchId}/related`, { 
-            headers: { ...HEADERS, 'X-Device-UUID': DEVICE_UUID } 
-        });
-        return data;
+        return await pinnacleClient.get(`/matchups/${matchId}/related`);
     } catch (e) {
         return [];
     }
@@ -92,8 +75,9 @@ function processBTTS(markets, participants) {
     const ml = markets.find(m => m.type === 'moneyline' && m.period === 0 && m.status === 'open');
     if (!ml || !ml.prices || !participants) return null;
 
-    const partYes = participants.find(p => p.name === 'Yes');
-    const partNo = participants.find(p => p.name === 'No');
+    // Búsqueda insensible a mayúsculas
+    const partYes = participants.find(p => p.name && p.name.toLowerCase() === 'yes');
+    const partNo = participants.find(p => p.name && p.name.toLowerCase() === 'no');
 
     if (!partYes || !partNo) return null;
 
@@ -117,29 +101,29 @@ function processBTTS(markets, participants) {
     return null;
 }
 
-async function run() {
-    console.log("🚀 INICIANDO INGESTA PINNACLE (Reemplazo API-Sports)...");
+export const ingestPinnaclePrematch = async () => {
+    console.log("🚀 INICIANDO INGESTA PINNACLE (Camaleón Mode)...");
     await initDB();
 
-    const DEVICE_UUID = randomUUID();
-    
     // 1. Fetch Active Leagues
     let leagues = [];
     try {
         console.log("📡 Obteniendo ligas activas...");
-        const sportsRes = await axios.get(`https://guest.api.arcadia.pinnacle.com/0.1/sports/29/leagues?hasMatchups=true`, { 
-            headers: { ...HEADERS, 'X-Device-UUID': DEVICE_UUID } 
-        });
-        leagues = sportsRes.data.filter(l => l.matchupCount > 0);
+        const data = await pinnacleClient.get('/sports/29/leagues', { hasMatchups: true });
+        // Response is array directly
+        leagues = data.filter(l => l.matchupCount > 0);
     } catch (e) {
         console.error("❌ Error obteniendo ligas:", e.message);
         return;
     }
 
-    // 2. Define Date Range (Next 48 Hours)
+    // 2. Define Date Range (SOLO HOY para minimizar tráfico y riesgo)
     const now = new Date();
     const futureLimit = new Date();
-    futureLimit.setDate(now.getDate() + 2); 
+    futureLimit.setHours(23, 59, 59, 999); // Final de hoy
+    // futureLimit.setDate(now.getDate() + 2); // ANTES: 48 Horas
+    
+    console.log(`📅 Filtrando partidos desde AHORA hasta: ${futureLimit.toISOString()}`);
 
     let refinedMatches = [];
     let processedLeagues = 0;
@@ -151,10 +135,7 @@ async function run() {
         if (processedLeagues >= MAX_LEAGUES_TO_CHECK) break;
 
         try {
-            const matchesUrl = `https://guest.api.arcadia.pinnacle.com/0.1/leagues/${league.id}/matchups`;
-            const { data: matches } = await axios.get(matchesUrl, { 
-                headers: { ...HEADERS, 'X-Device-UUID': randomUUID() } 
-            });
+            const matches = await pinnacleClient.get(`/leagues/${league.id}/matchups`);
             
             const relevant = matches.filter(m => {
                 if (!m.startTime) return false;
@@ -180,7 +161,7 @@ async function run() {
                         const bttsSpec = related.find(r => 
                             r.special && 
                             r.special.description && 
-                            r.special.description.includes('Both Teams To Score')
+                            r.special.description.toLowerCase().includes('both teams to score')
                         );
 
                         if (bttsSpec) {
@@ -190,13 +171,16 @@ async function run() {
                         }
                     } catch (err) {
                         // Silent fail for optional markets
+                        // console.warn(`⚠️ Error BTTS para ${match.id}: ${err.message}`);
                     }
 
                     if (oddsML && oddsML.home && oddsML.away) {
                         refinedMatches.push({
                             id: match.id.toString(),
                             home: match.participants.find(p => p.alignment === 'home')?.name, 
+                            homeId: match.participants.find(p => p.alignment === 'home')?.id,
                             away: match.participants.find(p => p.alignment === 'away')?.name, 
+                            awayId: match.participants.find(p => p.alignment === 'away')?.id,
                             date: match.startTime, 
                             league: { name: league.name },
                             bookmaker: "Pinnacle",
@@ -213,14 +197,49 @@ async function run() {
         processedLeagues++;
     }
 
-    console.log(`💾 Guardando ${refinedMatches.length} partidos de Pinnacle en DB...`);
+    console.log(`💾 Fusionando partidos...`);
+
+    // --- LÓGICA DE FUSIÓN (MERGE) PARA NO PERDER LIVE MATCHES ---
+    // 1. Cargar partidos existentes
+    const existingMatches = db.data.upcomingMatches || [];
     
-    // Save to DB replacing the old collection
-    db.data.upcomingMatches = refinedMatches; 
+    // 2. Definir ventana de preservación: TODO EL DÍA DE HOY
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const endOfToday = new Date();
+    endOfToday.setHours(23, 59, 59, 999);
+
+    const keptMatches = existingMatches.filter(oldMatch => {
+        const oldDate = new Date(oldMatch.date);
+        
+        // Criterio: Es de HOY y no ha sido reemplazado por la nueva data
+        const isToday = oldDate >= startOfToday && oldDate <= endOfToday;
+        
+        // Si el partido "nuevo" ya existe en lo que acabamos de descargar, NO lo guardamos del viejo
+        // (Dejamos que la versión nueva, actualizada, tome el lugar)
+        const isReplacedByNew = refinedMatches.some(newMatch => newMatch.id === oldMatch.id);
+        
+        return isToday && !isReplacedByNew;
+    });
+
+    console.log(`   ♻️  Preservando ${keptMatches.length} partidos previos de HOY (en curso/recientes).`);
+    console.log(`   🆕 Insertando/Actualizando ${refinedMatches.length} partidos frescos desde API.`);
+
+    // 3. Fusionar Listas
+    const finalMatchList = [...keptMatches, ...refinedMatches];
+    
+    // Ordenar cronológicamente
+    finalMatchList.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    // Save to DB
+    db.data.upcomingMatches = finalMatchList; 
     db.data.lastUpdate = new Date().toISOString();
     await db.write();
     
-    console.log("✅ INGESTA PINNACLE COMPLETADA.");
+    console.log(`✅ INGESTA PINNACLE COMPLETADA. Total: ${finalMatchList.length} partidos en DB.`);
 }
 
-run();
+// Ejecución directa desde CLI
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    ingestPinnaclePrematch();
+}

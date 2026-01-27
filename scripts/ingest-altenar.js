@@ -1,19 +1,23 @@
 import altenarClient from '../src/config/axiosClient.js';
 import db, { initDB } from '../src/db/database.js';
 
-const ingestAltenarPrematch = async () => {
+import { fileURLToPath } from 'url';
+
+export const ingestAltenarPrematch = async () => {
   console.log('🚀 INICIANDO INGESTA MASIVA PRE-MATCH ALTENAR (DoradoBet)...');
   await initDB();
 
   try {
-    // Calcular rango de fechas para coincidir con Pinnacle (Hoy + 2 días)
+    // Calcular rango de fechas (SOLO HOY para optimizar tráfico)
     const now = new Date();
     const endDate = new Date();
-    endDate.setDate(now.getDate() + 2); // 48 horas de ventana
+    endDate.setHours(23, 59, 59, 999); // Final del día de hoy
 
-    console.log('📡 Consultando API Altenar /GetUpcoming (Massive Fetch)...');
+    console.log(`📡 Consultando API Altenar /GetUpcoming (Hasta: ${endDate.toISOString()})...`);
     
     // PARAMS EXACTOS DEL APPS SCRIPT (Sin eventCount explicito si el default es masivo)
+    // Añadimos endDate al request si la API lo soporta, pero filtramos localmente igual.
+    // Altenar suele traer todo por defecto o paginado. Filtramos en memoria.
     const response = await altenarClient.get('/GetUpcoming', {
       params: { 
           culture: 'es-ES',
@@ -63,6 +67,7 @@ const ingestAltenarPrematch = async () => {
           startDate: event.startDate,
           status: event.status, // 0 = Not started
           champId: event.champId,
+          catId: event.catId,   // ID de Categoría/País
           competitors: event.competitorIds, // IDs para referencia futura
           odds: {
               home: odds.home,
@@ -76,10 +81,37 @@ const ingestAltenarPrematch = async () => {
       }
     }
 
-    // 3. Persistir en DB
-    console.log(`💾 Guardando ${cleanEvents.length} eventos optimizados en DB...`);
+    // 3. Persistir en DB con Fusión Inteligente (Merge)
+    // Mantener eventos recientes de Altenar en memoria aunque desaparezcan del endpoint /Upcoming
+    // LOGICA SIMPLIFICADA: Si es de HOY (00:00 - 23:59), se queda.
     
-    db.data.altenarUpcoming = cleanEvents;
+    const existingEvents = db.data.altenarUpcoming || [];
+    
+    // Definir límites del día de hoy
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const endOfToday = new Date();
+    endOfToday.setHours(23, 59, 59, 999);
+
+    const keptEvents = existingEvents.filter(oldEv => {
+        const oldDate = new Date(oldEv.startDate);
+        
+        // Criterio: Es de HOY y no ha sido reemplazado por la nueva data
+        const isToday = oldDate >= startOfToday && oldDate <= endOfToday;
+        const isReplaced = cleanEvents.some(newEv => newEv.id === oldEv.id);
+        
+        return isToday && !isReplaced;
+    });
+
+    console.log(`   ♻️  Preservando ${keptEvents.length} eventos Altenar previos (pasaron a Live/Recientes).`);
+    console.log(`   🆕 Insertando/Actualizando ${cleanEvents.length} eventos frescos.`);
+
+    const finalEventList = [...keptEvents, ...cleanEvents];
+    finalEventList.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+    
+    console.log(`💾 Guardando Total: ${finalEventList.length} eventos optimizados en DB...`);
+    
+    db.data.altenarUpcoming = finalEventList;
     db.data.lastAltenarUpdate = new Date().toISOString();
     await db.write();
 
@@ -174,4 +206,7 @@ const extractOdds = (event, marketsMap, oddsMap) => {
   return result;
 };
 
-ingestAltenarPrematch();
+// Ejecución directa si se llama desde CLI (node scripts/ingest-altenar.js)
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    ingestAltenarPrematch();
+}

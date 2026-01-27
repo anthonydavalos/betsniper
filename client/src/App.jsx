@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { 
   Trophy, RefreshCw, Zap, TrendingUp, Calendar, Activity, RotateCcw, Archive, Clock, Volume2, 
-  ChevronLeft, ChevronRight, Filter, Layers
+  ChevronLeft, ChevronRight, Filter, Layers, Edit, Search
 } from 'lucide-react';
 
 // Sonido de Notificación (Ping Suave)
@@ -110,6 +110,35 @@ function App() {
   const totalProfit = portfolio.balance - initialCapital;
   const profitClass = totalProfit >= 0 ? 'text-emerald-400' : 'text-red-400';
 
+  // --- MANUAL SETTLEMENT ---
+  const requestSettle = async (id, mode) => {
+      let score = null;
+      if (mode === 'MANUAL') {
+          score = prompt("Ingrese marcador FINAL (Local-Visita):", "0-0");
+          if (score === null) return; // Cancelado
+      } else {
+          // Modo API aka "Auto"
+          if (!confirm("¿Intentar buscar resultado oficial en la API?")) return;
+      }
+      
+      try {
+          const res = await fetch(`http://localhost:3000/api/portfolio/settle/${id}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ score })
+          });
+          const json = await res.json();
+          if (json.success) {
+              fetchData(); 
+          } else {
+              alert("❌ Error: " + json.error);
+          }
+      } catch (e) {
+          console.error(e);
+          alert("Error de conexión con Backend");
+      }
+  };
+
   // --- FILTRADO DE DATOS (TIPO FLASHSCORE) ---
   const isSameDay = (d1, d2) => {
     return d1.getDate() === d2.getDate() && 
@@ -132,7 +161,7 @@ function App() {
         // 1. Historial Real (Ya liquidadas)
         const historyData = portfolio.history.map(h => ({
             ...h,
-            date: h.closedAt, 
+            date: h.matchDate || h.date || h.closedAt, 
             isFinished: true
         }));
 
@@ -183,14 +212,50 @@ function App() {
         // TAB: ALL o PRÓXIMOS
         // Comportamiento Flashscore: Mostrar Live + Prematch del día seleccionado
         
-        // 1. Si es HOY, incluimos Live Ops al principio
-        if (isSameDay(dateFilter, new Date())) {
-            data = [...liveOps];
-        }
+        // 1. Si es HOY, NO incluimos liveOps para separar estrictamente
+        // if (isSameDay(dateFilter, new Date())) {
+        //    data = [...liveOps];
+        // }
 
-        // 2. Filtrar Pre-Match por fecha seleccionada
-        const dayPrematch = prematchOps.filter(op => isSameDay(new Date(op.date), dateFilter));
-        data = [...data, ...dayPrematch];
+        // 2. Filtrar Pre-Match por fecha seleccionada Y eliminar duplicados que ya estén en Live
+        const dayPrematch = prematchOps.filter(op => {
+             if (!isSameDay(new Date(op.date), dateFilter)) return false;
+             
+             // Evitar que aparezca en "Todos" si ya está en "Live"
+             const isLive = liveOps.some(liveOp => 
+                 String(liveOp.eventId) === String(op.eventId) || 
+                 String(liveOp.pinnacleId) === String(op.pinnacleId)
+             );
+             return !isLive;
+        });
+        
+        // 3. [FIX] Inyectar APUESTAS ACTIVAS (Active Bets) que ya no están en scanners
+        // Esto resuelve que las apuestas desaparezcan cuando empieza el partido
+        const dayActiveBets = portfolio.activeBets.filter(bet => {
+             // a) Filtrar por fecha
+             if (!bet.matchDate) return false; // si no tiene fecha, skip
+             if (!isSameDay(new Date(bet.matchDate), dateFilter)) return false;
+
+             // b) Evitar duplicados (si ya está en liveOps o dayPrematch)
+             const existsInLive = liveOps.some(op => op.eventId === bet.eventId);
+             const existsInPrematch = dayPrematch.some(op => op.eventId === bet.eventId);
+             
+             return !existsInLive && !existsInPrematch;
+        }).map(bet => ({
+            ...bet,
+            date: bet.matchDate, // Normalizar date key
+            kellyStake: bet.stake, // Normalizar stake visual
+            ev: 0, // No recalculamos EV en runtime para bets viejas
+            manualStatus: 'ACTIVE_INJECTED',
+            time: bet.liveTime,
+            score: bet.lastKnownScore
+        }));
+
+        data = [...data, ...dayPrematch, ...dayActiveBets];
+        
+        // Ordenar por hora
+        data.sort((a,b) => new Date(a.date) - new Date(b.date));
+
         return data;
     }
   };
@@ -382,8 +447,8 @@ function App() {
                                                         {betData.finalScore || betData.lastKnownScore || betData.score || '?-?'}
                                                      </span>
                                                      {/* DATE BELOW SCORE */}
-                                                     <span className="text-[9px] text-slate-500 leading-tight">
-                                                        {new Date(op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                     <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
+                                                        {new Date(op.matchDate || op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
                                                      </span>
                                                 </div>
                                             ) : (op.manualStatus === 'WAIT_RES' || minutesElapsed > 150) ? (
@@ -426,8 +491,8 @@ function App() {
                                         <td className="p-3 text-center">
                                             <div className="flex flex-col items-center">
                                                 <span className="font-mono text-white font-bold bg-slate-900/40 px-2 py-1 rounded">
-                                                    {/* Mostrar LIVE ODD si disponible y es live */}
-                                                    {(op.odd || 0).toFixed(2)}
+                                                    {/* [FIX] Priorizar 'price' (Live) sobre 'odd', fallback a 0 */}
+                                                    {(op.price || op.odd || 0).toFixed(2)}
                                                 </span>
                                                 {isLive && (
                                                     <span className="text-[8px] text-red-400 font-bold uppercase tracking-wider mt-0.5 animate-pulse">
@@ -465,20 +530,49 @@ function App() {
                                         </td>
                                         <td className="p-3 text-center">
                                             {op.manualStatus === 'WAIT_RES' ? (
-                                                <div className="flex flex-col items-center">
+                                                <div className="flex flex-col items-center group relative p-1">
                                                     <span className="text-[10px] text-amber-500 font-bold bg-amber-900/20 px-2 py-1 rounded border border-amber-500/20 animate-pulse">
                                                         VERIFICANDO
                                                     </span>
                                                     <span className="text-[9px] text-slate-500 mt-1">API RESULTADOS</span>
+                                                    
+                                                    {/* BOTONES DE ACCIÓN MANUAL (HOVER) */}
+                                                    <div className="hidden group-hover:flex absolute inset-0 bg-slate-900/95 items-center justify-center gap-1 rounded z-10 border border-slate-700">
+                                                         <button 
+                                                            onClick={(e) => { e.stopPropagation(); requestSettle(betData.id, 'AUTO'); }} 
+                                                            className="p-1 hover:bg-blue-500/20 text-blue-400 rounded"
+                                                            title="Reintentar API"
+                                                         >
+                                                            <Search className="w-3 h-3" />
+                                                         </button>
+                                                         <button 
+                                                            onClick={(e) => { e.stopPropagation(); requestSettle(betData.id, 'MANUAL'); }}
+                                                            className="p-1 hover:bg-amber-500/20 text-amber-400 rounded"
+                                                            title="Corregir Manualmente"
+                                                         >
+                                                            <Edit className="w-3 h-3" />
+                                                         </button>
+                                                    </div>
                                                 </div>
                                             ) : (executionStatus === 'FINISHED' || op.isFinished) ? (
-                                                <div className="flex flex-col items-center justify-center p-1 rounded bg-slate-800/50">
+                                                <div className="flex flex-col items-center justify-center p-1 rounded bg-slate-800/50 group relative">
                                                     <span className={`font-bold text-xs ${betData.status === 'WON' ? 'text-emerald-400' : 'text-red-400'}`}>
                                                         {betData.status === 'WON' ? 'GANADA' : 'PERDIDA'}
                                                     </span>
                                                     <span className={`font-mono font-bold text-sm ${betData.profit > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                                                         {betData.profit > 0 ? '+' : ''}{betData.profit?.toFixed(2)}
                                                     </span>
+
+                                                    {/* BOTONES DE CORRECCIÓN (HOVER) */}
+                                                    <div className="hidden group-hover:flex absolute inset-0 bg-slate-900/95 items-center justify-center gap-1 rounded z-10 border border-slate-700">
+                                                         <button 
+                                                            onClick={(e) => { e.stopPropagation(); requestSettle(betData.id, 'MANUAL'); }}
+                                                            className="p-1 hover:bg-amber-500/20 text-amber-400 rounded"
+                                                            title="Corregir Resultado"
+                                                         >
+                                                            <Edit className="w-3 h-3" />
+                                                         </button>
+                                                    </div>
                                                 </div>
                                             ) : executionStatus === 'ACTIVE' ? (
                                                 <span className="text-[10px] text-amber-400 animate-pulse font-bold">EN JUEGO</span>

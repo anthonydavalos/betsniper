@@ -16,7 +16,7 @@ export const getLiveOverview = async () => {
         // sportId=66 (Fútbol), categoryId=0 (Mundo)
         // Usamos GetLivenow en lugar de GetLiveOverview
         const { data } = await altenarClient.get('/GetLivenow', {
-            params: { sportId: 66, categoryId: 0, eventCount: 100 }
+            params: { sportId: 66, categoryId: 0 } // Eliminado limit eventCount para ver todo
         });
         
         // Normalización de Tiempos (Fix Visual 103' -> 90'+ y estado)
@@ -100,21 +100,28 @@ export const getEventResult = async (sportId, catId, dateISO) => {
  * @param {Object} pinnacleMatch - Datos guardados de Pinnacle (Source of Truth)
  */
 const checkTurnaroundCondition = (liveEvent, pinnacleMatch) => {
+    const timeStr = (liveEvent.liveTime || "").toLowerCase();
+    
     // 1. Validar Tiempo de Juego (15' a 70')
-    const timeStr = liveEvent.liveTime || "";
-    const cleanTime = parseInt(timeStr.replace("'", "")) || 0;
+    let cleanTime = parseInt(timeStr.replace("'", "")) || 0;
+    
+    // [FIX] Tratar "Descanso" (HT) como minuto 45 para no perder oportunidades de medio tiempo
+    if (timeStr.includes("descanso") || timeStr.includes("half") || timeStr.includes("so") || timeStr.includes("ht")) {
+        cleanTime = 45;
+    }
     
     // Si no hay tiempo numérico o está fuera de rango
-    if (cleanTime < 15 || cleanTime > 75) return null;
+    // Extendemos rango hasta 80 para los "Late Snipes"
+    if (cleanTime < 15 || cleanTime > 80) return null;
 
     // 2. Validar Marcador (Diferencia de 1 gol)
+    // Altenar score comes as array [home, away]
     const [scoreHome, scoreAway] = liveEvent.score || [0, 0];
     const diff = scoreHome - scoreAway;
 
     if (Math.abs(diff) !== 1) return null; 
 
     // 3. Identificar Favorito según Pinnacle
-    // Antes > 0.60 (Cuota < 1.67). Ajustamos a > 0.55 (Cuota < 1.81) para ser más permisivos.
     if (!pinnacleMatch || !pinnacleMatch.odds) return null;
 
     const pHome = 1 / pinnacleMatch.odds.home;
@@ -122,8 +129,9 @@ const checkTurnaroundCondition = (liveEvent, pinnacleMatch) => {
 
     const MIN_PROB_FAVORITE = 0.55;
 
-    // CASO A: Favorito Local va perdiendo (Score: 0-1, 1-2...) => diff negativo
+    // CASO A: Favorito Local va perdiendo
     if (diff === -1 && pHome > MIN_PROB_FAVORITE) { 
+        console.log(`       ✅ Match Condition: ${liveEvent.name} (Home Fav ${pHome.toFixed(2)})`);
         return { 
             side: 'home', 
             favorite: pinnacleMatch.home, 
@@ -132,8 +140,9 @@ const checkTurnaroundCondition = (liveEvent, pinnacleMatch) => {
         };
     }
 
-    // CASO B: Favorito Visita va perdiendo (Score: 1-0, 2-1...) => diff positivo
+    // CASO B: Favorito Visita va perdiendo
     if (diff === 1 && pAway > MIN_PROB_FAVORITE) {
+        console.log(`       ✅ Match Condition: ${liveEvent.name} (Away Fav ${pAway.toFixed(2)})`);
         return { 
             side: 'away', 
             favorite: pinnacleMatch.away, 
@@ -162,6 +171,10 @@ export const scanLiveOpportunities = async () => {
     const liveEvents = await getLiveOverview();
     const opportunities = [];
 
+    // [DEBUG LOG]
+    console.log(`📡 Recibidos ${liveEvents.length} eventos live.`);
+    // liveEvents.forEach(e => console.log(`   - ${e.name} (ID: ${e.id}) [Linked? ${linkedMatches.has(e.id)}]`));
+
     for (const event of liveEvents) {
         const pinMatch = linkedMatches.get(event.id);
 
@@ -187,16 +200,36 @@ export const scanLiveOpportunities = async () => {
                         // 4. ESTRATEGIA PURA (ARCADIA LIVE TRUTH)
                         // -----------------------------------------------------------
                         
-                        // A) Obtener Cuota Altenar (Value)
+                        // A) Obtener Cuota Altenar (Value) - FIXED RELATIONAL MAPPING
                         let altenarOdd = 0;
-                        const targetSide = condition.side; // 'home' o 'away'
+                        const targetSide = condition.side; // 'home' or 'away'
+                        
+                        // Map de Odds para búsqueda rápida
+                        const oddsMap = new Map();
+                        if (details.odds && Array.isArray(details.odds)) {
+                            details.odds.forEach(o => oddsMap.set(o.id, o));
+                        }
 
                         if (details.markets && details.markets.length > 0) {
                             const market1x2 = details.markets.find(m => m.typeId === 1 || m.name === '1x2' || m.name === 'Match Result');
-                            if (market1x2 && market1x2.odds) {
+                            
+                            if (market1x2) { 
                                 const targetOddId = targetSide === 'home' ? 1 : 3; 
-                                const oddObj = market1x2.odds.find(o => o.typeId === targetOddId);
-                                if (oddObj) altenarOdd = oddObj.price;
+                                
+                                // Buscar IDs en desktopOddIds (Array de Arrays)
+                                const marketOddIds = (market1x2.desktopOddIds || []).flat(); 
+                                
+                                // Buscar el odd que coincida con el typeId y esté en este mercado
+                                const oddObj = marketOddIds.map(id => oddsMap.get(id)).find(o => o && o.typeId === targetOddId);
+                                
+                                if (oddObj) {
+                                    altenarOdd = oddObj.price;
+                                    console.log(`       ✅ Cuota Encontrada: ${altenarOdd} (Side: ${targetSide})`);
+                                } else {
+                                    console.log(`       ⚠️ Cuota NO encontrada para ${targetSide} en mercado 1x2`);
+                                }
+                            } else {
+                                console.log("       ⚠️ Mercado 1x2 NO encontrado en detalles.");
                             }
                         }
 
@@ -253,6 +286,7 @@ export const scanLiveOpportunities = async () => {
                              opportunities.push({
                                 type: 'LIVE_SNIPE',
                                 eventId: event.id,
+                                pinnacleId: pinMatch.id, // ID de Arcadia/Pinnacle para referencia
                                 match: event.name,
                                 league: pinMatch.league.name,
                                 sportId: event.sportId || 66,
@@ -260,6 +294,7 @@ export const scanLiveOpportunities = async () => {
                                 champId: event.champId || event.championshipId,
                                 time: event.liveTime,
                                 score: condition.currentScore,
+                                date: event.startDate, // Fecha de inicio real para la DB
                                 favorite: condition.favorite,
                                 selection: condition.side === 'home' ? 'Home' : 'Away',
                                 
@@ -293,6 +328,12 @@ export const scanLiveOpportunities = async () => {
                     let realOdd = 0;
 
                     if (details && details.markets) {
+                        // Map de Odds para búsqueda
+                        const oddsMap = new Map();
+                        if (details.odds && Array.isArray(details.odds)) {
+                            details.odds.forEach(o => oddsMap.set(o.id, o));
+                        }
+
                         // Buscar mercado de Totales (Over/Under)
                         // Altenar suele llamarlo "Total Goals", "Goals Over/Under", etc. typeId suele ser 2 o similar.
                         const totalMarket = details.markets.find(m => 
@@ -300,16 +341,15 @@ export const scanLiveOpportunities = async () => {
                             m.name.includes('Total')
                         );
 
-                        if (totalMarket && totalMarket.odds) {
-                            // Buscar la linea especifica (ej. 0.5, 1.5, 2.5)
-                            // Altenar prices tienen "line": 2.5
-                            // Ojo: "typeId": 4 suele ser Over, 5 Under (varía según config).
-                            // Confiamos en el "name" o estructura.
-                            
+                        if (totalMarket) { // && totalMarket.odds REMOVED
+                            // Relational Logic
+                            const marketOddIds = (totalMarket.desktopOddIds || []).flat();
+
                             // Filtrar por linea
                             // Muchos mercados están agrupados. Buscamos el odd que tenga line == goalValue.line
-                            const overOdd = totalMarket.odds.find(o => 
-                                Math.abs(o.line - goalValue.line) < 0.1 && 
+                            // Y que sea Over (Name match or typeId 12 approx)
+                            const overOdd = marketOddIds.map(id => oddsMap.get(id)).find(o => 
+                                o && Math.abs((o.line || totalMarket.line || 0) - goalValue.line) < 0.1 && 
                                 (o.name || "").toLowerCase().includes("over") 
                             );
 
@@ -325,6 +365,7 @@ export const scanLiveOpportunities = async () => {
                         opportunities.push({
                             type: 'LIVE_VALUE',
                             eventId: event.id,
+                            pinnacleId: pinMatch.id, // ID de Arcadia/Pinnacle para referencia
                             match: event.name,
                             league: pinMatch.league.name,
                             sportId: event.sportId || 66,
@@ -332,6 +373,7 @@ export const scanLiveOpportunities = async () => {
                             champId: event.champId || event.championshipId,
                             time: event.liveTime,
                             score: goalValue.currentScore,
+                            date: event.startDate, // Fecha de inicio real para la DB
                             market: 'Total',
                             selection: `Apostar MÁS DE ${goalValue.line} GOLES`, // Action name for uniqueness
                             pick: `over_${goalValue.line}`,

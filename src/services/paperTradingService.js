@@ -114,7 +114,8 @@ export const placeAutoBet = async (opportunity) => {
 
         // 2. Calcular Stake (Kelly)
         const realProb = opportunity.realProb || 50;
-        const odd = opportunity.odd || 2.0;          
+        // SOPORTE HÍBRIDO: 'odd' (Prematch/Standard) o 'price' (Live/Altenar)
+        const odd = opportunity.odd || opportunity.price || 2.0;          
         
         // Normalizar datos para Kelly
         const kellyResult = calculateKellyStake(
@@ -143,6 +144,7 @@ export const placeAutoBet = async (opportunity) => {
             createdAt: new Date().toISOString(), // Fecha de transacción
             matchDate: opportunity.date || null, // Fecha del partido (si disponible)
             eventId: opportunity.eventId, // ID Altenar para tracking robusto
+            pinnacleId: opportunity.pinnacleId, // ID Arcadia/Pinnacle (si disponible)
             sportId: opportunity.sportId,
             catId: opportunity.catId,
             champId: opportunity.champId,
@@ -241,7 +243,10 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
 
         if (liveEvent && !isFinishedInFeed) {
             // A) EL PARTIDO ESTÁ EN VIVO Y JUGANDO
-            const currentScoreStr = `${liveEvent.score[0]}-${liveEvent.score[1]}`;
+            let currentScoreStr = bet.lastKnownScore;
+            if (Array.isArray(liveEvent.score) && liveEvent.score.length >= 2) {
+                currentScoreStr = `${liveEvent.score[0]}-${liveEvent.score[1]}`;
+            }
             
             if (bet.lastKnownScore !== currentScoreStr) {
                 bet.lastKnownScore = currentScoreStr;
@@ -253,6 +258,7 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
             if (liveEvent.liveTime) {
                 if (bet.liveTime !== liveEvent.liveTime) {
                     bet.liveTime = liveEvent.liveTime;
+                    bet.lastUpdate = new Date().toISOString(); // Reflejar que hubo actividad (cambio de minuto)
                     hasChanges = true;
                 }
             }
@@ -345,17 +351,25 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
             const now = Date.now();
 
             // [FIX] Si ya teníamos tracking en vivo (minutos > 0) y desapareció del feed,
-            // asumimos interrupción o fin. Verificar resultado INMEDIATAMENTE ignorando el timer.
-            const wasLive = bet.liveTime && bet.liveTime !== "0'" && bet.liveTime !== "" && !bet.liveTime.includes("00:00");
+            // asumimos interrupción o fin. Verificar resultado.
+            const wasLive = bet.liveTime && bet.liveTime !== "0'" && bet.liveTime !== "";
 
-            if (bet.matchDate && !wasLive) {
+            if (bet.matchDate) {
                 const matchTime = new Date(bet.matchDate).getTime();
-                const hoursSinceStart = (now - matchTime) / (1000 * 60 * 60); // Horas pasadas
+                const hoursSinceStart = (now - matchTime) / (1000 * 60 * 60); 
                 
-                // Si pasaron más de 2.2 horas (aprox 135 mins) y NO está en vivo -> Probablemente terminó
-                if (hoursSinceStart > 2.2) {
-                    shouldCheckResult = true;
+                // CRITICAL FIX: Prioridad de Re-conexión
+                // Si el partido "desapareció" pero estamos dentro del tiempo lógico de juego (ej. < 2.5 horas)
+                // NO asumir finalizado inmediatamente, podría ser un fallo de paginación del feed.
+                // Esperar a que pasen > 2.5 horas O que tengamos confirmación explicita de final.
+                
+                if (hoursSinceStart > 2.5) {
+                    shouldCheckResult = true; // Ya debió acabar sí o sí
+                } else if (wasLive && hoursSinceStart > 2.0) {
+                     shouldCheckResult = true; // Estaba vivo y ya pasó tiempo razonable
                 }
+                // Si hoursSinceStart es 0.5 (30 mins) y desapareció, NO checkear resultado, 
+                // esperar a que el feed lo recupere (re-conexión).
             } else {
                 // Si no tiene fecha (Live Snipe) O YA ESTABA VIVO y desaparece, 
                 // asumimos que acaba de terminar. Verificación inmediata (sin espera).
@@ -451,15 +465,19 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
                     // Sin ID, lógica antigua por tiempo
                     isFinished = true; // Forzamos cierre por tiempo
                     // Parse lastKnownScore
-                    const parts = bet.lastKnownScore.split('-');
-                    finalScore = [parseInt(parts[0]), parseInt(parts[1])];
+                    const parts = (bet.lastKnownScore || "0-0").split('-');
+                    const s1 = parseInt(parts[0]);
+                    const s2 = parseInt(parts[1]);
+                    finalScore = (!isNaN(s1) && !isNaN(s2)) ? [s1, s2] : [0,0];
                 }
 
                 if (isFinished) {
                     if (!finalScore) {
                         // Usar ultimo conocido si falla fetch
-                        const parts = bet.lastKnownScore.split('-');
-                        finalScore = [parseInt(parts[0]), parseInt(parts[1])];
+                        const parts = (bet.lastKnownScore || "0-0").split('-');
+                        const s1 = parseInt(parts[0]);
+                        const s2 = parseInt(parts[1]);
+                        finalScore = (!isNaN(s1) && !isNaN(s2)) ? [s1, s2] : [0,0];
                     }
                     
                     if (bet.payoutReceived) {
@@ -562,5 +580,101 @@ const settleBet = (bet, score) => {
     };
 };
 
+/**
+ * LIQUIDACIÓN MANUAL / CORRECCIÓN
+ * Permite al usuario forzar un resultado (score) o re-intentar la validación API.
+ */
+export const manualSettleBet = async (betId, manualScoreStr) => {
+    await initDB();
+    const portfolio = db.data.portfolio;
+    
+    // 1. Buscar Apuesta (Active o History)
+    let bet = portfolio.activeBets.find(b => b.id === betId);
+    let isHistory = false;
+    
+    if (!bet) {
+        bet = portfolio.history.find(b => b.id === betId);
+        isHistory = true;
+    }
 
+    if (!bet) throw new Error("Apuesta no encontrada");
 
+    let finalScore = null;
+
+    // A) MODO MANUAL (User input)
+    if (manualScoreStr) {
+        const parts = manualScoreStr.split('-');
+        if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+             finalScore = [parseInt(parts[0]), parseInt(parts[1])];
+        } else {
+             throw new Error("Formato de marcador inválido. Use 'Local-Visita' (ej. 2-1)");
+        }
+    } 
+    // B) MODO AUTO-RETRY (API Fetch)
+    else {
+        // Intentar fetch details o results
+        try {
+            if (!bet.eventId) throw new Error("Sin Event ID para consultar API.");
+            
+            // 1. Probar Post-Game Results
+            // (Si no tenemos catId, intentamos con sportId y date generico, pero es dificil)
+            if (bet.catId) {
+                const results = await getEventResult(bet.sportId || 66, bet.catId, bet.matchDate || bet.createdAt);
+                const found = results?.events?.find(e => e.id === bet.eventId);
+                if (found && found.score && found.score.length >= 2) {
+                    finalScore = found.score;
+                }
+            }
+
+            // 2. Si falló, probar Live Details (a veces sigue ahí como Ended)
+            if (!finalScore) {
+                 const details = await getEventDetails(bet.eventId);
+                 if (details && details.score && details.score.length >= 2) {
+                     // Solo si parece finalizado
+                     finalScore = details.score;
+                 }
+            }
+
+            if (!finalScore) throw new Error("No se pudo obtener resultado oficial de la API. Intente corrección manual.");
+
+        } catch (e) {
+            throw new Error(`Error consultando API: ${e.message}`);
+        }
+    }
+
+    // 3. APLICAR LIQUIDACIÓN
+    // Si ya estaba en History, necesitamos revertir el impacto anterior en el balance
+    if (isHistory) {
+         // Revertir return anterior
+         const oldReturn = bet.return || 0;
+         portfolio.balance -= oldReturn;
+         
+         // Calcular nuevo estado
+         const updatedBet = settleBet(bet, finalScore);
+         
+         // Actualizar en array
+         Object.assign(bet, updatedBet); // Mutar objeto existente en array
+         
+         // Aplicar nuevo return
+         portfolio.balance += updatedBet.return;
+         
+         console.log(`🔧 Corrección Manual en Historial: ${bet.match} -> Score: ${bet.finalScore}, PnL: ${bet.profit}`);
+    } else {
+         // Estaba Activa -> Liquidar normal y mover a historial
+         const updatedBet = settleBet(bet, finalScore);
+         
+         // Remover de active
+         portfolio.activeBets = portfolio.activeBets.filter(b => b.id !== betId);
+         
+         // Agregar a history
+         portfolio.history.push(updatedBet);
+         
+         // Sumar return
+         portfolio.balance += updatedBet.return;
+
+         console.log(`🔧 Liquidación Manual Forzada: ${bet.match} -> Score: ${bet.finalScore}`);
+    }
+
+    await db.write();
+    return bet;
+};

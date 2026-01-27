@@ -1,6 +1,6 @@
 import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
-import { scanLiveOpportunities as performLiveScan } from './liveScannerService.js';
+import { scanLiveOpportunities as performLiveScan, getLiveOverview } from './liveValueScanner.js';
 import { scanPrematchOpportunities } from './prematchScannerService.js';
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 
@@ -12,6 +12,7 @@ import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingServic
 
 // MEMORY CACHE
 let cachedOpportunities = [];
+let cachedPrematchIds = new Set(); // IDs de eventos ya detectados en Pre-Match
 let lastScanTime = null;
 let isScanning = false;
 let ticks = 0; // Contador de ciclos
@@ -29,31 +30,21 @@ export const startBackgroundScanner = () => {
             ticks++;
             
             // ---------------------------------------------------------
-            // 1. ESCANEAR LIVE (Cada ciclo ~30s)
-            // ---------------------------------------------------------
-            
-            // IMPORTANDO de liveScannerService
-            const { getLiveOverview, scanLiveOpportunities } = await import('./liveScannerService.js');
-            
-            // A) Obtener RAW Events (Solo 1 llamada HTTP)
-            const rawEvents = await getLiveOverview();
-
-            // B) Pasar a lógica de detección
-            const ops = await scanLiveOpportunities(); 
-            
-            // C) AUTO-TRADING LIVE (Detectar entrada)
-            if (ops && ops.length > 0) {
-                for (const op of ops) {
-                    await placeAutoBet(op);
-                }
-            }
-
-            // ---------------------------------------------------------
-            // 2. ESCANEAR PRE-MATCH (Al inicio y cada 4 ciclos ~2 min)
+            // 1. ESCANEAR PRE-MATCH (Al inicio y cada 4 ciclos ~2 min)
+            // (PRIORIDAD ALTA: Para poblar Cache de "Ignorados en Live")
             // ---------------------------------------------------------
             if (ticks === 1 || ticks % 4 === 0) {
                  // console.log("   🔎 Ejecutando escaneo Pre-Match...");
                  const prematchOps = await scanPrematchOpportunities();
+                 
+                 // Actulizar Cache de IDs ignorados
+                 if (prematchOps) {
+                     prematchOps.forEach(op => {
+                         if (op.eventId) cachedPrematchIds.add(String(op.eventId));
+                         if (op.altenarId) cachedPrematchIds.add(String(op.altenarId));
+                     });
+                 }
+
                  if (prematchOps && prematchOps.length > 0) {
                     // console.log(`   🔎 Detectadas ${prematchOps.length} Oportunidades Pre-Match para Auto-Bet.`);
                     for (const op of prematchOps) {
@@ -61,6 +52,49 @@ export const startBackgroundScanner = () => {
                     }
                  }
             }
+
+            // ---------------------------------------------------------
+            // 2. ESCANEAR LIVE (Cada ciclo ~30s)
+            // ---------------------------------------------------------
+            
+            // A) Obtener RAW Events (Solo 1 llamada HTTP)
+            const rawEvents = await getLiveOverview();
+
+            // B) Pasar a lógica de detección (Inyectamos eventos para ahorrar calls)
+            let ops = await performLiveScan(rawEvents); 
+            
+            // FILTRADO ROBUSTO:
+            // 1. Remover eventos que ya eran Oportunidades Pre-Match (Memoria sesión actual)
+            // 2. Remover eventos que YA TIENEN APUESTAS ACTIVAS (Persistencia DB)
+            if (ops && ops.length > 0) {
+                const initialCount = ops.length;
+                
+                // IDs de apuestas activas
+                const activeBetIds = new Set((db.data.portfolio.activeBets || []).map(b => String(b.eventId)));
+
+                ops = ops.filter(op => {
+                    const idStr = String(op.id || op.eventId);
+                    // Solo filtramos si YA EXISTE una apuesta activa.
+                    // (Permitimos que un evento Pre-Match "fallido" sea re-capturado en Live)
+                    return !activeBetIds.has(idStr);
+                });
+
+                if (ops.length < initialCount) {
+                    console.log(`   🧹 Ocultando ${initialCount - ops.length} oportunidades LIVE (Repetidas o Ya Apostadas).`);
+                }
+            }
+
+            // C) AUTO-TRADING LIVE (Detectar entrada)
+            if (ops && ops.length > 0) {
+                 console.log(`   🎯 Oportunidades LIVE encontradas: ${ops.length}`);
+                for (const op of ops) {
+                    await placeAutoBet(op);
+                }
+            } else {
+                 if(ticks % 2 === 0) console.log(`   ... Escaneo Live completado. Sin oportunidades (nuevas).`);
+            }
+
+            // (Pre-match block moved up)
 
             // ---------------------------------------------------------
             // 3. MONITORING (Actualizar salidas)
@@ -77,8 +111,15 @@ export const startBackgroundScanner = () => {
         } catch (e) {
             console.error('⚠️ Background Scan Error:', e.message);
         } finally {
-            // Jitter para evitar ban (15s - 30s)
-            const delay = Math.floor(Math.random() * (15000)) + 15000; 
+            // POLÍTICA DE POLLING OFICIAL (Basada en app.json)
+            // Regla: "events.matchups" (5000ms) * "guest_multiplier" (3) = 15,000ms Mínimo Requerido
+            // Si bajamos de 15s, activamos el "botManagement" y nos mandan a la cola de delay.
+            const MIN_POLL_INTERVAL = 15000; 
+            const RANDOM_JITTER = 4000; // +0-4s de variabilidad humana
+            
+            const delay = MIN_POLL_INTERVAL + Math.floor(Math.random() * RANDOM_JITTER);
+            // Resultante: 15s - 19s entre ciclos
+            
             setTimeout(loop, delay);
         }
     };

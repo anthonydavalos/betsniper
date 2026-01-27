@@ -1,5 +1,5 @@
 import db from '../db/database.js';
-import { findMatch } from '../utils/teamMatcher.js';
+import { findMatch, isTimeMatch } from '../utils/teamMatcher.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 
 // =====================================================================
@@ -40,8 +40,51 @@ export const scanPrematchOpportunities = async () => {
         if (expiredCount > 0) {
             // Actualizar DB para remover expirados si se desea
             // Por ahora solo filtramos en memoria para no borrar data histórica útil para debug
-             console.log(`   🧹 Filtrando ${expiredCount} partidos que ya comenzaron o terminaron.`);
+             console.log(`   🧹 Filtrando ${expiredCount} partidos que ya comenzaron o terminaron para el análisis de valor.`);
         }
+
+        // --- FASE 1: LINKING GLOBAL (Linkear TODO, incluso pasados) ---
+        // Esto asegura que reportes y futuros análisis tengan la data cruzada.
+        for (const pinMatch of pinnacleMatches) {
+             let altenarEvent = null;
+
+             // RE-VALIDACIÓN ESTRICTA DE LINKS EXISTENTES 
+             // (Crucial si cambiamos tolerancias de tiempo)
+             if (pinMatch.altenarId) {
+                altenarEvent = altenarCachedEvents.find(e => e.id === pinMatch.altenarId);
+                
+                if (altenarEvent) {
+                    // Si el evento existe, validamos que siga cumpliendo la tolerancia de tiempo actual (5 min)
+                    // Si ya no cumple (ej. es un falso positivo de 6 horas), ROMPEMOS el enlace.
+                    if (!isTimeMatch(pinMatch.date, altenarEvent.startDate || altenarEvent.date)) {
+                         console.log(`   ✂️ ROMPIENDO ENLACE INVÁLIDO (Tiempo): ${pinMatch.home} vs ${altenarEvent.name || altenarEvent.home}`);
+                         pinMatch.altenarId = null;
+                         pinMatch.altenarName = null;
+                         altenarEvent = null;
+                    }
+                } else {
+                    // Si el evento enlazado ya no existe en el cache de Altenar, no podemos validarlo.
+                    // Lo dejamos (podria ser que Altenar borró el evento), o lo limpiamos?
+                    // Mejor mantenerlo si es solo que Altenar lo sacó del feed, pero para seguridad futura podriamos limpiarlo.
+                    // Por ahora: Mantener para no perder rastro de settled bets.
+                }
+             }
+
+             if (!pinMatch.altenarId) {
+                // Solo intentamos linkear si NO tienen ID.
+                const leagueName = pinMatch.league ? pinMatch.league.name : '';
+                const matchResult = findMatch(pinMatch.home, pinMatch.date, altenarCachedEvents, pinMatch.homeId, leagueName);
+                if (matchResult) {
+                    pinMatch.altenarId = matchResult.match.id;  
+                    pinMatch.altenarName = matchResult.match.name; 
+                    newLinksCreated++;
+                    console.log(`   🔗 NUEVO ENLACE: ${pinMatch.home} (Pin) <--> ${matchResult.match.name} (Alt)`);
+                }
+             }
+        }
+
+        const totalLinked = pinnacleMatches.filter(m => m.altenarId).length;
+        console.log(`   📊 Estado del Linker: ${totalLinked} total enlazados (${newLinksCreated} nuevos en esta pasada).`);
 
         // Helper para calcular Probabilidad Real (Sin Vig) - 3 WAY (1x2)
         const getFairProbabilities = (odds) => {
@@ -67,7 +110,7 @@ export const scanPrematchOpportunities = async () => {
             return { p1: i1 / sum, p2: i2 / sum };
         };
 
-        // 2. Iterar sobre Pinnacle (SOLO VÁLIDOS)
+        // 2. Iterar sobre Pinnacle (SOLO VÁLIDOS FUTUROS)
         for (const pinMatch of validPinnacleMatches) {
             
             let altenarEvent = null;
@@ -76,21 +119,12 @@ export const scanPrematchOpportunities = async () => {
             if (pinMatch.altenarId) {
                 altenarEvent = altenarCachedEvents.find(e => e.id === pinMatch.altenarId);
             }
-
-            // Si no tenemos ID o el ID ya no existe en el feed reciente, buscamos fuzzy
-            if (!altenarEvent) {
-                const matchResult = findMatch(pinMatch.home, pinMatch.date, altenarCachedEvents);
-                if (matchResult) {
-                    altenarEvent = matchResult.match;
-                    pinMatch.altenarId = altenarEvent.id; 
-                    pinMatch.altenarName = altenarEvent.name; 
-                    newLinksCreated++;
-                }
-            }
+            // NOTA: Ya linkeamos arriba en Fase 1. Si no tiene link, es que falló findMatch globalmente.
 
             if (altenarEvent) {
                 totalMatchesFound++;
-
+                
+                // ... Analysis Logic ...
                 const currentBankroll = db.data.portfolio.balance || db.data.config.bankroll || 1000;
                 const altenarOdds = altenarEvent.odds;
 
@@ -107,7 +141,7 @@ export const scanPrematchOpportunities = async () => {
                 // ==========================================
                 if (pinMatch.odds.totals && Array.isArray(pinMatch.odds.totals) && 
                     altenarOdds.totals && Array.isArray(altenarOdds.totals)) {
-                    
+                        
                     for (const pinTotal of pinMatch.odds.totals) {
                         // Buscamos la misma linea en Altenar (margen error 0.1 para floats 2.5 vs 2.50)
                         const altTotal = altenarOdds.totals.find(t => Math.abs(t.line - pinTotal.line) < 0.1);
@@ -115,6 +149,7 @@ export const scanPrematchOpportunities = async () => {
                         if (altTotal) {
                             const realProbsTotal = getFair2Way(pinTotal.over, pinTotal.under);
                             if (realProbsTotal) {
+
                                 // Over (p1)
                                 evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Over ${pinTotal.line}`, altTotal.over, realProbsTotal.p1, currentBankroll, 'Total');
                                 // Under (p2)
@@ -155,6 +190,12 @@ export const scanPrematchOpportunities = async () => {
         console.log(`   - Filtrados (Ya iniciaron): ${expiredCount}`);
         console.log(`   - Enlazados con Altenar:   ${totalMatchesFound}`);
 
+        // PERSISTENCIA DE ENLACES (CRÍTICO)
+        if (newLinksCreated > 0) {
+            console.log(`   💾 Guardando ${newLinksCreated} nuevos enlaces en base de datos...`);
+            await db.write();
+        }
+
         if (valueBets.length > 0) {
             console.log(`💎 ${valueBets.length} VALUE BETS DETECTADAS`);
         } else {
@@ -185,7 +226,12 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
         resultsArray.push({
             type: 'PREMATCH_VALUE',
             eventId: event.id, // ID Vital para tracking
+            pinnacleId: dbMatch.id, // ID Pinnacle para referencia
             match: `${dbMatch.home} vs ${dbMatch.away}`,
+            league: dbMatch.league?.name, // Nombre de liga formateado
+            catId: event.catId, // Metadata para liquidación
+            champId: event.champId,
+            sportId: event.sportId || 66,
             date: dbMatch.date,
             market: marketName,
             selection: listSide,
