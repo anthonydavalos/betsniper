@@ -2,8 +2,9 @@ import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { 
   Trophy, RefreshCw, Zap, TrendingUp, Calendar, Activity, RotateCcw, Archive, Clock, Volume2, 
-  ChevronLeft, ChevronRight, Filter, Layers, Edit, Search
+  ChevronLeft, ChevronRight, Filter, Layers, Edit, Search, Link as LinkIcon 
 } from 'lucide-react';
+import ManualMatcher from './components/ManualMatcher';
 
 // Sonido de Notificación (Ping Suave)
 const ALERT_SOUND = "data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YU..."; 
@@ -44,7 +45,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   
   // NAVEGACIÓN TIPO FLASHSCORE
-  const [activeTab, setActiveTab] = useState('ALL'); // 'ALL', 'LIVE', 'FINISHED'
+  const [activeTab, setActiveTab] = useState('ALL'); // 'ALL', 'LIVE', 'FINISHED', 'MATCHER'
   const [dateFilter, setDateFilter] = useState(new Date());
 
   // Refs para control de notificaciones
@@ -208,6 +209,9 @@ function App() {
         
         // Filtro por fecha (solicitado por user)
         return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
+    } else if (activeTab === 'MATCHER') {
+        // Tab especial Manual Matcher: No usamos filteredData, renderizaremos componente dedicado
+        return [];
     } else {
         // TAB: ALL o PRÓXIMOS
         // Comportamiento Flashscore: Mostrar Live + Prematch del día seleccionado
@@ -345,6 +349,12 @@ function App() {
                 >
                     <Archive className="w-4 h-4" /> Finalizados
                 </button>
+                <button 
+                    onClick={() => setActiveTab('MATCHER')}
+                    className={`flex-1 py-4 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors ${activeTab === 'MATCHER' ? 'bg-slate-700 text-blue-400 border-b-2 border-blue-500' : 'text-slate-500 hover:text-blue-300 hover:bg-slate-750'}`}
+                >
+                    <LinkIcon className="w-4 h-4" /> Matcher
+                </button>
             </div>
 
             {/* 2. DATE FILTER BAR (Solo visible si no es FINISHED/LIVE puro) */}
@@ -372,8 +382,14 @@ function App() {
                 </div>
             )}
 
-            {/* 3. MAIN TABLE */}
+            {/* 3. CONTENIDO PRINCIPAL */}
             <section className="bg-slate-800 rounded-b-xl border border-slate-700 border-t-0 overflow-hidden shadow-lg min-h-[400px]">
+                
+                {/* SI ESTAMOS EN MATCHER, RENDERIZAR COMPONENTE ESPECIAL */}
+                {activeTab === 'MATCHER' ? (
+                     <ManualMatcher />
+                ) : (
+                /* TABLA ESTÁNDAR */
                 <div className="overflow-x-auto">
                     <table className="w-full text-left text-xs">
                         <thead>
@@ -614,6 +630,7 @@ function App() {
                         )}
                     </table>
                 </div>
+                )}
             </section>
         </div>
       </main>

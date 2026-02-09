@@ -63,9 +63,11 @@ setTimeout(() => {
 // Rutas de API
 import opportunitiesRouter from './src/routes/opportunities.js';
 import portfolioRouter from './src/routes/portfolio.js';
+import matcherRouter from './src/routes/matcher.js';
 
 app.use('/api/opportunities', opportunitiesRouter);
 app.use('/api/portfolio', portfolioRouter);
+app.use('/api/matcher', matcherRouter);
 
 // Rutas Básicas (API Health Check)
 app.get('/', (req, res) => {

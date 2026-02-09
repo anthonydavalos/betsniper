@@ -110,8 +110,10 @@ export const ingestPinnaclePrematch = async () => {
     try {
         console.log("📡 Obteniendo ligas activas...");
         const data = await pinnacleClient.get('/sports/29/leagues', { hasMatchups: true });
+        
         // Response is array directly
         leagues = data.filter(l => l.matchupCount > 0);
+
     } catch (e) {
         console.error("❌ Error obteniendo ligas:", e.message);
         return;
@@ -120,8 +122,7 @@ export const ingestPinnaclePrematch = async () => {
     // 2. Define Date Range (SOLO HOY para minimizar tráfico y riesgo)
     const now = new Date();
     const futureLimit = new Date();
-    futureLimit.setHours(23, 59, 59, 999); // Final de hoy
-    // futureLimit.setDate(now.getDate() + 2); // ANTES: 48 Horas
+    futureLimit.setHours(23, 59, 59, 999); // Final del día de hoy
     
     console.log(`📅 Filtrando partidos desde AHORA hasta: ${futureLimit.toISOString()}`);
 
@@ -135,7 +136,12 @@ export const ingestPinnaclePrematch = async () => {
         if (processedLeagues >= MAX_LEAGUES_TO_CHECK) break;
 
         try {
-            const matches = await pinnacleClient.get(`/leagues/${league.id}/matchups`);
+            const matchesResponse = await pinnacleClient.get(`/leagues/${league.id}/matchups`);
+            // Pinnacle a veces devuelve un objeto { code: '...', leagues: [...] } o array directo? 
+            // Ojo: En endpoints de matchups suele ser array directo o wrapper.
+            
+            // Normalizar si viene envuelto
+            const matches = Array.isArray(matchesResponse) ? matchesResponse : (matchesResponse.matchups || []);
             
             const relevant = matches.filter(m => {
                 if (!m.startTime) return false;

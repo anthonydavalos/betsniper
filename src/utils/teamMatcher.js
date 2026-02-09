@@ -1,4 +1,11 @@
 import { PINNACLE_TO_ALTENAR_IDS } from './idMapping.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ALIAS_FILE = path.join(__dirname, 'dynamicAliases.json');
 
 /**
  * UTILIDAD DE NORMALIZACIÓN Y MATCHING DE EQUIPOS
@@ -25,7 +32,7 @@ const STOP_WORDS = [
   ];
 
 // Alias conhecidos para corrección manual inmediata
-export const TEAM_ALIASES = {
+const STATIC_ALIASES = {
     // --- NUEVOS AGREGADOS (BATCH 1) ---
     "arminia bielefeld": "bielefeld",
     "bielefeld": "arminia bielefeld",
@@ -373,6 +380,18 @@ export const TEAM_ALIASES = {
     "correcaminos de la uat iii": "correcaminos uat reserves",
     "hampton & richmond": "hampton and richmond borough"
 };
+
+// Cargar alias dinámicos
+let DYNAMIC_ALIASES = {};
+try {
+    if (fs.existsSync(ALIAS_FILE)) {
+        DYNAMIC_ALIASES = JSON.parse(fs.readFileSync(ALIAS_FILE, 'utf8'));
+    }
+} catch (e) {
+    console.error("Error loading dynamic aliases:", e);
+}
+
+export const TEAM_ALIASES = { ...STATIC_ALIASES, ...DYNAMIC_ALIASES };
   
   /**
    * Normaliza un nombre de equipo:
@@ -417,6 +436,40 @@ export const TEAM_ALIASES = {
 
     return clean;
   };
+
+export const registerDynamicAlias = (targetName, candidateName) => {
+    try {
+        const normTarget = normalizeName(targetName);
+        const normCand = normalizeName(candidateName);
+        
+        // Evitar auto-alias
+        if (normTarget === normCand) return false;
+        
+        // Guardar Candidate -> Target (Ej. "R. Madrid" -> "Real Madrid")
+        DYNAMIC_ALIASES[normCand] = normTarget;
+        // Tambien guardamos inverso si no existe, por seguridad de matching bidireccional
+        // pero TEAM_ALIASES suele usarse [candidate] -> target.
+        
+        fs.writeFileSync(ALIAS_FILE, JSON.stringify(DYNAMIC_ALIASES, null, 2));
+        console.log(`🧠 [TeamMatcher] Learned new alias: "${normCand}" -> "${normTarget}"`);
+        
+        // Actualizar la referencia en memoria
+        // Como TEAM_ALIASES es un objeto exportado const, no podemos reasignarlo, 
+        // pero como es un objeto, podríamos mutarlo si no fuera spread.
+        // Espera, hice export const TEAM_ALIASES = { ... }
+        // Eso crea un NUEVO objeto.
+        // Mutar la variable exportada 'const' es imposible. 
+        // Pero los consumidores importan la referencia.
+        
+        // Fix: Modificar la PROPIEDAD del objeto exportado
+        TEAM_ALIASES[normCand] = normTarget;
+
+        return true;
+    } catch (e) {
+        console.error("Error saving dynamic alias:", e);
+        return false;
+    }
+};
   
   export const levenshteinDistance = (a, b) => {
     const matrix = [];
@@ -684,11 +737,11 @@ export const getTokenSimilarity = (name1, name2) => {
     // 2. Coincidencia de ALIAS conocido.
     {
         const EXTENDED_WINDOW = 30; // 30 minutos
-        console.log(`DEBUG Extended: Buscando en ventana ${EXTENDED_WINDOW}m para ${targetTeamName}`);
+        // console.log(`DEBUG Extended: Buscando en ventana ${EXTENDED_WINDOW}m para ${targetTeamName}`);
         const extendedCandidates = candidatesList.filter(c => {
              const inWindow = isTimeMatch(targetDate, c.startDate || c.date, EXTENDED_WINDOW);
              const alreadyChecked = isTimeMatch(targetDate, c.startDate || c.date, 5);
-             if (inWindow && !alreadyChecked) console.log(`  -> Candidato aceptado para extended: ${c.home || c.name}`);
+             // if (inWindow && !alreadyChecked) console.log(`  -> Candidato aceptado para extended: ${c.home || c.name}`);
              return inWindow && !alreadyChecked;
         });
 

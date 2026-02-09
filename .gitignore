@@ -22,3 +22,6 @@ db.json
 # OS
 .DS_Store
 Thumbs.db
+.chrome_session/
+client/nul
+nul

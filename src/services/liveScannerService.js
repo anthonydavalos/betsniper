@@ -241,7 +241,9 @@ export const scanLiveOpportunities = async () => {
                         const { getPinnacleLiveOdds, calculateNoVigProb } = await import('./pinnacleService.js');
                         
                         if (pinMatch.id) {
-                            const pinLiveOdds = await getPinnacleLiveOdds(pinMatch.id);
+                            const pinData = await getPinnacleLiveOdds(pinMatch.id);
+                            const pinLiveOdds = pinData ? pinData.moneyline : null;
+
                             if (pinLiveOdds) {
                                 // Calcular Total Implied Prob (Suma de inversas)
                                 const invHome = 1 / pinLiveOdds.home;

@@ -117,6 +117,16 @@ export const getAllPinnacleLiveOdds = async () => {
 
             // A) MONEYLINE (1x2)
             if (market.period === 0 && (market.type === 'moneyline' || market.key === 's;0;m')) {
+                // [Security Fix] Check if we already have a Moneyline and compare cutoffAt
+                // We want the OLDEST cutoffAt (True Match Winner), not "Rest of Match"
+                const currentCutoff = market.cutoffAt || '9999';
+                const existingCutoff = parsed._mlCutoff || '9999';
+
+                // Si ya existe uno y el nuevo es "mas futuro" (mayor cutoff), lo ignoramos (es Rest of Match)
+                if (parsed.moneyline && currentCutoff >= existingCutoff) {
+                    continue;
+                }
+
                 const p = {};
                 market.prices.forEach(priceObj => {
                     const dec = americanToDecimal(priceObj.price);
@@ -130,6 +140,7 @@ export const getAllPinnacleLiveOdds = async () => {
                         draw: p.draw,
                         isLive: true 
                     };
+                    parsed._mlCutoff = currentCutoff; // Save for comparison
                     // Auto-Calcular DC
                     parsed.doubleChance = calculateDCFromMoneyline(p.home, p.draw, p.away);
                 }
@@ -181,8 +192,20 @@ export const getPinnacleLiveOdds = async (pinnacleMatchId) => {
         // 1. MONEYLINE (1x2) & DOUBLE CHANCE
         // ----------------------------------------------------------------
         // Buscamos periodo 0 (Match) o periodo 1/2 si es live (pero para "Full Match Match Winner" sigue siendo periodo 0)
-        // El status='open' es clave.
-        const mlMarket = data.find(m => (m.key === 's;0;m' || m.type === 'moneyline') && m.period === 0 && m.status === 'open');
+        // [Security Fix] Filtramos múltiples mercados para evitar "Rest of Match"
+        // El verdadero Match Winner es el que tiene el cutoffAt más antiguo (original).
+        
+        const allMoneylines = data.filter(m => (m.key === 's;0;m' || m.type === 'moneyline') && m.period === 0 && m.status === 'open');
+        
+        // Ordenar: Más antiguo primero
+        allMoneylines.sort((a, b) => (a.cutoffAt || '9999').localeCompare(b.cutoffAt || '9999'));
+
+        const mlMarket = allMoneylines[0];
+        
+        // DEBUG: Si hay duplicados, avisar
+        if (allMoneylines.length > 1) {
+             console.log(`🛡️  Filtered ${allMoneylines.length} ML markets. Selected Cutoff: ${mlMarket.cutoffAt}`);
+        }
         
         // --- LIVE CHECK ---
         // Verificamos si hay mercados de periodo 1 o 2, lo cual confirma que es LIVE
@@ -196,7 +219,7 @@ export const getPinnacleLiveOdds = async (pinnacleMatchId) => {
             const prices = {};
             mlMarket.prices.forEach(p => {
                 const decimal = americanToDecimal(p.price);
-                if (decimal) prices[p.designation] = Number(decimal.toFixed(3));
+                if (decimal && p.designation) prices[p.designation.toLowerCase()] = Number(decimal.toFixed(3));
             });
 
             if (prices.home && prices.away) {

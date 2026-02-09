@@ -21,7 +21,7 @@ async function findLiveMatches() {
 
         // DEBUG: Imprimir estructura RAW de un partido específico para encontrar el Score verdadero
         const debugMatchName = "Kapfenberger";
-        const targetParentId = 1622601619; // ID Padre detectado previamente
+        const targetParentId = 1623858109; // ID Padre detectado previamente
 
         // Buscar por nombre O por ID explícito (Padre o Hijo)
         const debugMatches = matchups.filter(m => 
