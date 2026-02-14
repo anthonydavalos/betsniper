@@ -1,6 +1,8 @@
 import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
+import { findMatch } from '../utils/teamMatcher.js'; // [NEW] Import Matcher
+import { getAllPinnacleLiveOdds } from './pinnacleService.js'; // [NEW] Static import for matcher fallback
 
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER"
@@ -16,15 +18,63 @@ export const getLiveOverview = async () => {
         // sportId=66 (Fútbol), categoryId=0 (Mundo)
         // Usamos GetLivenow en lugar de GetLiveOverview
         const { data } = await altenarClient.get('/GetLivenow', {
-            params: { sportId: 66, categoryId: 0 } // Eliminado limit eventCount para ver todo
+            params: { 
+                sportId: 66, 
+                categoryId: 0,
+                _: Date.now() // Cache buster
+            } // Eliminado limit eventCount para ver todo
         });
+
+        // [NEW] Mapas de búsqueda rápida para Ligas y Países (Relational Data)
+        const champsMap = new Map();
+        if (Array.isArray(data.champs)) {
+            data.champs.forEach(c => champsMap.set(c.id, c.name));
+        }
+
+        const catsMap = new Map();
+        if (Array.isArray(data.categories)) {
+            data.categories.forEach(c => catsMap.set(c.id, c.name));
+        }
         
         // Normalización de Tiempos (Fix Visual 103' -> 90'+ y estado)
         // Usamos la propiedad 'ls' (Live Status) para detectar tiempos extra
         return (data.events || []).map(ev => {
+             // [NEW] Enriquecer con nombres reales
+             const leagueName = champsMap.get(ev.champId) || "";
+             const countryName = catsMap.get(ev.catId) || "";
+
              const status = ev.ls || ""; 
              let cleanTime = ev.liveTime;
-             const minutes = parseInt((ev.liveTime || "0").replace("'", "")) || 0;
+             
+             // [FALLBACK IMPROVED] Si tiempo es inválido o 0, calculamos desde startDate
+             const isInvalidTime = !cleanTime || cleanTime === "0'" || cleanTime === "" || cleanTime === 0 || cleanTime === "0";
+             
+             if (isInvalidTime && ev.startDate) {
+                 const startedAt = new Date(ev.startDate).getTime();
+                 const now = Date.now();
+                 let diffMins = Math.floor((now - startedAt) / 60000);
+                 
+                 if (diffMins < 0) diffMins = 0; // Evitar negativos
+                 
+                 // Solo aplicamos corrección si hace sentido (entre 0 y 130 mins)
+                 if (diffMins >= 0 && diffMins < 130) {
+                     if (status.toLowerCase().includes('2nd') || status.toLowerCase().includes('2t')) {
+                         cleanTime = `${Math.max(46, diffMins)}'`; // Force 46+ if 2nd half
+                     } else if (diffMins === 0) { // Si es 0 pero está activo
+                         cleanTime = "1'"; 
+                     } else {
+                         cleanTime = `${diffMins}'`;
+                     }
+                 }
+             }
+
+             const minutes = parseInt((cleanTime || "0").replace("'", "")) || 0;
+             const statusLower = (status || "").toLowerCase();
+
+             // [FIX] Mostrar "HT" claramente en el frontend
+             if (statusLower.includes('half') || statusLower.includes('descanso') || statusLower.includes('ht') || statusLower.includes('intermedio')) {
+                 cleanTime = "HT";
+             }
 
              // Detectar Extra Time / Prórrogas (>90 min)
              // El usuario prefiere marcar como "Finalizado" (Settled) si entramos a tiempos extra.
@@ -40,6 +90,8 @@ export const getLiveOverview = async () => {
              
              return {
                  ...ev,
+                 league: leagueName,   // [NEW]
+                 country: countryName, // [NEW]
                  liveTime: cleanTime,
                  rawStatus: status
              };
@@ -121,28 +173,30 @@ const checkTurnaroundCondition = (liveEvent, pinnacleMatch) => {
 
     if (Math.abs(diff) !== 1) return null; 
 
-    // 3. Identificar Favorito según Pinnacle
+    // 3. ESTRATEGIA "UN CEREBRO": 
+    // Ya no exigimos que sea el súper favorito pre-match (>55%).
+    // Cualquier equipo perdiendo por 1 gol es candidato SI las cuotas en vivo tienen valor (EV+).
+    // La filtración real ocurre después con calculateKellyStake.
+
     if (!pinnacleMatch || !pinnacleMatch.odds) return null;
 
     const pHome = 1 / pinnacleMatch.odds.home;
     const pAway = 1 / pinnacleMatch.odds.away;
 
-    const MIN_PROB_FAVORITE = 0.55;
-
-    // CASO A: Favorito Local va perdiendo
-    if (diff === -1 && pHome > MIN_PROB_FAVORITE) { 
-        console.log(`       ✅ Match Condition: ${liveEvent.name} (Home Fav ${pHome.toFixed(2)})`);
+    // CASO A: Local va perdiendo (Buscamos remontada local)
+    if (diff === -1) { 
+        // console.log(`       ✅ Match Candidate: ${liveEvent.name} (Home losing)`);
         return { 
             side: 'home', 
-            favorite: pinnacleMatch.home, 
+            favorite: pinnacleMatch.home, // Reference name only
             currentScore: `${scoreHome}-${scoreAway}`,
-            prematchProb: pHome * 100 // %
+            prematchProb: pHome * 100 // % (Reference only)
         };
     }
 
-    // CASO B: Favorito Visita va perdiendo
-    if (diff === 1 && pAway > MIN_PROB_FAVORITE) {
-        console.log(`       ✅ Match Condition: ${liveEvent.name} (Away Fav ${pAway.toFixed(2)})`);
+    // CASO B: Visita va perdiendo (Buscamos remontada visita)
+    if (diff === 1) {
+        // console.log(`       ✅ Match Candidate: ${liveEvent.name} (Away losing)`);
         return { 
             side: 'away', 
             favorite: pinnacleMatch.away, 
@@ -157,7 +211,7 @@ const checkTurnaroundCondition = (liveEvent, pinnacleMatch) => {
 /**
  * Función Principal del Sniper
  */
-export const scanLiveOpportunities = async () => {
+export const scanLiveOpportunities = async (preFetchedEvents = null) => {
     await initDB(); 
     const pinnacleDb = db.data.upcomingMatches || [];
     
@@ -166,17 +220,62 @@ export const scanLiveOpportunities = async () => {
         if (m.altenarId) linkedMatches.set(m.altenarId, m);
     });
 
-    console.log(`📡 Escaneando en vivo... (DB tiene ${linkedMatches.size} partidos enlazados)`);
-
-    const liveEvents = await getLiveOverview();
+    // Usar eventos inyectados si existen, si no, buscar frescos
+    const liveEvents = preFetchedEvents || await getLiveOverview();
     const opportunities = [];
 
+    // [NEW] Cargar Pinnacle Live para Fallback (Matcher en caliente)
+    let pinnacleLiveFeed = [];
+    try {
+        const pinMap = await getAllPinnacleLiveOdds();
+        if (pinMap) pinnacleLiveFeed = Array.from(pinMap.values());
+    } catch(e) { /* ignore */ }
+
     // [DEBUG LOG]
-    console.log(`📡 Recibidos ${liveEvents.length} eventos live.`);
+    console.log(`📡 Recibidos ${liveEvents.length} eventos live. (PinLive: ${pinnacleLiveFeed.length} cands)`);
     // liveEvents.forEach(e => console.log(`   - ${e.name} (ID: ${e.id}) [Linked? ${linkedMatches.has(e.id)}]`));
 
     for (const event of liveEvents) {
-        const pinMatch = linkedMatches.get(event.id);
+        let pinMatch = linkedMatches.get(event.id);
+
+        // [FALLBACK] Intentar Match Dinámico si no hay link previo
+        if (!pinMatch && pinnacleLiveFeed.length > 0) {
+            const parts = (event.name || "").split(/ vs\.? /i);
+            const homeName = parts[0]; 
+            
+            if (homeName) {
+                // Usamos startDate del evento Altenar. Si es null, usamos ahora.
+                const targetDate = event.startDate || new Date().toISOString(); 
+                
+                // Buscamos coincidencia en el feed en vivo de Pinnacle
+                const matchResult = findMatch(homeName, targetDate, pinnacleLiveFeed, null, event.league); 
+
+                if (matchResult && matchResult.score >= 0.6) { // Umbral razonable
+                     const m = matchResult.match;
+                     
+                     if (m && m.match) {
+                        
+                        // [FIX] Recuperación Inversa: Intentar buscar en DB (Prematch) usando el ID Dinámico
+                        const dbMatch = pinnacleDb.find(pm => String(pm.id) === String(m.id));
+                        
+                        if (dbMatch) {
+                            pinMatch = dbMatch;
+                            // console.log(`   🔗 RE-LINKED LIVE->PRE: ${pinMatch.home} vs ${pinMatch.away}`);
+                        } else {
+                            // Construimos un objeto pinMatch temporal "Duck Typed"
+                            pinMatch = {
+                                id: m.id,
+                                home: m.match.split(' vs ')[0] || m.match,
+                                away: m.match.split(' vs ')[1] || "Away",
+                                league: m.league || { name: "Unknown League" }, // [FIX] Proporcionar objeto league por defecto
+                                odds: m.moneyline // Pasamos las cuotas LIVE como "base" si no hay prematch
+                            };
+                        }
+                        // console.log(`   🔗 LIVE MATCHED: ${event.name} -> ${pinMatch.home} vs ${pinMatch.away}`);
+                     }
+                }
+            }
+        }
 
         if (pinMatch) {
             const condition = checkTurnaroundCondition(event, pinMatch);
@@ -200,6 +299,41 @@ export const scanLiveOpportunities = async () => {
                         // 4. ESTRATEGIA PURA (ARCADIA LIVE TRUTH)
                         // -----------------------------------------------------------
                         
+                        // [MEJORA: CORRECCIÓN DE TIEMPO Y SCORE DESDE PINNACLE SI EXISTE]
+                        if (pinMatch && pinMatch.id && pinnacleLiveFeed.length > 0) {
+                            // Buscar el objeto Pinnacle original en el feed en vivo
+                            const realPinLive = pinnacleLiveFeed.find(p => String(p.id) === String(pinMatch.id));
+                            if (realPinLive) {
+                                // Inyectar datos de Tiempo/Score oficiales de Pinnacle
+                                // Pinnacle Status: 1=Live 1H, 2=Live 2H.
+                                // Period 0 = Match
+                                // Period 1 = 1st Half
+                                // Period 2 = 2nd Half
+                                
+                                // Score
+                                const homeScore = realPinLive.score?.home || 0;
+                                const awayScore = realPinLive.score?.away || 0;
+                                condition.currentScore = `${homeScore}-${awayScore}`; // Actualizar condición
+                                details.score = [homeScore, awayScore]; // Actualizar objeto Altenar (simulado)
+
+                                // Time [FIX CRUCIAL] Priorizar reloj de Pinnacle
+                                if (realPinLive.time && realPinLive.time.length > 2) {
+                                    event.liveTime = realPinLive.time;
+                                    pinMatch.time = realPinLive.time; // Persistir en el objeto auxiliar
+                                    pinMatch.score = condition.currentScore;
+                                }
+                            }
+                        }
+
+                        // NOTA: Si llegamos aquí es porque GetEventDetails funcionó. 
+                        // Usamos sus datos para refinar el tiempo si era 0.
+                        if (details.clock && details.clock.matchTime) {
+                            event.liveTime = details.clock.matchTime + "'"; 
+                            // Update condition score too just in case
+                        } else if (event.liveTime === "0'" || event.liveTime === "1'") {
+                             // Fallback final: Si GetEventDetails no trae reloj, mantenemos el cálculo de GetLiveOverview
+                        }
+
                         // A) Obtener Cuota Altenar (Value) - FIXED RELATIONAL MAPPING
                         let altenarOdd = 0;
                         const targetSide = condition.side; // 'home' or 'away'
@@ -280,23 +414,24 @@ export const scanLiveOpportunities = async () => {
                         const kellyResult = calculateKellyStake(
                             realProb, 
                             altenarOdd, 
-                            db.data.portfolio.balance || 1000
+                            db.data.portfolio.balance || 100
                         );
                         
-                        // Solo push si hay valor positivo
-                        if (kellyResult.amount > 0) {
+                        // Solo push si hay valor positivo y min 1 Sol
+                        if (kellyResult.amount >= 1) {
                              opportunities.push({
                                 type: 'LIVE_SNIPE',
                                 eventId: event.id,
                                 pinnacleId: pinMatch.id, // ID de Arcadia/Pinnacle para referencia
                                 match: event.name,
-                                league: pinMatch.league.name,
+                                league: pinMatch.league?.name || "Live League", // [FIX] Safe access
                                 sportId: event.sportId || 66,
                                 catId: event.catId || event.categoryId,
                                 champId: event.champId || event.championshipId,
-                                time: event.liveTime,
+                                time: pinMatch.time || event.liveTime, // [FIX] Prioritize Pin Time
                                 score: condition.currentScore,
                                 date: event.startDate, // Fecha de inicio real para la DB
+                                market: 'Match Winner', // [FIX] Explicit Market Name needed for oddsService
                                 favorite: condition.favorite,
                                 selection: condition.side === 'home' ? 'Home' : 'Away',
                                 
@@ -310,7 +445,24 @@ export const scanLiveOpportunities = async () => {
                                 realProb: realProb, 
                                 odd: altenarOdd,
                                 ev: (((realProb)/100 * altenarOdd) - 1) * 100,
-                                kellyStake: kellyResult.amount
+                                kellyStake: kellyResult.amount,
+
+                                // [NEW] Enhanced Pinnacle Info for Frontend
+                                pinnacleInfo: {
+                                    id: pinMatch.id,
+                                    time: pinMatch.time || event.liveTime,
+                                    score: condition.currentScore,
+                                    // [NEW] Add Prematch Odds Context for UI
+                                    prematchPrice: condition.side === 'home' ? pinMatch.odds?.home : pinMatch.odds?.away,
+                                    // [NEW] Full Context for Badges
+                                    prematchContext: {
+                                        home: pinMatch.odds?.home,
+                                        draw: pinMatch.odds?.draw,
+                                        away: pinMatch.odds?.away,
+                                        over25: (pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over,
+                                        under25: (pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under,
+                                    }
+                                }
                             });
                         }
                     }
@@ -364,29 +516,51 @@ export const scanLiveOpportunities = async () => {
                     if (realOdd > 1.2) { // Filtro minimo de cuota
                         const estimatedProb = 55; // Mantenemos prob fija por ahora (TODO: Calcular real based on Live Vig)
                         
-                        opportunities.push({
-                            type: 'LIVE_VALUE',
-                            eventId: event.id,
-                            pinnacleId: pinMatch.id, // ID de Arcadia/Pinnacle para referencia
-                            match: event.name,
-                            league: pinMatch.league.name,
-                            sportId: event.sportId || 66,
-                            catId: event.catId || event.categoryId,
-                            champId: event.champId || event.championshipId,
-                            time: event.liveTime,
-                            score: goalValue.currentScore,
-                            date: event.startDate, // Fecha de inicio real para la DB
-                            market: 'Total',
-                            selection: `Apostar MÁS DE ${goalValue.line} GOLES`, // Action name for uniqueness
-                            pick: `over_${goalValue.line}`,
-                            reason: goalValue.reason,
-                            action: `Apostar MÁS DE ${goalValue.line} GOLES`,
-                            
-                            realProb: estimatedProb,
-                            odd: realOdd, // Cuota real obtenida
-                            ev: ((estimatedProb/100 * realOdd) - 1) * 100,
-                            kellyStake: calculateKellyStake(estimatedProb, realOdd, db.data.portfolio.balance || 1000).amount * 0.25 
-                        });
+                        // [FILTER] Min Stake
+                        const kRes = calculateKellyStake(estimatedProb, realOdd, db.data.portfolio.balance || 100);
+                        const kStake = kRes.amount * 0.25; // Fracción conservadora para Next Goal
+
+                        if (kStake >= 1) {
+                            opportunities.push({
+                                type: 'LIVE_VALUE',
+                                eventId: event.id,
+                                pinnacleId: pinMatch.id, // ID de Arcadia/Pinnacle para referencia
+                                match: event.name,
+                                league: pinMatch.league?.name || "Live League",
+                                sportId: event.sportId || 66,
+                                catId: event.catId || event.categoryId,
+                                champId: event.champId || event.championshipId,
+                                time: event.liveTime,
+                                score: goalValue.currentScore,
+                                date: event.startDate, // Fecha de inicio real para la DB
+                                market: 'Total',
+                                selection: `Apostar MÁS DE ${goalValue.line} GOLES`, // Action name for uniqueness
+                                pick: `over_${goalValue.line}`,
+                                reason: goalValue.reason,
+                                action: `Apostar MÁS DE ${goalValue.line} GOLES`,
+                                
+                                realProb: estimatedProb,
+                                odd: realOdd, // Cuota real obtenida
+                                ev: ((estimatedProb/100 * realOdd) - 1) * 100,
+                                kellyStake: kStake,
+                                
+                                pinnacleInfo: {
+                                    id: pinMatch?.id,
+                                    time: pinMatch?.time || event.liveTime,
+                                    score: goalValue.currentScore,
+                                    // [NEW] Add Prematch Odds Context for Totals
+                                    prematchPrice: (pinMatch?.odds?.totals || []).find(t => Math.abs(t.line - goalValue.line) < 0.1)?.over,
+                                    // [NEW] Full Context for Badges
+                                    prematchContext: {
+                                        home: pinMatch.odds?.home,
+                                        draw: pinMatch.odds?.draw,
+                                        away: pinMatch.odds?.away,
+                                        over25: (pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over,
+                                        under25: (pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under,
+                                    }
+                                }
+                            });
+                        }
                     } else {
                         // console.log(`   ❌ Cuota para Over ${goalValue.line} no encontrada o muy baja.`);
                     }

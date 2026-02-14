@@ -6,15 +6,10 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CREDS_PATH = path.join(__dirname, 'pinnacle-creds.json');
-// const REFRESHER_SCRIPT = path.join(__dirname, '../../scripts/harvest_token.js');
-const REFRESHER_SCRIPT = path.join(__dirname, '../../scripts/direct_login.cjs');
-
-// =====================================================================
-// PINNACLE CAMALEÓN CLIENT (AUTO-HEALING)
-// - Lee credenciales de JSON
-// - Si falla (401), abre Chrome, renueva token y reintenta
-// =====================================================================
+// UNIFICACIÓN DE SISTEMAS: Usar el token generado por el nuevo Gateway (pinnacleGateway.js)
+const CREDS_PATH = path.join(__dirname, '../../data/pinnacle_token.json');
+// Script de refresco unificado
+const REFRESHER_SCRIPT = path.join(__dirname, '../../services/pinnacleGateway.js');
 
 const BASE_URL = 'https://api.arcadia.pinnacle.com/0.1';
 
@@ -24,12 +19,24 @@ let credentials = loadCredentials();
 function loadCredentials() {
     try {
         if (fs.existsSync(CREDS_PATH)) {
-            return JSON.parse(fs.readFileSync(CREDS_PATH, 'utf8'));
+            const data = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf8'));
+            // Si tiene estructura nueva { headers: {...} }
+            if (data.headers) {
+                return { headers: data.headers };
+            }
+            // Soporte Legacy (si fuera necesario)
+            return { headers: {
+                'X-Session': data.token,
+                'X-API-Key': data.apiKey,
+                'X-Device-UUID': data.uuid,
+                'User-Agent': data.userAgent,
+                'Cookie': data.cookies // Si existen
+            }};
         }
     } catch (e) {
-        console.error("⚠️ No se pudo cargar pinnacle-creds.json:", e.message);
+        console.error("⚠️ No se pudo cargar token:", e.message);
     }
-    return { token: '', uuid: '', userAgent: '', apiKey: '' };
+    return { headers: {} };
 }
 
 class PinnacleChameleon {
@@ -40,36 +47,28 @@ class PinnacleChameleon {
 
     startHeartbeat() {
         // Mantiene la sesión viva enviando un PUT cada 60s
-        // Esto imita el comportamiento del navegador real
         setInterval(async () => {
-            if (!credentials.token) return;
+             // Extraer token de los headers (soportando mayus/minus)
+             const token = credentials.headers?.['X-Session'] || credentials.headers?.['x-session'];
+             if (!token) return;
             
             try {
-                // Heartbeat silencioso (bypass makeRequest para evitar params extra)
+                // Heartbeat silencioso
                 await axios({
                     method: 'PUT',
-                    url: `${this.baseUrl}/sessions/${credentials.token}`,
+                    url: `${this.baseUrl}/sessions/${token}`,
                     headers: {
-                        'User-Agent': credentials.userAgent,
-                        'X-API-Key': credentials.apiKey,
-                        'X-Device-UUID': credentials.uuid,
-                        'X-Session': credentials.token,
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json',
                         'Origin': 'https://www.pinnacle.com',
                         'Referer': 'https://www.pinnacle.com/',
-                         // Headers de mimetismo
-                        'sec-ch-ua': credentials.secChUa,
-                        'sec-ch-ua-mobile': credentials.secChUaMobile || '?0',
-                        'sec-ch-ua-platform': credentials.secChUaPlatform || '"Windows"',
-                        'Sec-Fetch-Dest': 'empty',
-                        'Sec-Fetch-Mode': 'cors',
-                        'Sec-Fetch-Site': 'cross-site'
+                        ...credentials.headers
                     },
                     httpsAgent: new https.Agent({ rejectUnauthorized: false })
                 });
                 // console.log("💓 Peak"); 
             } catch (e) {
-                // Si falla por 401, el siguiente get() normal disparará el refresh
-                // No forzamos refresh aqui para evitar bucles zombis
+                // Ignorar errores de heartbeat
             }
         }, 60000);
     }
@@ -81,25 +80,16 @@ class PinnacleChameleon {
     async makeRequest(method, endpoint, config = {}, retries = 1) {
         const cacheBuster = Date.now();
         
-        // Construir headers dinámicos basados en lo último del JSON
+        // Construir headers usando lo que tenemos en archivo (Exactos del navegador)
+        // Mantenemos headers estáticos mínimos por si acaso
         const headers = {
-            'User-Agent': credentials.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'application/json',
             'Content-Type': 'application/json',
-            'X-API-Key': credentials.apiKey,
-            'X-Device-UUID': credentials.uuid,
-            'X-Session': credentials.token, 
-            
             'Origin': 'https://www.pinnacle.com',
             'Referer': 'https://www.pinnacle.com/',
             
-            // Mimetismo Avanzado
-            'sec-ch-ua': credentials.secChUa,
-            'sec-ch-ua-mobile': credentials.secChUaMobile || '?0',
-            'sec-ch-ua-platform': credentials.secChUaPlatform || '"Windows"',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site',
+            // INYECTAR HEADERS CAPTURADOS (Session, cookies, device-uuid, user-agent)
+            ...credentials.headers,
 
             ...config.headers
         };
@@ -111,7 +101,7 @@ class PinnacleChameleon {
             params: {
                 'brandId': 0,
                 'withSpecials': false,
-                '_t': Date.now(), // Cache Buster REACTIVADO
+                // '_t': Date.now(), // Cache Buster DESACTIVADO (Causa problemas en endpoints estrictos)
                 ...config.params
             },
             httpsAgent: new https.Agent({ rejectUnauthorized: false }),

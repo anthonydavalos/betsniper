@@ -12,28 +12,23 @@ const altenarClient = axios.create({
   // Forzar IPv4 para evitar errores ENOTFOUND en redes con IPv6 inestable
   httpsAgent: new https.Agent({ family: 4, keepAlive: true }),
   headers: {
-    // Simulación de navegador real
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
-    'Referer': 'https://doradobet.com/',
+    // Simulación exacta del navegador (Chrome 145)
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    'Referer': 'https://doradobet.com/deportes-en-vivo',
     'Origin': 'https://doradobet.com',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'cross-site',
-    
-    // Headers de Integración Específicos (NO BORRAR NI MODIFICAR)
-    'integration': 'doradobet',
-    'numFormat': 'en-GB', // Crucial para recibir decimales con punto (1.50)
-    'countryCode': 'PE'   // Contexto de Perú
+    'Sec-Fetch-Site': 'cross-site'
   },
   params: {
-    // Parámetros Globales por Defecto
+    // Parámetros Globales Obligatorios (Capturados del tráfico real)
     culture: 'es-ES',
     timezoneOffset: 300, // UTC-5 (Perú)
     integration: 'doradobet',
     deviceType: 1, // Desktop
-    numFormat: 'en-GB',
+    numFormat: 'en-GB', // Formato decimal con punto
     countryCode: 'PE',
-    sportId: 66 // Solo Fútbol por defecto
+    sportId: 0 // Default a todos (luego se sobreescribe a 66 en los servicios)
   },
   timeout: 10000 // 10 segundos timeout
 });

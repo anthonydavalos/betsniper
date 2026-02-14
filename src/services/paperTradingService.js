@@ -11,8 +11,8 @@ import { calculateKellyStake } from '../utils/mathUtils.js';
 export const resetPortfolio = async () => {
     await initDB();
     db.data.portfolio = {
-        balance: 1000,
-        initialCapital: 1000,
+        balance: 100,
+        initialCapital: 100,
         activeBets: [],
         history: []
     };
@@ -62,10 +62,18 @@ export const placeAutoBet = async (opportunity) => {
 
     // B) Totals (Over/Under)
     if (selectionStr.includes('OVER') || selectionStr.includes('MÁS')) {
-        const line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+        let line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+        // Fallback: Mirar en Market Name si la selección no tiene número (ej. "Over")
+        if (line === 0 && opportunity.market) {
+             line = parseFloat(opportunity.market.match(/\d+(\.\d+)?/)?.[0] || 0);
+        }
         pick = `over_${line}`; 
     } else if (selectionStr.includes('UNDER') || selectionStr.includes('MENOS')) {
-        const line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+        let line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+        // Fallback: Mirar en Market Name si la selección no tiene número (ej. "Under")
+        if (line === 0 && opportunity.market) {
+             line = parseFloat(opportunity.market.match(/\d+(\.\d+)?/)?.[0] || 0);
+        }
         pick = `under_${line}`; 
     }
 
@@ -97,7 +105,7 @@ export const placeAutoBet = async (opportunity) => {
         await db.read(); 
         
         const portfolio = db.data.portfolio;
-        const config = db.data.config || { bankroll: 1000, kellyFraction: 0.25 };
+        const config = db.data.config || { bankroll: 100, kellyFraction: 0.25 };
 
         // 1. Evitar duplicados EXACTOS (activeBets O history)
         
@@ -145,11 +153,13 @@ export const placeAutoBet = async (opportunity) => {
             matchDate: opportunity.date || null, // Fecha del partido (si disponible)
             eventId: opportunity.eventId, // ID Altenar para tracking robusto
             pinnacleId: opportunity.pinnacleId, // ID Arcadia/Pinnacle (si disponible)
+            pinnaclePrice: opportunity.pinnaclePrice, // [FIX] Persist Pinnacle Live Price for UI reference
             sportId: opportunity.sportId,
             catId: opportunity.catId,
             champId: opportunity.champId,
             match: opportunity.match,
             league: opportunity.league,
+            market: opportunity.market, // [FIX] Guardar mercado para referencia UI (Display Line)
             type: opportunity.type, 
             selection: opportunity.action || opportunity.selection, // Texto legible
             pick: pick, // Código interno calculado arriba
@@ -159,7 +169,11 @@ export const placeAutoBet = async (opportunity) => {
             status: 'PENDING',
             initialScore: opportunity.score || "0-0", // Guardamos score inicial
             lastKnownScore: opportunity.score || "0-0",
-            lastUpdate: new Date().toISOString()
+            lastUpdate: new Date().toISOString(),
+            // [NEW] Persist Pinnacle Context for UI Badges in Active Bets tab
+            pinnacleInfo: opportunity.pinnacleInfo,
+            // [NEW] Persist LiveTime for UI sorting
+            liveTime: opportunity.time || opportunity.liveTime
         };
 
         // 5. Actualizar DB
@@ -187,8 +201,9 @@ import { getEventDetails, getEventResult } from './liveScannerService.js';
  * MONITOREO DE APUESTAS ACTIVAS (Llamado desde el loop del scanner)
  * Compara las apuestas activas con los datos en vivo para actualizar scores y cerrar apuestas.
  * @param {Array} liveEvents - Array de eventos actuales de Altenar
+ * @param {Array} pinnacleLiveFeed - [NEW] Array de eventos de Pinnacle (Source of Truth) para time/score
  */
-export const updateActiveBetsWithLiveData = async (liveEvents) => {
+export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed = []) => {
     await initDB();
     const portfolio = db.data.portfolio;
     let hasChanges = false;
@@ -199,6 +214,17 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
         liveMap.set(e.id, e);
         liveMap.set(e.name, e); // Fallback por nombre
     });
+    
+    // [NEW] Mapa Rápido Pinnacle Live (ID -> Data)
+    const pinLiveMap = new Map();
+    const pinLiveByName = new Map();
+    
+    if (Array.isArray(pinnacleLiveFeed)) {
+        pinnacleLiveFeed.forEach(p => {
+             pinLiveMap.set(String(p.id), p);
+             if (p.match) pinLiveByName.set(p.match, p); 
+        });
+    }
 
     const settledBets = [];
     const updatedActiveBets = [];
@@ -243,27 +269,74 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
 
         if (liveEvent && !isFinishedInFeed) {
             // A) EL PARTIDO ESTÁ EN VIVO Y JUGANDO
-            let currentScoreStr = bet.lastKnownScore;
-            if (Array.isArray(liveEvent.score) && liveEvent.score.length >= 2) {
-                currentScoreStr = `${liveEvent.score[0]}-${liveEvent.score[1]}`;
+
+            // [NEW] PINNACLE SYNC LOGIC FOR ACTIVE BETS
+            let pinSynced = false;
+            let pinData = null;
+
+            // 1. Try to find Pinnacle Data for Truth
+            if (bet.pinnacleId && pinLiveMap.has(String(bet.pinnacleId))) {
+                 pinData = pinLiveMap.get(String(bet.pinnacleId));
+            } 
+            // 2. Try by Name Matching if ID missing
+            else if (pinLiveByName.has(bet.match)) {
+                 pinData = pinLiveByName.get(bet.match);
+            }
+
+            // --- DATA EXTRACTION ---
+            let currentScoreStr = bet.lastKnownScore || "0-0";
+            let currentTimeStr = liveEvent.liveTime || bet.liveTime || "0'";
+
+            // Prioritize Pinnacle Data
+            if (pinData) {
+                // Time
+                if (pinData.time && pinData.time.length > 2) {
+                    currentTimeStr = pinData.time;
+                }
+                // Score
+                if (pinData.score) {
+                    if (typeof pinData.score === 'string') currentScoreStr = pinData.score;
+                    else if (pinData.score.home !== undefined) currentScoreStr = `${pinData.score.home}-${pinData.score.away}`;
+                }
+                pinSynced = true;
+            } else {
+                // Fallback to Altenar
+                 if (Array.isArray(liveEvent.score) && liveEvent.score.length >= 2) {
+                    currentScoreStr = `${liveEvent.score[0]}-${liveEvent.score[1]}`;
+                }
             }
             
-            if (bet.lastKnownScore !== currentScoreStr) {
+            // --- UPDATE DB IF CHANGED ---
+            
+            // Score Update
+            if (bet.lastKnownScore !== currentScoreStr || !bet.lastKnownScore) {
                 bet.lastKnownScore = currentScoreStr;
                 bet.lastUpdate = new Date().toISOString();
                 hasChanges = true;
             }
 
-            // [NUEVO] Actualizar tiempo de juego si está disponible
-            if (liveEvent.liveTime) {
-                if (bet.liveTime !== liveEvent.liveTime) {
-                    bet.liveTime = liveEvent.liveTime;
-                    bet.lastUpdate = new Date().toISOString(); // Reflejar que hubo actividad (cambio de minuto)
-                    hasChanges = true;
+            // Time Update
+            if (currentTimeStr !== bet.liveTime) {
+                // Validate quality (avoid overwriting good time with "0'" unless it's HT)
+                // If current is "88'" and new is "0'", ignore unless HT
+                const isBadUpdate = (currentTimeStr === "0'" || currentTimeStr === "0") && (bet.liveTime && bet.liveTime.includes("'") && bet.liveTime !== "0'");
+                
+                if (!isBadUpdate || currentTimeStr === "HT") {
+                     bet.liveTime = currentTimeStr;
+                     bet.lastUpdate = new Date().toISOString(); 
+                     hasChanges = true;
+                }
+            } else if (!bet.liveTime && liveEvent.minutes) {
+                // Legacy Fallback for Altenar Minutes
+                const newTime = `${liveEvent.minutes}'`;
+                if (bet.liveTime !== newTime) {
+                     bet.liveTime = newTime;
+                     bet.lastUpdate = new Date().toISOString();
+                     hasChanges = true;
                 }
             }
             
-            // Actualizar ID si no lo teníamos (apuestas viejas)
+            // Actualizar ID si no lo teníamos
             if (!bet.eventId && liveEvent.id) {
                 bet.eventId = liveEvent.id;
                 hasChanges = true;
@@ -272,7 +345,10 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
             // [NUEVO] Early Settlement Check (Liquidación Anticipada)
             // Si la apuesta ya se ganó matemáticamente (ej. Over 2.5 y van 3-0), cerramos YA.
             let earlyWin = false;
-            const currentTotal = liveEvent.score[0] + liveEvent.score[1];
+            
+            // Parse safe ints from currentScoreStr
+            const [scH, scA] = currentScoreStr.split('-').map(x => parseInt(x) || 0);
+            const currentTotal = scH + scA;
             
             // 1. Check Over
             if (bet.pick && bet.pick.startsWith('over_')) {
@@ -282,7 +358,7 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
             
             // 2. Check BTTS Yes
             if (bet.pick === 'btts_yes') {
-                 if (liveEvent.score[0] > 0 && liveEvent.score[1] > 0) earlyWin = true;
+                 if (scH > 0 && scA > 0) earlyWin = true;
             }
 
             // [NUEVO] Si ya se pagó (Early Payout), no recalcular trigger, solo mantener activo
@@ -432,29 +508,33 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
                                     const lastUpdateDate = new Date(bet.lastUpdate || bet.createdAt);
                                     const minsSinceUpdate = (Date.now() - lastUpdateDate.getTime()) / 60000;
                                     
-                                    // 1. Si el último tiempo registrado ya era >= 90
-                                    // 2. O si el tiempo estimado (registrado + transcurrido) > 100 mins
-                                    if (timeVal >= 90 || (timeVal + minsSinceUpdate) > 100) {
-                                        safeToClose = true;
+                                    // [MOD] Lógica más estricta: NO liquidar con marcador congelado si el partido desapareció temprano
+                                    // Solo liquidar por tiempo si:
+                                    // A. Ya estaba en el minuto 88+ cuando desapareció
+                                    // B. O han pasado más de 3.5 horas desde la última actualización (abandono total)
+                                    
+                                    if (timeVal >= 88) {
+                                         // Si desapareció al 90', es seguro asumir que terminó con ese marcador
+                                         safeToClose = true;
+                                    } else if (minsSinceUpdate > 240) { // 4 Horas
+                                         // Si desapareció hace 4 horas y no hay resultados oficiales, liquidar forzosamente (evitar zombies eternos)
+                                         safeToClose = true;
+                                    } else {
+                                         console.log(`⏳ Evento ${bet.eventId} desaparecido del feed al min ${timeVal}. Esperando resultado oficial (NO liquidar aun).`);
                                     }
 
-                                    // 3. Backup: Si la apuesta tiene más de 3 horas de creada (seguro de vida)
+                                    // 3. Backup de seguridad extrema: 5 horas desde creación
                                     const hoursSinceCreation = (Date.now() - new Date(bet.createdAt).getTime()) / 3600000;
-                                    if (hoursSinceCreation > 3) safeToClose = true;
-
-                                    // 4. Force Close Extreme (Anti-Stuck): Si el evento tiene más de 120 mins de vida teórica
-                                    if (timeVal > 120) safeToClose = true;
+                                    if (hoursSinceCreation > 5) safeToClose = true;
                                     
                                 } catch (err) {
-                                    safeToClose = true; // Ante error de cálculo, asumir cerrado para evitar bloqueos
+                                    // Si hay error calculando, mejor dejar abierto
+                                    safeToClose = false;
                                 }
 
                                 if (safeToClose) {
                                     console.log(`⚠️ Evento ${bet.eventId} (${bet.match}) tiempo cumplido/no encontrado. Cerrando.`);
                                     isFinished = true;
-                                } else {
-                                    // Si desaparece al minuto 80, NO cerramos aún. Esperamos que el reloj virtual avance.
-                                    // console.log(`⏳ Evento ${bet.eventId} fuera de feed, esperando tiempo prudente (Est: ${bet.liveTime}).`);
                                 }
                             }
                         }
@@ -532,8 +612,9 @@ export const updateActiveBetsWithLiveData = async (liveEvents) => {
 // Helper interno para liquidar
 const settleBet = (bet, score) => {
     // [0] = home, [1] = away
-    const homeGoals = score[0];
-    const awayGoals = score[1];
+    // Asegurar que sean números
+    const homeGoals = parseInt(score[0]);
+    const awayGoals = parseInt(score[1]);
     const totalGoals = homeGoals + awayGoals;
     
     let outcome = 'LOSE';
@@ -567,8 +648,13 @@ const settleBet = (bet, score) => {
     // Así que si perdemos, profit es -stake (ya descontado) y returnAmount es 0.
     // Si ganamos, returnAmount es (stake * odd).
     
-    const returnAmt = outcome === 'WIN' ? (bet.stake * bet.odd) : 0;
-    const profit = outcome === 'WIN' ? (returnAmt - bet.stake) : -bet.stake;
+    let returnAmt = 0;
+    let profit = -bet.stake;
+
+    if (outcome === 'WIN') {
+        returnAmt = parseFloat((bet.stake * bet.odd).toFixed(2));
+        profit = parseFloat((returnAmt - bet.stake).toFixed(2));
+    }
 
     return {
         ...bet,
