@@ -242,7 +242,7 @@ const ManualMatcher = () => {
                                 <div className="font-bold text-sm">{alt.name}</div>
                                 <div className="text-xs text-gray-400 mt-1 flex justify-between">
                                     <span>{new Date(alt.date).toLocaleString()}</span>
-                                    <span>{alt.league}</span>
+                                    <span>{alt.league} {alt.country ? `(${alt.country})` : ''}</span>
                                 </div>
                             </div>
                         ))}

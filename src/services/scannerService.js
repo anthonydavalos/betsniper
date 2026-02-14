@@ -1,6 +1,8 @@
 import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
-import { scanLiveOpportunities as performLiveScan, getLiveOverview } from './liveValueScanner.js';
+// [MOD] Importamos AMBAS estrategias
+import { scanLiveOpportunities as performValueScan, getLiveOverview } from './liveValueScanner.js';
+import { scanLiveOpportunities as performTurnaroundScan } from './liveScannerService.js'; 
 import { scanPrematchOpportunities } from './prematchScannerService.js';
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 
@@ -13,6 +15,26 @@ import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingServic
 // MEMORY CACHE
 let cachedOpportunities = [];
 let cachedPrematchIds = new Set(); // IDs de eventos ya detectados en Pre-Match
+
+export const discardOpportunity = async (eventId) => {
+    await initDB();
+    if (!db.data.blacklist) db.data.blacklist = [];
+    const idStr = String(eventId);
+    
+    if (!db.data.blacklist.includes(idStr)) {
+        db.data.blacklist.push(idStr);
+        await db.write();
+        console.log(`🗑️ Evento DESCARTADO y añadido a Blacklist (Persistente): ${eventId}`);
+    }
+    return true;
+};
+
+// Getter para uso en rutas
+export const getDiscardedIds = () => {
+    if (!db.data || !db.data.blacklist) return [];
+    return db.data.blacklist;
+};
+
 let lastScanTime = null;
 let isScanning = false;
 let ticks = 0; // Contador de ciclos
@@ -46,10 +68,13 @@ export const startBackgroundScanner = () => {
                  }
 
                  if (prematchOps && prematchOps.length > 0) {
-                    // console.log(`   🔎 Detectadas ${prematchOps.length} Oportunidades Pre-Match para Auto-Bet.`);
+                    console.log(`   🔎 Detectadas ${prematchOps.length} Oportunidades Pre-Match (Disponibles en UI).`);
+                    // [MOD] Auto-Bet DESHABILITADO para Pre-Match. El usuario debe decidir.
+                    /* 
                     for (const op of prematchOps) {
                         await placeAutoBet(op);
                     }
+                    */
                  }
             }
 
@@ -61,7 +86,42 @@ export const startBackgroundScanner = () => {
             const rawEvents = await getLiveOverview();
 
             // B) Pasar a lógica de detección (Inyectamos eventos para ahorrar calls)
-            let ops = await performLiveScan(rawEvents); 
+            // STRATEGY 1: VALUE BETS (Arbitraje Live)
+            let opsValue = [];
+            try {
+                 opsValue = await performValueScan(rawEvents);
+            } catch (e) {
+                 console.error("⚠️ Error en Value Scan:", e.message);
+            }
+            
+            // STRATEGY 2: TURNAROUNDS ("La Volteada")
+            let opsTurnaround = [];
+            try {
+                 opsTurnaround = await performTurnaroundScan(rawEvents); // Inyectamos eventos
+            } catch (e) {
+                 console.error("⚠️ Error en Turnaround Scan:", e.message);
+            }
+
+            // Combinar Oportunidades
+            let rawOps = [...(opsValue || []), ...(opsTurnaround || [])];
+            
+            // [MOD] Deduplicación estricta para evitar filas repetidas en UI
+            // Filtramos por key única compuesta: EventID + Market + Selection + Line
+            // Preferimos la estrategia "Value" si colisiona con "Turnaround"
+            const uniqueMap = new Map();
+            rawOps.forEach(op => {
+                const key = `${op.eventId}_${op.market}_${op.selection}_${op.line||''}`;
+                if (!uniqueMap.has(key)) {
+                    uniqueMap.set(key, op);
+                } else {
+                    // Si ya existe, nos quedamos con la que tenga mejor EV (o la más reciente)
+                    const existing = uniqueMap.get(key);
+                    if ((op.ev || 0) > (existing.ev || 0)) {
+                        uniqueMap.set(key, op);
+                    }
+                }
+            });
+            let ops = Array.from(uniqueMap.values());
             
             // FILTRADO ROBUSTO:
             // 1. Remover eventos que ya eran Oportunidades Pre-Match (Memoria sesión actual)
@@ -71,12 +131,16 @@ export const startBackgroundScanner = () => {
                 
                 // IDs de apuestas activas
                 const activeBetIds = new Set((db.data.portfolio.activeBets || []).map(b => String(b.eventId)));
+                const hiddenIds = new Set(db.data.blacklist || []);
 
                 ops = ops.filter(op => {
                     const idStr = String(op.id || op.eventId);
-                    // Solo filtramos si YA EXISTE una apuesta activa.
-                    // (Permitimos que un evento Pre-Match "fallido" sea re-capturado en Live)
-                    return !activeBetIds.has(idStr);
+                    // 1. Filtrar si ya se apostó
+                    if (activeBetIds.has(idStr)) return false;
+                    // 2. Filtrar si se descartó por el usuario
+                    if (hiddenIds.has(idStr)) return false;
+                    
+                    return true;
                 });
 
                 if (ops.length < initialCount) {
@@ -88,7 +152,10 @@ export const startBackgroundScanner = () => {
             if (ops && ops.length > 0) {
                  console.log(`   🎯 Oportunidades LIVE encontradas: ${ops.length}`);
                 for (const op of ops) {
-                    await placeAutoBet(op);
+                    // [MOD] MODO SEMI-AUTOMÁTICO
+                    // Deshabilitamos el auto-bet para que el usuario confirme manualmente (botón APOSTAR)
+                    // await placeAutoBet(op);
+                    console.log(`      👀 Oportunidad detectada (Esperando confirmación manual): ${op.match}`);
                 }
             } else {
                  if(ticks % 2 === 0) console.log(`   ... Escaneo Live completado. Sin oportunidades (nuevas).`);
@@ -102,7 +169,15 @@ export const startBackgroundScanner = () => {
             // Usamos los rawEvents para el tracking.
             // IMPORTANTE: Ejecutar siempre, incluso si rawEvents está vacío, para detectar partidos finalizados (Zombies)
             if (rawEvents) {
-                await updateActiveBetsWithLiveData(rawEvents);
+                // [MOD] Obtener Pinnacle Feed para sincronizar activeBets también
+                let pinFeed = [];
+                try {
+                     const { getAllPinnacleLiveOdds } = await import('./pinnacleService.js');
+                     const map = await getAllPinnacleLiveOdds(); // Reusa cache de la llamada previa en scanner si la hubo
+                     if (map) pinFeed = Array.from(map.values());
+                } catch(e) {}
+                
+                await updateActiveBetsWithLiveData(rawEvents, pinFeed);
             }
 
             cachedOpportunities = ops;
@@ -110,15 +185,21 @@ export const startBackgroundScanner = () => {
 
         } catch (e) {
             console.error('⚠️ Background Scan Error:', e.message);
+            // [FIX] Si hay error, limpiar caché para no mostrar partidos congelados "zombis" (Arkadag Min 19)
+            if (cachedOpportunities.length > 0) {
+                 console.log("   🧹 Datos de caché obsoletos/congelados. Limpiando para evitar errores visuales.");
+                 cachedOpportunities = [];
+            }
         } finally {
             // POLÍTICA DE POLLING OFICIAL (Basada en app.json)
             // Regla: "events.matchups" (5000ms) * "guest_multiplier" (3) = 15,000ms Mínimo Requerido
-            // Si bajamos de 15s, activamos el "botManagement" y nos mandan a la cola de delay.
-            const MIN_POLL_INTERVAL = 15000; 
-            const RANDOM_JITTER = 4000; // +0-4s de variabilidad humana
+            // [MOD] MODO BALANCEADO (Fast but Safer)
+            // 3.5 segundos + Jitter. Total ~4-5s entre ciclos.
+            const MIN_POLL_INTERVAL = 3500; 
+            const RANDOM_JITTER = 1500;
             
             const delay = MIN_POLL_INTERVAL + Math.floor(Math.random() * RANDOM_JITTER);
-            // Resultante: 15s - 19s entre ciclos
+            // Resultante: 30s - 35s entre ciclos
             
             setTimeout(loop, delay);
         }
@@ -129,9 +210,15 @@ export const startBackgroundScanner = () => {
 };
 
 export const getCachedLiveOpportunities = () => {
+    // [FIX] Filtrar al momento de servir también, por si el caché tiene datos viejos o hubo una desconexión
+    const hiddenMap = new Set(db.data.blacklist || []);
+    const filtered = (cachedOpportunities || []).filter(op => 
+        !hiddenMap.has(String(op.eventId || op.id))
+    );
+    
     return {
         timestamp: lastScanTime,
-        data: cachedOpportunities
+        data: filtered
     };
 };
 

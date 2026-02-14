@@ -2,9 +2,10 @@ import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { 
   Trophy, RefreshCw, Zap, TrendingUp, Calendar, Activity, RotateCcw, Archive, Clock, Volume2, 
-  ChevronLeft, ChevronRight, Filter, Layers, Edit, Search, Link as LinkIcon 
+  ChevronLeft, ChevronRight, Filter, Layers, Edit, Search, Link as LinkIcon, Trash2 
 } from 'lucide-react';
 import ManualMatcher from './components/ManualMatcher';
+import MonitorDashboard from './components/MonitorDashboard';
 
 // Sonido de Notificación (Ping Suave)
 const ALERT_SOUND = "data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YU..."; 
@@ -40,7 +41,7 @@ function playAlert() {
 function App() {
   const [liveOps, setLiveOps] = useState([]);
   const [prematchOps, setPrematchOps] = useState([]);
-  const [portfolio, setPortfolio] = useState({ balance: 1000, activeBets: [], history: [] });
+  const [portfolio, setPortfolio] = useState({ balance: 100, activeBets: [], history: [] });
   
   const [loading, setLoading] = useState(false);
   
@@ -51,6 +52,15 @@ function App() {
   // Refs para control de notificaciones
   const isFirstLoad = useRef(true);
   const prevLiveOpsLength = useRef(0);
+  
+  // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
+  const localDiscardedIdsRef = useRef(new Set());
+  const localPlacedBetIdsRef = useRef(new Set());
+  const pendingBetDetailsRef = useRef({});
+
+  // Trigger re-render when we update refs (hacky but works for instant feedback)
+  const [, setTick] = useState(0);
+  const forceUpdate = () => setTick(t => t + 1);
 
   // --- API CALLS ---
 
@@ -63,9 +73,83 @@ function App() {
         axios.get('/api/portfolio')
       ]);
 
-      if (liveRes.data?.data) setLiveOps(liveRes.data.data);
-      if (prematchRes.data?.data) setPrematchOps(prematchRes.data.data);
-      if (portfolioRes.data) setPortfolio(portfolioRes.data);
+      // 1. First capture server active bets to use in filtering
+      let serverActiveBetIds = new Set();
+      if (portfolioRes.data?.activeBets) {
+          serverActiveBetIds = new Set(portfolioRes.data.activeBets.map(b => String(b.eventId)));
+      }
+
+      if (liveRes.data?.data) {
+          // [FIX] Filtrar con blacklist local para evitar parpadeo
+          // Si el servidor aun trae un evento que acabamos de descartar o apostar, lo ocultamos
+          const serverOps = liveRes.data.data;
+          const cleanOps = serverOps.filter(op => {
+              const id = String(op.eventId || op.id);
+              
+              // A. Si está descartado localmente
+              if (localDiscardedIdsRef.current.has(id)) return false;
+              
+              // B. Si está apostado localmente (optimistic)
+              if (localPlacedBetIdsRef.current.has(id)) return false;
+              
+              // C. [NEW] Si YA está en el portfolio del servidor (real)
+              // Esto arregla el "flash" donde localPlaced se limpia pero liveOps aun trae la oportunidad vieja
+              if (serverActiveBetIds.has(id)) return false;
+
+              return true;
+          });
+          setLiveOps(cleanOps);
+      }
+      
+      if (prematchRes.data?.data) {
+           const serverOps = prematchRes.data.data;
+           const cleanOps = serverOps.filter(op => {
+              const id = String(op.eventId || op.id || op.matchId);
+              if (localDiscardedIdsRef.current.has(id)) return false;
+              if (localPlacedBetIdsRef.current.has(id)) return false;
+              if (serverActiveBetIds.has(id)) return false; // [NEW] Filter strict checked
+              return true;
+           });
+           setPrematchOps(cleanOps);
+      }
+
+      if (portfolioRes.data) {
+          // [MOD] Optimistic merge: Si tenemos apuestas locales pendientes que aun no estan en el server, las mantenemos
+          const serverActiveBets = portfolioRes.data.activeBets || [];
+          const serverIds = new Set(serverActiveBets.map(b => String(b.eventId)));
+          
+          // Mantener locales solo si NO han llegado del server aun
+          const stillPendingLocalIds = [];
+          localPlacedBetIdsRef.current.forEach(id => {
+              if (!serverIds.has(id)) stillPendingLocalIds.push(id);
+              else localPlacedBetIdsRef.current.delete(id); // Limpiar si ya llegó
+          });
+          
+          setPortfolio(prevPortfolio => ({
+              ...portfolioRes.data,
+              // Fucionar las apuestas reales con las "fantasma" locales para que sigan apareciendo en la UI como "Apostadas"
+              activeBets: [
+                  ...serverActiveBets,
+                  // Reconstruir objetos "Fake/Optimistic" para la UI
+                  ...stillPendingLocalIds.map(id => {
+                        // Intentar recuperar la data original del evento si es posible
+                        const originalOp = pendingBetDetailsRef.current[id];
+                        return {
+                            eventId: id,
+                            match: originalOp ? originalOp.match : "Procesando...",
+                            league: originalOp ? originalOp.league : "...",
+                            strategy: "Procesando...",
+                            type: "LIVE_SNIPE", // Default fake
+                            stake: 0,
+                            potentialReturn: 0,
+                            isOptimistic: true, // Flag para UI
+                            liveTime: originalOp?.time || "Live",
+                            createdAt: new Date().toISOString()
+                        };
+                  })
+              ]
+          }));
+      }
 
     } catch (err) {
       console.error("Error fetching data", err);
@@ -86,7 +170,7 @@ function App() {
 
   useEffect(() => {
     fetchData(); // Initial load
-    const interval = setInterval(fetchData, 3000); // Polling cada 3s
+    const interval = setInterval(fetchData, 2000); // UI Polling rapido (2s) para recibir data del backend
     return () => clearInterval(interval);
   }, []);
 
@@ -110,6 +194,54 @@ function App() {
   const initialCapital = portfolio.initialCapital || 1000;
   const totalProfit = portfolio.balance - initialCapital;
   const profitClass = totalProfit >= 0 ? 'text-emerald-400' : 'text-red-400';
+
+  // --- MANUAL PLACEMENT ---
+  const [processingBets, setProcessingBets] = useState(new Set());
+
+  const handlePlaceBet = async (opportunity) => {
+    const id = String(opportunity.eventId || opportunity.id);
+    
+    // Evitar doble clic
+    if (processingBets.has(id)) return;
+    
+    // UI Optimista: Añadir a procesando
+    setProcessingBets(prev => new Set(prev).add(id));
+    
+    // [NEW] Añadir a localPlacedBetIds (REF) para que fetchData lo filtre de la lista de oportunidades inmediatamente
+    localPlacedBetIdsRef.current.add(id);
+    pendingBetDetailsRef.current[id] = opportunity;
+    forceUpdate(); // Forzar re-render inmediato para ocultarlo de la lista
+
+    try {
+        const res = await axios.post('http://localhost:3000/api/portfolio/place-bet', opportunity);
+        if (res.data.success) {
+            // Sonido éxito
+            const audio = new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YU..."); 
+            // Mock sound, just UI Feedback needed
+        } else {
+            alert("⚠️ " + res.data.message);
+            // Si falló, lo quitamos de la lista local para que reaparezca
+            localPlacedBetIdsRef.current.delete(id);
+            delete pendingBetDetailsRef.current[id];
+            forceUpdate();
+        }
+    } catch (error) {
+        console.error(error);
+        alert("Error al conectar con el servidor.");
+        // Si falló, lo quitamos de la lista local
+        localPlacedBetIdsRef.current.delete(id);
+        delete pendingBetDetailsRef.current[id];
+        forceUpdate();
+    } finally {
+        setTimeout(() => {
+             setProcessingBets(prev => {
+                 const next = new Set(prev);
+                 next.delete(id);
+                 return next;
+             });
+        }, 1000);
+    }
+  };
 
   // --- MANUAL SETTLEMENT ---
   const requestSettle = async (id, mode) => {
@@ -140,6 +272,37 @@ function App() {
       }
   };
 
+  // --- HANDLE DISCARD (USER ACTION) ---
+  const handleDiscard = async (op) => {
+      // Ignoramos si es una apuesta ya realizada (no tiene sentido descartar activa)
+      if (op.id && !op.eventId) { // Es una bet, tiene ID numerico o string propio
+          // TO-DO: Implementar "Ocultar Apuesta Activa" si se desea
+          return; 
+      }
+      
+      const eventId = String(op.eventId || op.id);
+      if (!eventId) return;
+
+      // Optimistic Updates: Remover de la UI inmediatamente
+      // [NEW] Persistir en blacklist LOCAL (Ref) para que el próximo fetch no lo reviva
+      localDiscardedIdsRef.current.add(eventId);
+
+      if (activeTab === 'LIVE') {
+          setLiveOps(prev => prev.filter(o => String(o.eventId || o.id) !== eventId));
+      } else {
+          setPrematchOps(prev => prev.filter(o => String(o.eventId || o.id) !== eventId));
+      }
+
+      try {
+          await axios.post('http://localhost:3000/api/opportunities/discard', { id: eventId });
+      } catch (e) {
+          console.error("Error discarding opportunity:", e);
+          // Si falla, revertimos el blacklist local
+          localDiscardedIdsRef.current.delete(eventId);
+          // Opcional: Podríamos hacer forceUpdate() para traerlo de vuelta si el poll aun no ha pasado
+      }
+  };
+
   // --- FILTRADO DE DATOS (TIPO FLASHSCORE) ---
   const isSameDay = (d1, d2) => {
     return d1.getDate() === d2.getDate() && 
@@ -157,7 +320,58 @@ function App() {
     let data = [];
     
     if (activeTab === 'LIVE') {
-        return liveOps; // Siempre muestra todo lo live
+        // 1. Oportunidades detectadas (Scanner)
+        const ops = [...liveOps];
+
+        // 2. Apuestas EN JUEGO (Portfolio Active Bets)
+        // Queremos mostrar aquí las apuestas que ya hicimos pero cuyo partido se está jugando.
+        const activePlayingBets = (portfolio.activeBets || []).filter(bet => {
+            // [MOD] Filtrar por TIPO: Solo mostrar apuestas de origen LIVE en la pestaña LIVE
+            // PREMATCH bets que ya iniciaron se quedan en TODOS (User Request)
+            const isLiveOrigin = bet.type === 'LIVE_SNIPE' || bet.type === 'LIVE_VALUE' || bet.type === 'LA_VOLTEADA' || bet.isLive;
+            if (!isLiveOrigin) return false;
+
+            // a. Evitar duplicados visuales si el scanner también lo está viendo (aunque el scanner suele ocultar activeBets)
+            if (ops.some(o => String(o.eventId) === String(bet.eventId))) return false;
+
+            // b. Solo mostrar si el partido "parece" estar en vivo
+            // Criterio: Tiene liveTime valido O la fecha de inicio ya pasó (y no hace 5 horas)
+            const hasLiveTime = bet.liveTime && bet.liveTime !== 'Final' && bet.liveTime !== 'HT'; 
+            // Nota: HT lo incluimos en Live. 'Final' no.
+            
+            const startDate = new Date(bet.matchDate || bet.date || bet.createdAt);
+            const now = new Date();
+            const minutesSinceStart = (now - startDate) / 60000;
+            
+            // Es Live si: (Tiene tiempo de juego explícito) O (Ya empezó hace 0-130 mins)
+            const isLiveByTime = (minutesSinceStart > 0 && minutesSinceStart < 130);
+            
+            // Si ya determinamos que es "pending finish" (WAIT_RES) en la logica de abajo, NO mostrar aqui.
+            // Para simplificar, asumimos que si está en rango 0-130 mins es Live.
+            // La logica de FINISHED usa > 105 mins estricto o > 140 mins. Hay un pequeño solapamiento seguro.
+            
+            // [FIX] Consider matches that are technically '90+' as LIVE until backend settles them
+            const isLateGame = (bet.liveTime && bet.liveTime !== 'Final' && bet.liveTime !== 'HT');
+            
+            return (bet.liveTime && bet.liveTime !== 'Final') || isLiveByTime || isLateGame;
+        }).map(bet => ({
+            ...bet,
+            isActiveBet: true, // Propiedad para distingir visualmente si queremos
+             // [FIX] Mapear propiedades para consistencia de UI en pestaña LIVE
+            time: bet.liveTime,
+            score: bet.lastKnownScore,
+            date: bet.matchDate || bet.date,
+            // [NEW] Ensure badges persist
+            pinnacleInfo: bet.pinnacleInfo 
+        }));
+
+        return [...ops, ...activePlayingBets].sort((a,b) => {
+             // Ordenar: primero los minutos más altos (final del partido) para ver desenlaces
+             const timeA = parseInt((a.time || a.liveTime || "0").replace("'", "")) || 0;
+             const timeB = parseInt((b.time || b.liveTime || "0").replace("'", "")) || 0;
+             return timeB - timeA;
+        });
+
     } else if (activeTab === 'FINISHED') {
         // 1. Historial Real (Ya liquidadas)
         const historyData = portfolio.history.map(h => ({
@@ -169,6 +383,9 @@ function App() {
         // 2. Activas "Maduras" (Probablemente finalizadas pero esperando API Results)
         // Criterio Mejorado: Usar liveTime y lastUpdate para ser más agresivos moviendo a "Finalizados"
         const pendingFinishData = (portfolio.activeBets || []).filter(b => {
+             // Si el estado es explícitamente finalizado, mover
+             if (b.liveTime === 'Final' || b.liveTime === 'FT') return true;
+
              const betTime = new Date(b.createdAt).getTime();
              const minutesSinceBet = (Date.now() - betTime) / 60000;
              
@@ -183,10 +400,12 @@ function App() {
                  // Solo mover a Finished si:
                  // A. Calculamos que ya pasó el minuto 105
                  const estimatedCurrentMinute = lastKnownMinute + minutesSinceUpdate;
-                 if (estimatedCurrentMinute > 105) return true;
+                 // [FIX] Aumentar tolerancia para evitar mover partidos 90+ a finished prematuramente
+                 if (estimatedCurrentMinute > 115) return true;
                  
-                 // B. Estaba en min 80+ y hace más de 7 min no actualiza (se acabó feed)
-                 if (lastKnownMinute > 80 && minutesSinceUpdate > 7) return true;
+                 // B. Estaba en min 80+ y hace más de 12 min no actualiza (se acabó feed)
+                 // [FIX] Aumentar tolerancia de "feed perdido"
+                 if (lastKnownMinute > 85 && minutesSinceUpdate > 15) return true;
              } else {
                 // Fallback para PreMatch o Snipes sin tiempo capturado
                 const eventStartTime = new Date(b.matchDate || b.createdAt).getTime();
@@ -209,8 +428,8 @@ function App() {
         
         // Filtro por fecha (solicitado por user)
         return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
-    } else if (activeTab === 'MATCHER') {
-        // Tab especial Manual Matcher: No usamos filteredData, renderizaremos componente dedicado
+    } else if (activeTab === 'MATCHER' || activeTab === 'MONITOR') {
+        // Tab especial Manual Matcher / Monitor: No usamos filteredData, renderizaremos componente dedicado
         return [];
     } else {
         // TAB: ALL o PRÓXIMOS
@@ -236,6 +455,11 @@ function App() {
         // 3. [FIX] Inyectar APUESTAS ACTIVAS (Active Bets) que ya no están en scanners
         // Esto resuelve que las apuestas desaparezcan cuando empieza el partido
         const dayActiveBets = portfolio.activeBets.filter(bet => {
+             // [MOD] User Request: Oportunidades Live NO deben salir en TOTALES (ALL), Solo en LIVE.
+             // Así que filtramos y QUITAMOS las de origen Live aquí.
+             const isLiveOrigin = bet.type === 'LIVE_SNIPE' || bet.type === 'LIVE_VALUE' || bet.type === 'LA_VOLTEADA' || bet.isLive;
+             if (isLiveOrigin) return false;
+
              // a) Filtrar por fecha
              if (!bet.matchDate) return false; // si no tiene fecha, skip
              if (!isSameDay(new Date(bet.matchDate), dateFilter)) return false;
@@ -251,6 +475,7 @@ function App() {
             kellyStake: bet.stake, // Normalizar stake visual
             ev: 0, // No recalculamos EV en runtime para bets viejas
             manualStatus: 'ACTIVE_INJECTED',
+            isActiveBet: true, // [FIX] Marcar visualmente como apuesta activa
             time: bet.liveTime,
             score: bet.lastKnownScore
         }));
@@ -355,6 +580,12 @@ function App() {
                 >
                     <LinkIcon className="w-4 h-4" /> Matcher
                 </button>
+                <button 
+                    onClick={() => setActiveTab('MONITOR')}
+                    className={`flex-1 py-4 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors ${activeTab === 'MONITOR' ? 'bg-slate-700 text-purple-400 border-b-2 border-purple-500' : 'text-slate-500 hover:text-purple-300 hover:bg-slate-750'}`}
+                >
+                    <Activity className="w-4 h-4" /> Monitor
+                </button>
             </div>
 
             {/* 2. DATE FILTER BAR (Solo visible si no es FINISHED/LIVE puro) */}
@@ -388,6 +619,8 @@ function App() {
                 {/* SI ESTAMOS EN MATCHER, RENDERIZAR COMPONENTE ESPECIAL */}
                 {activeTab === 'MATCHER' ? (
                      <ManualMatcher />
+                ) : activeTab === 'MONITOR' ? (
+                     <MonitorDashboard />
                 ) : (
                 /* TABLA ESTÁNDAR */
                 <div className="overflow-x-auto">
@@ -420,8 +653,9 @@ function App() {
                                     
                                     // [MOD] Lógica Visual Strict: Si dice "Final", NO es live, aunque sea 'LIVE_SNIPE'.
                                     const isExplicitlyFinished = op.time === 'Final' || op.liveTime === 'Final' || (minutesElapsed > 120 && isReallyLiveType);
+                                    const isStatusCompleted = op.status === 'WON' || op.status === 'LOST' || op.status === 'VOID';
                                     
-                                    const isLive = !isExplicitlyFinished && (isReallyLiveType || (new Date(op.date) < new Date() && !op.isFinished && minutesElapsed < 150));
+                                    const isLive = !isStatusCompleted && !isExplicitlyFinished && (isReallyLiveType || (new Date(op.date) < new Date() && !op.isFinished && minutesElapsed < 150));
                                     
                                     // Búsqueda en historial para ver si esta operación fue ejecutada
                                     // Fix: Linkeo robusto por eventId + selection (manejo de fallback)
@@ -443,14 +677,14 @@ function App() {
                                                 <div className="flex flex-col gap-1">
                                                     <span className="flex items-center gap-1 text-red-500 animate-pulse font-bold bg-red-500/10 px-2 py-0.5 rounded w-fit text-[10px]">
                                                        <Clock className="w-3 h-3" />
-                                                       {/* Live Timer */}
-                                                       {typeof op.time === 'string' && op.time.length < 10 
-                                                            ? op.time
-                                                            : (minutesElapsed > 90 ? `90'+` : `${minutesElapsed}'`)}
+                                                       {/* Live Timer con Fallback a Pin Info (y op.liveTime si time falta) */}
+                                                       {op.pinnacleInfo?.time || op.time || op.liveTime || (
+                                                            (minutesElapsed > 90 ? `90'+` : `${minutesElapsed}'`)
+                                                       )}
                                                     </span>
-                                                    {/* SCORE MOVED HERE BELOW TIMER */}
+                                                    {/* SCORE con Prioridad Pinnacle si existe */}
                                                     <span className="font-mono font-bold text-white text-xs pl-0.5">
-                                                        {Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0'}
+                                                        {op.pinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
                                                     </span>
                                                 </div>
                                             ) : showFinished ? (
@@ -488,12 +722,53 @@ function App() {
                                             )}
                                         </td>
                                         <td className="p-3">
+                                            {/* STRATEGY BADGE */}
+                                            {isLive && (
+                                                <div className="mb-1">
+                                                    {op.type === 'LIVE_VALUE' ? (
+                                                        <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                            ARBITRAJE
+                                                        </span>
+                                                    ) : (op.type === 'LIVE_SNIPE' || op.type === 'LA_VOLTEADA') ? (
+                                                        <span className="text-[9px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                            VOLTEADA
+                                                        </span>
+                                                    ) : null}
+                                                </div>
+                                            )}
                                             <div className="text-slate-200 font-bold text-sm text-wrap max-w-[200px] md:max-w-none">{op.match}</div>
                                             <div className="text-slate-500 text-[10px] flex gap-2">
                                                 <span>{op.league}</span>
                                                 <span className="text-slate-600">|</span>
                                                 <span>{op.market || '1x2'}</span>
                                             </div>
+
+                                            {/* PRE-MATCH CONTEXT BADGES */}
+                                            {(op.pinnacleInfo?.prematchContext) && (
+                                                <div className="flex flex-wrap gap-1 mt-1.5 opacity-90">
+                                                    {/* 1x2 Badge */}
+                                                    {(op.pinnacleInfo.prematchContext.home || op.pinnacleInfo.prematchContext.draw || op.pinnacleInfo.prematchContext.away) && (
+                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match 1x2 Odds">
+                                                            <span className="text-emerald-500 font-sans font-bold">1x2</span>
+                                                            <span className={op.pinnacleInfo.prematchContext.home < 2.0 ? "text-emerald-400 font-bold" : ""}>{op.pinnacleInfo.prematchContext.home?.toFixed(2) || '-'}</span>
+                                                            <span className="text-slate-600">|</span>
+                                                            <span className={op.pinnacleInfo.prematchContext.draw < 3.0 ? "text-amber-400" : ""}>{op.pinnacleInfo.prematchContext.draw?.toFixed(2) || '-'}</span>
+                                                            <span className="text-slate-600">|</span>
+                                                            <span className={op.pinnacleInfo.prematchContext.away < 2.0 ? "text-emerald-400 font-bold" : ""}>{op.pinnacleInfo.prematchContext.away?.toFixed(2) || '-'}</span>
+                                                        </div>
+                                                    )}
+                                                    
+                                                    {/* Totals 2.5 Badge */}
+                                                    {(op.pinnacleInfo.prematchContext.over25 || op.pinnacleInfo.prematchContext.under25) && (
+                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match Over/Under 2.5">
+                                                            <span className="text-blue-500 font-sans font-bold">2.5</span>
+                                                            <span className={op.pinnacleInfo.prematchContext.over25 < 1.8 ? "text-blue-300 font-bold" : ""}>O:{op.pinnacleInfo.prematchContext.over25?.toFixed(2) || '-'}</span>
+                                                            <span className="text-slate-600">|</span>
+                                                            <span className={op.pinnacleInfo.prematchContext.under25 < 1.8 ? "text-blue-300 font-bold" : ""}>U:{op.pinnacleInfo.prematchContext.under25?.toFixed(2) || '-'}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
                                         </td>
                                         <td className="p-3 text-center">
                                             <span className={`font-bold px-2 py-1 rounded border text-[10px] whitespace-nowrap ${
@@ -501,20 +776,55 @@ function App() {
                                                 op.selection?.includes('Away') || op.action?.includes('VISITA') ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 
                                                 'bg-slate-700 text-slate-300 border-slate-600'
                                             }`}>
-                                                {op.selection}
+                                                {(() => {
+                                                    let sel = op.selection?.replace(/^BET\s+/i, '').split('@')[0].trim();
+                                                    // [MOD] Agregar línea de gol si es mercado Over/Under y falta en la selección
+                                                    if ((sel === 'Over' || sel === 'Under') && op.market?.includes('Total')) {
+                                                        const line = op.market.match(/(\d+\.?\d*)/)?.[0];
+                                                        if (line) sel += ` ${line}`;
+                                                    }
+                                                    return sel;
+                                                })()}
                                             </span>
                                         </td>
                                         <td className="p-3 text-center">
-                                            <div className="flex flex-col items-center">
-                                                <span className="font-mono text-white font-bold bg-slate-900/40 px-2 py-1 rounded">
-                                                    {/* [FIX] Priorizar 'price' (Live) sobre 'odd', fallback a 0 */}
-                                                    {(op.price || op.odd || 0).toFixed(2)}
-                                                </span>
-                                                {isLive && (
-                                                    <span className="text-[8px] text-red-400 font-bold uppercase tracking-wider mt-0.5 animate-pulse">
-                                                        LIVE
+                                            <div className="flex flex-col gap-1.5 items-center justify-center">
+                                                {/* 1. PINNACLE (Amarillo - Referencia Sharp) */}
+                                                <div className="flex flex-col items-center min-h-[2.5em] justify-center">
+                                                    {/* PRE-MATCH: Mostrar SIEMPRE si existe, aunque no haya Live */}
+                                                    {op.pinnacleInfo?.prematchPrice && (
+                                                        <span className="text-[9px] font-bold text-yellow-500/60 leading-none mb-0.5" title="Pinnacle Pre-Match">
+                                                            P.M: {op.pinnacleInfo.prematchPrice.toFixed(2)}
+                                                        </span>
+                                                    )}
+                                                    
+                                                    {/* LIVE: Mostrar si existe */}
+                                                    {(op.pinnaclePrice && op.pinnaclePrice > 1) ? (
+                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/20 w-fit" title="Pinnacle (Live Odds)">
+                                                            <span className="text-[8px] font-bold text-yellow-600/80 tracking-tighter">PIN</span>
+                                                            <span className="font-mono font-bold text-xs text-yellow-400 leading-none">{op.pinnaclePrice.toFixed(2)}</span>
+                                                        </div>
+                                                    ) : op.pinnacleInfo?.prematchPrice ? (
+                                                         // Si solo hay PreMatch pero no Live (mercado cerrado en Pin), mostrar placeholder
+                                                         <span className="text-[8px] text-slate-600 italic">Live Susp.</span>
+                                                    ) : null}
+                                                </div>
+
+                                                {/* 2. DORADOBET (Color Distinto - Target) */}
+                                                <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 w-fit relative shadow-[0_0_10px_rgba(16,185,129,0.05)]" title="DoradoBet (Altenar)">
+                                                    <span className="text-[9px] font-bold text-emerald-600/80 tracking-tighter">DOR</span>
+                                                    <span className="font-mono font-bold text-sm text-emerald-400 leading-none">
+                                                        {(op.price || op.odd || 0).toFixed(2)}
                                                     </span>
-                                                )}
+                                                    
+                                                    {/* Punto Rojo Pulsante para LIVE */}
+                                                    {isLive && (
+                                                        <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                                                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                                            <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
+                                                        </span>
+                                                    )}
+                                                </div>
                                             </div>
                                         </td>
                                         <td className="p-3 text-center">
@@ -535,12 +845,33 @@ function App() {
                                                         S/. {betData.stake ? betData.stake.toFixed(2) : op.kellyStake?.toFixed(2)}
                                                      </div>
                                                 </div>
+                                            ) : processingBets.has(op.eventId) ? (
+                                                <div className="flex flex-col items-center animate-pulse">
+                                                    <span className="text-[10px] text-slate-400 font-bold">PROCESANDO...</span>
+                                                </div>
                                             ) : (
-                                                <div className="flex flex-col items-center opacity-70">
-                                                    <span className="font-mono text-xs text-slate-500 mb-0.5">Sugerido</span>
-                                                    <div className="font-mono text-white text-sm bg-slate-900/50 px-2 py-0.5 rounded inline-block border border-dashed border-slate-600">
-                                                        S/. {(op.kellyStake || 0).toFixed(2)}
-                                                    </div>
+                                                <div className="flex flex-col items-center gap-1.5">
+                                                    {/* BOTÓN APOSTAR */}
+                                                    <button 
+                                                        onClick={(e) => { e.stopPropagation(); handlePlaceBet(op); }}
+                                                        className="flex items-center gap-2 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/50 hover:border-emerald-400 text-emerald-100 rounded px-3 py-1.5 w-full justify-between transition-all group cursor-pointer shadow-[0_0_10px_rgba(16,185,129,0.1)] hover:shadow-[0_0_15px_rgba(16,185,129,0.3)] active:scale-95"
+                                                        title="Apostar ahora"
+                                                    >
+                                                        <span className="font-bold text-[10px] group-hover:text-white">APOSTAR</span>
+                                                        <span className="font-mono font-bold text-sm">S/. {(op.kellyStake || 0).toFixed(2)}</span>
+                                                    </button>
+                                                    
+                                                    {/* BOTÓN DESCARTAR (Solo si NO es una apuesta activa inyectada) */}
+                                                    {!op.isActiveBet && (
+                                                        <button 
+                                                            onClick={(e) => { e.stopPropagation(); handleDiscard(op); }}
+                                                            className="flex items-center justify-center gap-1 bg-slate-800 hover:bg-red-900/40 border border-slate-700 hover:border-red-500/50 text-slate-400 hover:text-red-400 rounded px-2 py-1 w-full transition-colors text-[10px]"
+                                                            title="Descartar oportunidad"
+                                                        >
+                                                            <Trash2 className="w-3 h-3" />
+                                                            <span>DESCARTAR</span>
+                                                        </button>
+                                                    )}
                                                 </div>
                                             )}
                                         </td>

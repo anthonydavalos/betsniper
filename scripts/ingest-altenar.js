@@ -3,15 +3,42 @@ import db, { initDB } from '../src/db/database.js';
 
 import { fileURLToPath } from 'url';
 
-export const ingestAltenarPrematch = async () => {
-  console.log('🚀 INICIANDO INGESTA MASIVA PRE-MATCH ALTENAR (DoradoBet)...');
+export const ingestAltenarPrematch = async (force = false) => {
   await initDB();
+
+  // --- SMART SKIP LOGIC ---
+  if (!force && db.data.altenarLastUpdate) {
+      const lastRun = new Date(db.data.altenarLastUpdate).getTime();
+      const nowMs = Date.now();
+      const diffMins = (nowMs - lastRun) / 60000;
+      
+      if (diffMins < 100) { // 100 Minutos (1h 40m) de protección
+          console.log(`⏳ INGESTA ALTENAR OMITIDA: Datos frescos (${diffMins.toFixed(1)} mins)`);
+          return;
+      }
+  }
+
+  console.log('🚀 INICIANDO INGESTA MASIVA PRE-MATCH ALTENAR (DoradoBet)...');
 
   try {
     // Calcular rango de fechas (SOLO HOY para optimizar tráfico)
     const now = new Date();
+    
+    // --- HORIZONTE DINÁMICO (Estrategia AM/PM) ---
+    const peruTime = new Date().toLocaleString("en-US", { timeZone: "America/Lima" });
+    const currentHourPeru = new Date(peruTime).getHours();
+    
+    // CAMBIO A 6 PM (18:00)
     const endDate = new Date();
-    endDate.setHours(23, 59, 59, 999); // Final del día de hoy
+    if (currentHourPeru >= 18) {
+        // Noche: Buscar hasta fin de MAÑANA
+        endDate.setDate(endDate.getDate() + 1);
+        console.log(`🕒 Modo Noche (${currentHourPeru}:00 PE): Extendiendo Altenar hasta mañana.`);
+    } else {
+        // Día: Solo HOY
+        console.log(`🕒 Modo Operativo (${currentHourPeru}:00 PE): Altenar solo hoy.`);
+    }
+    endDate.setHours(23, 59, 59, 999); // Final del día seleccionado
 
     console.log(`📡 Consultando API Altenar /GetUpcoming (Hasta: ${endDate.toISOString()})...`);
     
@@ -43,6 +70,18 @@ export const ingestAltenarPrematch = async () => {
     // No necesitamos guardar TODA la basura relacional, solo lo útil para el cruce
     // Aplanamos la estructura aquí para que el Scanner sea rápido.
     
+    // [NEW] Mapas de Ligas y Países (Relational Data)
+    const champsMap = new Map();
+    if (Array.isArray(response.data.champs)) {
+        response.data.champs.forEach(c => champsMap.set(c.id, c.name));
+    }
+
+    const catsMap = new Map();
+    if (Array.isArray(response.data.categories)) {
+        response.data.categories.forEach(c => catsMap.set(c.id, c.name));
+    }
+
+    // Maps de Mercados y Odds
     const marketsMap = new Map((response.data.markets || []).map(m => [m.id, m]));
     const oddsMap = new Map((response.data.odds || []).map(o => [o.id, o]));
 
@@ -54,6 +93,10 @@ export const ingestAltenarPrematch = async () => {
       const eventDate = new Date(event.startDate);
       if (eventDate < now || eventDate > endDate) continue;
 
+      // Extract League and Country names
+      const leagueName = champsMap.get(event.champId) || "Unknown League";
+      const countryName = catsMap.get(event.catId) || "Unknown Country";
+
       // Extraer cuotas 1x2, Totales y BTTS
       const odds = extractOdds(event, marketsMap, oddsMap);
       
@@ -61,13 +104,15 @@ export const ingestAltenarPrematch = async () => {
       // Puede que solo tenga 1x2, o solo Totales, etc.
       // Modificamos para ser permisivos si hay ALGUNA información útil.
       if (odds.home || odds.draw || odds.away || odds.totals.length > 0 || odds.btts.yes) {
-        cleanEvents.push({
+        const cleanObj = {
           id: event.id,
           name: event.name,
           startDate: event.startDate,
           status: event.status, // 0 = Not started
           champId: event.champId,
           catId: event.catId,   // ID de Categoría/País
+          league: leagueName,   // [NEW] Stored Name
+          country: countryName, // [NEW] Stored Name
           competitors: event.competitorIds, // IDs para referencia futura
           odds: {
               home: odds.home,
@@ -77,11 +122,21 @@ export const ingestAltenarPrematch = async () => {
               btts: odds.btts      // { yes, no }
           },
           lastUpdated: new Date().toISOString()
-        });
+        };
+        cleanEvents.push(cleanObj);
       }
     }
 
-    // 3. Persistir en DB con Fusión Inteligente (Merge)
+    // [DEBUG] Loguear muestra para verificar extracción de Liga/País
+    if (cleanEvents.length > 0) {
+        console.log(`\n🔍 MUESTRA DE DATOS EXTRAÍDOS (Evento #1):`);
+        const sample = cleanEvents[0];
+        console.log(`   - Evento: ${sample.name}`);
+        console.log(`   - Liga: "${sample.league}"`);
+        console.log(`   - País: "${sample.country}"`);
+    }
+
+    console.log(`✅ Filtrado: ${cleanEvents.length} eventos válidos (de ${events.length}).`);
     // Mantener eventos recientes de Altenar en memoria aunque desaparezcan del endpoint /Upcoming
     // LOGICA SIMPLIFICADA: Si es de HOY (00:00 - 23:59), se queda.
     
@@ -112,7 +167,8 @@ export const ingestAltenarPrematch = async () => {
     console.log(`💾 Guardando Total: ${finalEventList.length} eventos optimizados en DB...`);
     
     db.data.altenarUpcoming = finalEventList;
-    db.data.lastAltenarUpdate = new Date().toISOString();
+    db.data.lastUpdate = new Date().toISOString(); // Master update
+    db.data.altenarLastUpdate = new Date().toISOString(); // Específico
     await db.write();
 
     console.log('✅ INGESTA ALTENAR COMPLETADA.');
@@ -151,8 +207,10 @@ const extractOdds = (event, marketsMap, oddsMap) => {
     }
 
     // B) Mercado Totales (typeId 18 o name 'Total')
-    if (market.typeId === 18 || market.name === 'Total') {
-        const lineVal = parseFloat(market.sv || market.sn); // sv="2.5" usually
+    // Agregamos variantes de nombre comunes como 'Total Goals'
+    if (market.typeId === 18 || market.name === 'Total' || (market.name && market.name.includes('Total'))) {
+        let lineVal = parseFloat(market.sv || market.sn || market.activeLine || market.specialOddValue); 
+
         if (!isNaN(lineVal)) {
             let overPrice = 0;
             let underPrice = 0;
@@ -208,5 +266,6 @@ const extractOdds = (event, marketsMap, oddsMap) => {
 
 // Ejecución directa si se llama desde CLI (node scripts/ingest-altenar.js)
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    ingestAltenarPrematch();
+    const force = process.argv.includes('--force');
+    ingestAltenarPrematch(force);
 }

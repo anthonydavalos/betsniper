@@ -125,7 +125,7 @@ export const scanPrematchOpportunities = async () => {
                 totalMatchesFound++;
                 
                 // ... Analysis Logic ...
-                const currentBankroll = db.data.portfolio.balance || db.data.config.bankroll || 1000;
+                const currentBankroll = db.data.portfolio.balance || db.data.config.bankroll || 100;
                 const altenarOdds = altenarEvent.odds;
 
                 // A) Analizar Oportunidades 1x2
@@ -186,9 +186,9 @@ export const scanPrematchOpportunities = async () => {
         valueBets.sort((a, b) => new Date(a.date) - new Date(b.date));
 
         console.log(`\n📊 ESTADÍSTICAS PRE-MATCH:`);
-        console.log(`   - Partidos Pinnacle (48h): ${pinnacleMatches.length}`);
+        console.log(`   - Partidos Pinnacle (DB):   ${pinnacleMatches.length}`);
         console.log(`   - Filtrados (Ya iniciaron): ${expiredCount}`);
-        console.log(`   - Enlazados con Altenar:   ${totalMatchesFound}`);
+        console.log(`   - Enlazados con Altenar:    ${totalLinked}`);
 
         // PERSISTENCIA DE ENLACES (CRÍTICO)
         if (newLinksCreated > 0) {
@@ -223,6 +223,9 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
         // IMPORTANTE: calculateKellyStake espera porcentaje (0-100)
         const kellyResult = calculateKellyStake(realProb * 100, offeredOdd, bankroll);
         
+        // [FILTER] Min Stake 1.00 PEN (Evitar centavos)
+        if (kellyResult.amount < 1) return;
+
         resultsArray.push({
             type: 'PREMATCH_VALUE',
             eventId: event.id, // ID Vital para tracking
@@ -240,7 +243,17 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
             ev: evPercentage,
             kellyStake: kellyResult.amount, // Extraer el monto ($) del objeto devuelto
             bookmaker: 'Altenar',
-            snapshotTime: new Date().toISOString()
+            snapshotTime: new Date().toISOString(),
+            // [NEW] Pinnacle Context for UI
+            pinnacleInfo: {
+                prematchContext: {
+                    home: dbMatch.odds?.home,
+                    draw: dbMatch.odds?.draw,
+                    away: dbMatch.odds?.away,
+                    over25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over,
+                    under25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under,
+                }
+            }
         });
     }
 };

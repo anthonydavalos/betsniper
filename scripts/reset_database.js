@@ -7,7 +7,7 @@ const dbPath = path.join(__dirname, '../db.json');
 
 const defaultData = {
   config: { 
-    bankroll: 1000, 
+    bankroll: 100, 
     kellyFraction: 0.25 
   },
   mappedTeams: { 
@@ -17,8 +17,8 @@ const defaultData = {
   altenarUpcoming: [],
   liveTracking: [],
   portfolio: {
-    balance: 1000,
-    initialCapital: 1000,
+    balance: 100,
+    initialCapital: 100,
     activeBets: [],
     history: []
   }
@@ -28,7 +28,7 @@ console.log('🧹 Reiniciando Base de Datos a estado de fábrica...');
 try {
     fs.writeFileSync(dbPath, JSON.stringify(defaultData, null, 2));
     console.log('✅ Base de datos (db.json) ha sido reseteada exitosamente.');
-    console.log('💰 Balance: 1000');
+    console.log('💰 Balance: 100');
     console.log('📝 Apuestas limpiadas.');
     console.log('📅 Eventos limpiados.');
     console.log('\n⚠️ PASOS SIGUIENTES REQUERIDOS:');

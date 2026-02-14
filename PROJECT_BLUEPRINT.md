@@ -571,9 +571,11 @@ La API no devuelve un JSON anidado simple. Devuelve un modelo RELACIONAL normali
 
 **Lógica de Parseo:**
 1.  Crear Maps (Diccionarios) para `markets` y `odds` usando sus IDs como clave para acceso rápido O(1).
-2.  Iterar sobre `events`.
-3.  Para cada evento, iterar sobre sus `marketIds`.
-4.  Buscar el mercado correspondiente en el Map de mercados.
+2.  **[NUEVO]** Crear Maps para `champs` (Ligas) y `categories` (Países) usando sus IDs (`id` -> `name`).
+    *   Iterar sobre `events` e inyectar `league: champsMap.get(event.champId)` y `country: catsMap.get(event.catId)`.
+3.  Iterar sobre `events`.
+4.  Para cada evento, iterar sobre sus `marketIds`.
+5.  Buscar el mercado correspondiente en el Map de mercados.
 5.  Si el mercado es "1x2" (Generalmente typeId: 1 o name: "1x2"), iterar sobre sus `oddIds` y buscar la cuota en el Map de odds.
     * Odd TypeId 1 = Local (Home)
     * Odd TypeId 2 = Empate (Draw)
@@ -1763,3 +1765,14 @@ Implementar funciones puras en `mathUtils.js`:
 * **FASE 3:** Implementar `GetLiveOverview` y lógica de "La Volteada" cruzando datos en tiempo real.
 * **FASE 4:** Implementar cálculo de Kelly y EV en el backend.
 * **FASE 5:** Construir el Frontend en React que consuma `GET /api/opportunities`.
+## 8. ACTUALIZACIONES V3.1 (Live-Trading V2)
+- **Extracción de Ligas (Altenar):** Implementado mapeo relacional de  y  para obtener nombres reales.
+- **Matching Estricto:** Se valida  para distinguir Femenino/Reservas.
+- **Snapshot de Cuotas:** Persistencia de  en el momento de la apuesta.
+- **Arcadia WS:** Integración de WebSockets/Puppeteer documentada como estándar para PULL de datos Pinnacle.
+
+## 8. ACTUALIZACIONES V3.1 (Live-Trading V2)
+- **Extracción de Ligas (Altenar):** Implementado mapeo relacional de `champs` y `categories` para obtener nombres reales.
+- **Matching Estricto:** Se valida `League Name` para distinguir Femenino/Reservas.
+- **Snapshot de Cuotas:** Persistencia de `pinnaclePrice` en el momento de la apuesta.
+- **Arcadia WS:** Integración de WebSockets/Puppeteer documentada como estándar para PULL de datos Pinnacle.

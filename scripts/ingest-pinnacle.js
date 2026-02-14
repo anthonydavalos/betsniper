@@ -13,6 +13,7 @@ async function fetchMarketsForMatch(matchId) {
     try {
         return await pinnacleClient.get(`/matchups/${matchId}/markets/related/straight`);
     } catch (e) {
+        console.error(`❌ Error fetching markets for ${matchId}: ${e.message}`);
         return [];
     }
 }
@@ -101,9 +102,22 @@ function processBTTS(markets, participants) {
     return null;
 }
 
-export const ingestPinnaclePrematch = async () => {
-    console.log("🚀 INICIANDO INGESTA PINNACLE (Camaleón Mode)...");
+export const ingestPinnaclePrematch = async (force = false) => {
     await initDB();
+
+    // --- SMART SKIP LOGIC ---
+    if (!force && db.data.pinnacleLastUpdate) {
+        const lastRun = new Date(db.data.pinnacleLastUpdate).getTime();
+        const nowMs = Date.now();
+        const diffMins = (nowMs - lastRun) / 60000;
+        
+        if (diffMins < 100) { // 100 Minutos (1h 40m) de protección
+            console.log(`⏳ INGESTA PINNACLE OMITIDA: Datos frescos (${diffMins.toFixed(1)} mins)`);
+            return;
+        }
+    }
+
+    console.log("🚀 INICIANDO INGESTA PINNACLE (Camaleón Mode)...");
 
     // 1. Fetch Active Leagues
     let leagues = [];
@@ -119,10 +133,25 @@ export const ingestPinnaclePrematch = async () => {
         return;
     }
 
-    // 2. Define Date Range (SOLO HOY para minimizar tráfico y riesgo)
+    // 2. Define Date Range (HORIZONTE DINÁMICO)
+    // Estrategia:
+    // - Mañana (< 12:00 PM Perú): Descargar solo hasta el final de HOY.
+    // - Tarde   (>= 12:00 PM Perú): Descargar hasta el final de MAÑANA.
     const now = new Date();
+    const peruTime = new Date().toLocaleString("en-US", { timeZone: "America/Lima" });
+    const currentHourPeru = new Date(peruTime).getHours();
+    
+    // CAMBIO A 6 PM (18:00): Antes de eso, foco total en liquidar el día.
     const futureLimit = new Date();
-    futureLimit.setHours(23, 59, 59, 999); // Final del día de hoy
+    if (currentHourPeru >= 18) {
+        // Noche: Extender hasta el final de MAÑANA (para preparar sesión de madrugada)
+        futureLimit.setDate(futureLimit.getDate() + 1);
+        console.log(`🕒 Modo Noche (${currentHourPeru}:00 PE): Extendiendo búsqueda hasta mañana.`);
+    } else {
+        // Día: Buscando solo partidos de hoy (sin ruido futuro)
+        console.log(`🕒 Modo Operativo (${currentHourPeru}:00 PE): Buscando solo partidos de hoy.`);
+    }
+    futureLimit.setHours(23, 59, 59, 999);
     
     console.log(`📅 Filtrando partidos desde AHORA hasta: ${futureLimit.toISOString()}`);
 
@@ -146,8 +175,14 @@ export const ingestPinnaclePrematch = async () => {
             const relevant = matches.filter(m => {
                 if (!m.startTime) return false;
                 const date = new Date(m.startTime);
+                // Debug log for first few matches
+                // if (Math.random() < 0.05) console.log(`Debug Match Date: ${date.toISOString()} vs Limit: ${futureLimit.toISOString()}`);
                 return date >= now && date <= futureLimit && m.type === 'matchup' && m.parentId === null; 
             });
+
+            if (matches.length > 0 && relevant.length === 0) {
+                 console.log(`⚠️ ${league.name}: ${matches.length} partidos encontrados, pero 0 en rango (Filtro: ${futureLimit.toISOString()})`);
+            }
 
             if (relevant.length > 0) {
                 console.log(`   Analizando ${league.name}: ${relevant.length} partidos.`);
@@ -196,39 +231,64 @@ export const ingestPinnaclePrematch = async () => {
                                 btts: oddsBTTS      // {yes, no} or null
                             }
                         });
+                        console.log(`      ✅ Agregado: ${match.participants.find(p => p.alignment === 'home')?.name} vs ${match.participants.find(p => p.alignment === 'away')?.name}`);
+                    } else {
+                        console.log(`      ⚠️ Sin cuotas ML: ${match.id} (Markets: ${markets.length})`);
                     }
                 }
             }
         } catch (e) {}
         processedLeagues++;
+        
+        // --- INCREMENTAL SAVE (Anti-Crash) ---
+        try {
+            const existing = db.data.upcomingMatches || [];
+            const getPeruDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
+            const todayStr = getPeruDate(new Date());
+            
+            // Recalculate Kept Matches based on current refinedMatches state
+            // Note: This is slightly inefficient (O(N^2)) but safe for 100s of matches
+            const kept = existing.filter(old => {
+                const dStr = getPeruDate(old.date);
+                const replaced = refinedMatches.some(newM => newM.id === old.id);
+                return dStr === todayStr && !replaced;
+            });
+            
+            const merged = [...kept, ...refinedMatches].sort((a, b) => new Date(a.date) - new Date(b.date));
+            db.data.upcomingMatches = merged;
+            db.data.pinnacleLastUpdate = new Date().toISOString();
+            await db.write();
+            // console.log(`   💾 Saved progress: ${merged.length} total matches.`);
+        } catch (saveErr) {
+            console.error("   ❌ Error saving progress:", saveErr.message);
+        }
     }
 
-    console.log(`💾 Fusionando partidos...`);
+    console.log(`💾 Fusionando versión final...`);
 
-    // --- LÓGICA DE FUSIÓN (MERGE) PARA NO PERDER LIVE MATCHES ---
+    // --- LÓGICA DE FUSIÓN (MERGE) ---
     // 1. Cargar partidos existentes
     const existingMatches = db.data.upcomingMatches || [];
     
-    // 2. Definir ventana de preservación: TODO EL DÍA DE HOY
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const endOfToday = new Date();
-    endOfToday.setHours(23, 59, 59, 999);
+    // 2. Definir ventana de preservación: DÍA CALENDARIO ACTUAL (PERÚ UTC-5)
+    // Usamos 'en-CA' para obtener formato YYYY-MM-DD ajustado a la zona horaria
+    const getPeruDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
+    const todayStr = getPeruDate(new Date());
 
     const keptMatches = existingMatches.filter(oldMatch => {
-        const oldDate = new Date(oldMatch.date);
+        // Extraer fecha base (YYYY-MM-DD) del partido según Perú
+        const matchDateStr = getPeruDate(oldMatch.date);
         
-        // Criterio: Es de HOY y no ha sido reemplazado por la nueva data
-        const isToday = oldDate >= startOfToday && oldDate <= endOfToday;
+        // Criterio 1: Pertenece al día de HOY
+        const belongsToToday = matchDateStr === todayStr;
         
-        // Si el partido "nuevo" ya existe en lo que acabamos de descargar, NO lo guardamos del viejo
-        // (Dejamos que la versión nueva, actualizada, tome el lugar)
+        // Criterio 2: Aún no ha sido reemplazado por la nueva descarga
         const isReplacedByNew = refinedMatches.some(newMatch => newMatch.id === oldMatch.id);
         
-        return isToday && !isReplacedByNew;
+        return belongsToToday && !isReplacedByNew;
     });
 
-    console.log(`   ♻️  Preservando ${keptMatches.length} partidos previos de HOY (en curso/recientes).`);
+    console.log(`   ♻️  Preservando ${keptMatches.length} partidos previos de HOY (Perú).`);
     console.log(`   🆕 Insertando/Actualizando ${refinedMatches.length} partidos frescos desde API.`);
 
     // 3. Fusionar Listas
@@ -239,7 +299,8 @@ export const ingestPinnaclePrematch = async () => {
 
     // Save to DB
     db.data.upcomingMatches = finalMatchList; 
-    db.data.lastUpdate = new Date().toISOString();
+    db.data.lastUpdate = new Date().toISOString(); // General
+    db.data.pinnacleLastUpdate = new Date().toISOString(); // Específico
     await db.write();
     
     console.log(`✅ INGESTA PINNACLE COMPLETADA. Total: ${finalMatchList.length} partidos en DB.`);
@@ -247,5 +308,6 @@ export const ingestPinnaclePrematch = async () => {
 
 // Ejecución directa desde CLI
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    ingestPinnaclePrematch();
+    const force = process.argv.includes('--force');
+    ingestPinnaclePrematch(force);
 }

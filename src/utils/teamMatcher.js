@@ -189,6 +189,13 @@ const STATIC_ALIASES = {
     "yf juventus zurich": "yf juventus",
 
     // --- MANUALES ANTHONY ---
+    "al ahli amman": "al ahli jordan",
+    "al ahli jordan": "al ahli amman",
+    "b 93": "b93",
+    "b93": "b 93",
+    "stjarnan gardabae": "stjarnan",
+    "stjarnan": "stjarnan gardabae",
+
     "fac wien": "floridsdorfer", // Target norm = floridsdorfer
     "floridsdorfer": "fac wien", 
     
@@ -523,10 +530,11 @@ export const getTokenSimilarity = (name1, name2) => {
   };
   
   // Detecta discrepancias graves de categoría (Reservas, Femenino, Youth)
-  const isCategoryMismatch = (rawTarget, rawCandidate, targetLeague = '') => {
+  const isCategoryMismatch = (rawTarget, rawCandidate, targetLeague = '', candidateLeague = '') => {
       const t = rawTarget.toLowerCase();
       const c = rawCandidate.toLowerCase();
       const l = targetLeague ? targetLeague.toLowerCase() : '';
+      const lc = candidateLeague ? candidateLeague.toLowerCase() : '';
 
       // Lista de tokens peligrosos (sin espacios, validaremos con boundaries)
       // Separation: Tokens that can appear in League Name vs Tokens that must be in Team Name Only
@@ -547,7 +555,8 @@ export const getTokenSimilarity = (name1, name2) => {
 
           // Check Target (Team Name OR League Name if allowed)
           const tHas = regex.test(t) || (checkLeague && regex.test(l));
-          const cHas = regex.test(c);
+          // Check Candidate (Team Name OR League Name if allowed)
+          const cHas = regex.test(c) || (checkLeague && regex.test(lc));
           
           if (tHas !== cHas) {
               // Excepción: Si uno es "Women" y el otro "(F)" se considera igual.
@@ -556,7 +565,7 @@ export const getTokenSimilarity = (name1, name2) => {
                    const rWomen = /(^|\s|\()(women|femenil|\(f\)|fem|w)($|\s|\))/i;
                    // Re-evaluate with broad regex including League context for Target IF checkLeague is true (it is for women)
                    const tIsFem = rWomen.test(t) || rWomen.test(l);
-                   const cIsFem = rWomen.test(c);
+                   const cIsFem = rWomen.test(c) || rWomen.test(lc);
                    if (tIsFem === cIsFem) continue; 
               }
 
@@ -564,22 +573,7 @@ export const getTokenSimilarity = (name1, name2) => {
               const isReserveVar = (token === 'reserve' || token === 'reserves' || token === 'res.' || token === 'ii' || token === 'b' || token === 'u23' || token === '(a)');
               if (isReserveVar) {
                    const rRes = /(^|\s|\()(reserve|reserves|res\.|ii|b|u23|\(a\))($|\s|\))/i;
-                   // Aqui es tricky. Si 'b' fue detectado en team-only, tHas es true.
-                   // Si 'b' no fue detectado en team, tHas es false.
-                   // Pero si re-evaluamos con rRes que incluye todo, podríamos re-introducir el error de Serie B.
-                   
-                   // New Logic: Check mismatch type independently
-                   // If tHas (detected correctly based on token type) != cHas
-                   
-                   // Si el token original era 'b', NO queremos checkear l con rRes en el re-eval.
-                   // Solo si el token original era de FULL_CONTEXT.
-
-                   // Simplificación: Si ya detectamos un mismatch con la lógica fina de arriba, confiamos en ella.
-                   // PERO, el problema es si token="b" (mismatch porque uno tiene 'b' y otro 'ii').
-                   // Si uno tiene 'b' y otro 'ii', no son iguales para el token loop, pero SI semánticamente.
-                   
-                   // Cross-check all reserve keywords
-                   // Check Team Names ONLY for strict tokens, Team+League for context tokens
+                   // CHECK BOTH
                    
                    const hasReserveKeyword = (str, leagueStr) => {
                        // 1. Check Team Only Tokens in NAME ONLY
@@ -598,7 +592,7 @@ export const getTokenSimilarity = (name1, name2) => {
                    };
                    
                    const tIsRes = hasReserveKeyword(t, l);
-                   const cIsRes = hasReserveKeyword(c, ''); // Candidate doesn't have league context usually provided here
+                   const cIsRes = hasReserveKeyword(c, lc);
                    
                    if (tIsRes === cIsRes) continue; 
               }
@@ -661,8 +655,10 @@ export const getTokenSimilarity = (name1, name2) => {
   
     // 2. Comparar Nombres
     for (const candidate of timeCandidates) {
-        let candidateNameRaw = candidate.home || candidate.name; 
+        let candidateNameRaw = candidate.home || candidate.name || ""; 
         const originalCandidateName = candidateNameRaw; // Backup para check de categoría
+
+        if (!candidateNameRaw) continue; // Skip malformed candidates
 
         // ROBUST SPLITTER: Split by " vs " or " vs. " or "vs" with surrounding spaces/tabs
         // Handles multiple spaces/tabs like "Wolfsburg               vs. FC St Pauli"
@@ -676,7 +672,9 @@ export const getTokenSimilarity = (name1, name2) => {
         // 0. SAFETY CHECK: Categoría (Evita Reserves vs Pro, Women vs Men)
         // Usamos el nombre YA EXTRACTO (Home) para evitar falsos positivos con el Away (Ej. Getafe B)
         // Pasamos targetLeague para que "Women" en liga contectualice al equipo
-        if (isCategoryMismatch(targetTeamName, candidateNameRaw, targetLeague)) {
+        // [NEW] Pasamos candidate.league para que el matcher sepa si el candidato juega en "Women League" o "Reserves"
+        const candidateLeagueRaw = candidate.league || ""; 
+        if (isCategoryMismatch(targetTeamName, candidateNameRaw, targetLeague, candidateLeagueRaw)) {
              // console.log(`Ignorando mismatch categoría: ${targetTeamName} vs ${candidateNameRaw}`);
              continue;
         }
@@ -746,12 +744,15 @@ export const getTokenSimilarity = (name1, name2) => {
         });
 
         for (const candidate of extendedCandidates) {
-             let cName = candidate.home || candidate.name; 
+             let cName = candidate.home || candidate.name || ""; 
+             if (!cName) continue;
+
              const splitMatch = cName.match(/\s+vs\.?\s+/i);
              if (splitMatch) cName = cName.split(splitMatch[0])[0];
              else if (cName.includes(' vs ')) cName = cName.split(' vs ')[0];
 
-             if (isCategoryMismatch(targetTeamName, cName, targetLeague)) continue;
+             const cLeague = candidate.league || ""; 
+             if (isCategoryMismatch(targetTeamName, cName, targetLeague, cLeague)) continue;
              const nCand = normalizeName(cName);
              
              // RESOLUCIÓN DE ALIAS DOBLE (Extended Window)

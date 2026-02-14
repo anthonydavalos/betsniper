@@ -6,11 +6,13 @@ Actúa como un Desarrollador Senior Full Stack y Experto en Trading Deportivo (M
 - **Plan Maestro:** Tu guía absoluta es el archivo `PROJECT_BLUEPRINT.md` ubicado en la raíz. **Léelo antes de escribir cualquier código.**
 - **Diccionario Técnico (SDK):** Usa el archivo `altenarWSDK.js` ubicado en la raíz como referencia para validar endpoints, nombres de parámetros y estructura de microservicios.
 - **Objetivo:** Construir un sistema de arbitraje y apuestas de valor en vivo cruzando datos de API-Sports (Pinnacle) y Altenar (DoradoBet).
+- **Arcadia (Truth Source):** El módulo de Pinnacle ("Arcadia") utiliza WebSockets (`ws`) y Puppeteer para obtener cuotas en tiempo real ("Live Truth").
 
 ## 2. ESTÁNDARES TECNOLÓGICOS
 - **Backend:** Node.js (ES Modules `import`/`export`), Express.
 - **Base de Datos:** `lowdb` (JSON local). Prioriza el caché agresivo.
 - **HTTP Client:** `axios` (Con configuración estricta anti-bot).
+- **Scraping Avanzado:** Puppeteer & WebSockets para feeds de alta frecuencia (Arcadia).
 - **Frontend:** React + Vite + TailwindCSS (Separado en carpeta `/client`).
 - **Matemáticas:** Usa librerías como `decimal.js` si es necesario para precisión financiera (Cálculo de EV y Kelly).
 
@@ -32,7 +34,8 @@ Al conectar con Altenar (DoradoBet), DEBES seguir estas restricciones para evita
 ## 4. MANEJO DE DATOS (MODELO RELACIONAL)
 La API de Altenar devuelve datos normalizados (separados).
 - **NO** asumas que la estructura es anidada simple.
-- **SIEMPRE** crea funciones helper para mapear IDs:
+- **SIEMPRE** mapea las relaciones globales (`data.champs` y `data.categories`):
+  - Inyecta `league: champsMap.get(event.champId)` y `country: catsMap.get(event.catId)` en cada evento.
   - Cruza `event.marketIds` con el array `markets`.
   - Cruza `market.oddIds` con el array `odds`.
   - Cruza `event.competitorIds` con el array `competitors`.
@@ -41,7 +44,8 @@ La API de Altenar devuelve datos normalizados (separados).
 ## 4.1 NORMALIZACIÓN (DESAFÍO PRINCIPAL)
 Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta lógica de Matcher:
 1.  **Nombres de Equipos (Fuzzy):** Usa Levenshtein distance y limpieza de strings. Altenar usa sufijos como `(F)` o `(Res.)`.
-2.  **Sincronización Temporal (Timezone):**
+2.  **Contexto de Liga (CRÍTICO):** Verifica siempre si la Liga o el País coinciden para evitar falsos positivos (Ej. "Liverpool" ENG vs "Liverpool" URU). Si la liga contiene "Women", "U21", "Reserve", el match debe ser estricto.
+3.  **Sincronización Temporal (Timezone):**
     *   API-Sports = UTC-5.
     *   Altenar = UTC (Zulu).
     *   Regla: Si la hora coincide (+/- 20 min) tras ajustar timezone, asume match aunque los nombres no sean idénticos al 100%.

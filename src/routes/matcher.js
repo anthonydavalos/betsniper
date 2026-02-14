@@ -29,7 +29,8 @@ router.get('/data', async (req, res) => {
                 home: m.home,
                 away: m.away,
                 date: m.date || m.startDate,
-                league: m.leagueName || m.championshipName
+                league: m.league || m.leagueName || m.championshipName, // [MOD] Updated to use new prop
+                country: m.country // [NEW] Country prop (if available)
             }))
         });
     } catch (e) {
