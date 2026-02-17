@@ -13,6 +13,9 @@ yarn-error.log
 # Database
 db.json
 
+# Runtime Data (Pinnacle WebSocket, Tokens, Stale Triggers)
+data/
+
 # Editors
 .vscode/
 .idea/
