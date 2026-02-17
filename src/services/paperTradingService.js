@@ -366,6 +366,23 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             if (bet.pick === 'btts_yes') {
                  if (scH > 0 && scA > 0) earlyWin = true;
             }
+            
+            // [NUEVO] Early Loss Check (Liquidación Anticipada de Pérdidas)
+            let earlyLoss = false;
+            
+            // Parse current minute
+            const currentMinute = parseInt(bet.liveTime?.replace(/[^0-9]/g, '') || '0');
+            
+            // 1. Under perdido matemáticamente (más goles que la línea)
+            if (bet.pick && bet.pick.startsWith('under_')) {
+                const line = parseFloat(bet.pick.split('_')[1]);
+                if (currentTotal > line) earlyLoss = true;
+            }
+            
+            // 2. BTTS No perdido (ambos anotaron)
+            if (bet.pick === 'btts_no') {
+                if (scH > 0 && scA > 0) earlyLoss = true;
+            }
 
             // [NUEVO] Si ya se pagó (Early Payout), no recalcular trigger, solo mantener activo
             if (bet.payoutReceived) {
@@ -393,6 +410,25 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
                 updatedActiveBets.push(bet);
                 hasChanges = true;
                 continue; 
+            }
+            
+            if (earlyLoss) {
+                console.log(`💀 EARLY SETTLEMENT (LOSS): ${bet.match} - ${bet.pick} [Score: ${currentScoreStr}]. Liquidando ahora.`);
+                
+                // Liquidar como PERDIDA inmediatamente
+                const settledBet = {
+                    ...bet,
+                    status: 'LOST',
+                    finalScore: currentScoreStr,
+                    profit: -bet.stake,
+                    return: 0,
+                    closedAt: new Date().toISOString(),
+                    earlyLossSettlement: true
+                };
+                
+                settledBets.push(settledBet);
+                hasChanges = true;
+                continue;
             }
 
             updatedActiveBets.push(bet);

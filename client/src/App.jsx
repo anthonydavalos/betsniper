@@ -774,12 +774,18 @@ function App() {
                                                 </div>
                                             ) : (
                                                 <div className="flex flex-col">
-                                                    <span className="text-slate-200 font-mono font-bold">
-                                                        {new Date(op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
-                                                    </span>
-                                                    <span className="text-[10px] text-slate-500">
-                                                        {new Date(op.date).toLocaleDateString()}
-                                                    </span>
+                                                    {op.date ? (
+                                                        <>
+                                                            <span className="text-slate-200 font-mono font-bold">
+                                                                {new Date(op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                            </span>
+                                                            <span className="text-[10px] text-slate-500">
+                                                                {new Date(op.date).toLocaleDateString()}
+                                                            </span>
+                                                        </>
+                                                    ) : (
+                                                        <span className="text-slate-500 text-[10px] italic">En Vivo</span>
+                                                    )}
                                                 </div>
                                             )}
                                         </td>
