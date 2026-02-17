@@ -133,20 +133,25 @@ export const startBackgroundScanner = () => {
             
             // FILTRADO ROBUSTO:
             // 1. Remover eventos que ya eran Oportunidades Pre-Match (Memoria sesión actual)
-            // 2. Remover eventos que YA TIENEN APUESTAS ACTIVAS (Persistencia DB)
+            // 2. Remover selecciones específicas que ya tienen apuestas activas (Persistencia DB)
             if (ops && ops.length > 0) {
                 const initialCount = ops.length;
                 
-                // IDs de apuestas activas (comparar por eventId ya que el bet bloquea todo el evento)
-                const activeBetIds = new Set((db.data.portfolio.activeBets || []).map(b => String(b.eventId)));
+                // [FIX] IDs de apuestas activas (usar ID único: eventId + selection)
+                const activeBetIds = new Set(
+                    (db.data.portfolio.activeBets || []).map(b => {
+                        const eventId = String(b.eventId);
+                        const selection = b.selection || b.pick || '';
+                        return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+                    })
+                );
                 const hiddenIds = new Set(db.data.blacklist || []);
 
                 ops = ops.filter(op => {
-                    const eventIdStr = String(op.id || op.eventId); // EventId simple para check de apuestas
-                    const opId = getOpportunityId(op); // ID único para check de blacklist
+                    const opId = getOpportunityId(op); // ID único para ambos checks
                     
-                    // 1. Filtrar si ya se apostó (bloquea todo el evento)
-                    if (activeBetIds.has(eventIdStr)) return false;
+                    // 1. Filtrar si ya se apostó ESTA SELECCIÓN ESPECÍFICA
+                    if (activeBetIds.has(opId)) return false;
                     // 2. Filtrar si se descartó esta selección específica
                     if (hiddenIds.has(opId)) return false;
                     
