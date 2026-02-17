@@ -5,6 +5,14 @@ import db from '../db/database.js';
 
 const router = express.Router();
 
+// Helper: Generar ID único por oportunidad (eventId + selection)
+// Debe coincidir con la función del frontend
+function getOpportunityId(op) {
+  const eventId = String(op.eventId || op.id);
+  const selection = op.selection || op.action || op.market || '';
+  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+}
+
 // POST /api/opportunities/discard
 // Añade un evento a la lista negra
 router.post('/discard', (req, res) => {
@@ -38,13 +46,14 @@ router.get('/prematch', async (req, res) => {
     // Escaner Real vs Altenar
     const allOpportunities = await scanPrematchOpportunities();
     
-    // [MOD] Filtro de descartados en tiempo real
+    // [MOD] Filtro de descartados en tiempo real (por selección individual)
     const ignoredIds = new Set(getDiscardedIds());
     // console.log("Ignored IDs:", Array.from(ignoredIds)); 
     
     const filteredOpportunities = allOpportunities.filter(op => {
-         const isIgnored = ignoredIds.has(String(op.eventId));
-         // if (isIgnored) console.log(`Omitiendo Evento ID ${op.eventId} (Blacklisted)`);
+         const opId = getOpportunityId(op); // ID único por selección
+         const isIgnored = ignoredIds.has(opId);
+         // if (isIgnored) console.log(`Omitiendo Oportunidad ${opId} (Blacklisted)`);
          return !isIgnored;
     });
 
