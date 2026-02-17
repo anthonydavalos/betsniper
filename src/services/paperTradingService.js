@@ -120,30 +120,36 @@ export const placeAutoBet = async (opportunity) => {
              return null; 
         }
 
-        // 2. Calcular Stake (Kelly)
+        // 2. Calcular Bankroll Total (Net Asset Value - NAV)
+        // MEJOR PRÁCTICA: Usar (Balance Disponible + Stake Invertido en Activas)
+        // Esto evita penalizar oportunidades simultáneas. El riesgo se controla con Fractional Kelly.
+        const currentNAV = (portfolio.balance || 0) + (portfolio.activeBets || []).reduce((sum, b) => sum + (b.stake || 0), 0);
+
+        // Calcular Stake (Kelly Dinámico)
         const realProb = opportunity.realProb || 50;
-        // SOPORTE HÍBRIDO: 'odd' (Prematch/Standard) o 'price' (Live/Altenar)
         const odd = opportunity.odd || opportunity.price || 2.0;          
         
-        // Normalizar datos para Kelly
+        // Estrategia Detectada (Live vs Prematch)
+        const strategyType = opportunity.strategy || opportunity.type || 'DEFAULT';
+
+        // Usar NAV en lugar de Balance Líquido
         const kellyResult = calculateKellyStake(
             realProb, 
             odd, 
-            portfolio.balance, 
-            config.kellyFraction || 0.25
+            currentNAV, 
+            strategyType
         );
 
         const stake = kellyResult.amount;
         
-        // Validación mínima y Fondos
-        if (stake < 1) {
-            console.log(`⚠️ Stake Kelly muy bajo (${stake.toFixed(2)} PEN). Omitiendo apuesta para ${opportunity.match}.`);
-            return null; 
-        }
-        
-        if (portfolio.balance < stake) {
-            console.log("❌ Fondos insuficientes para apostar.");
-            return null;
+        // Validación de Fondos Reales (Líquidez)
+        // Aunque calculamos sobre NAV, no podemos apostar dinero que no tenemos líquido.
+        if (stake > portfolio.balance) {
+            console.log(`⚠️ Stake ideal (${stake.toFixed(2)}) excede balance líquito (${portfolio.balance.toFixed(2)}). Ajustando a All-In.`);
+            // Opcional: Ajustar a balance restante o cancelar. 
+            // En gestión conservadora, si no hay liquidez, se cancela o se reduce. Vamos a reducir.
+            // stake = portfolio.balance; // (Si quisieras All-In)
+            return null; // Mejor no apostar si estamos sin liquidez real
         }
 
         // 4. Registrar Apuesta

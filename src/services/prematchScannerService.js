@@ -220,8 +220,8 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
     // Filtro de Valor (> 2% EV por defecto)
     if (evPercentage > 2.0) {
         // Calcular Stake Kelly
-        // IMPORTANTE: calculateKellyStake espera porcentaje (0-100)
-        const kellyResult = calculateKellyStake(realProb * 100, offeredOdd, bankroll);
+        // ESTRATEGIA: PREMATCH_VALUE (Perfil Bajo Riesgo, Alta Confianza)
+        const kellyResult = calculateKellyStake(realProb * 100, offeredOdd, bankroll, 'PREMATCH_VALUE');
         
         // [FILTER] Min Stake 1.00 PEN (Evitar centavos)
         if (kellyResult.amount < 1) return;

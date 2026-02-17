@@ -3,6 +3,14 @@ import db, { initDB } from '../db/database.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { findMatch } from '../utils/teamMatcher.js'; // [NEW] Import Matcher
 import { getAllPinnacleLiveOdds } from './pinnacleService.js'; // [NEW] Static import for matcher fallback
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// Ajustamos path para que apunte a data/ en la RAIZ (../data desde src/services está mal, necesitamos ../../data)
+const STALE_TRIGGER_FILE = path.join(__dirname, '../../data/pinnacle_stale.trigger');
 
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER"
@@ -131,6 +139,8 @@ export const getEventResult = async (sportId, catId, dateISO) => {
          // Si dateISO viene con hora, quizás cortarlo al día.
          const dateParam = dateISO ? new Date(dateISO).toISOString().split('T')[0] + 'T00:00:00.000Z' : new Date().toISOString().split('T')[0] + 'T00:00:00.000Z';
 
+         console.log(`[DEBUG] Calling GetEventResults: Sport=${sportId}, Cat=${catId}, Date=${dateParam}`);
+         
          const { data } = await altenarClient.get('/GetEventResults', {
             baseURL: resultsBaseURL, 
             params: {
@@ -278,6 +288,41 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
         }
 
         if (pinMatch) {
+            // [NEW] STALE DATA DETECTION (FROZEN SOCKET)
+            // Si hay match pero la diferencia de minutos es > 2 mins, es probable que 
+            // el socket de Pinnacle esté congelado. Reiniciamos el scraper.
+            if (pinMatch.time && event.liveTime) {
+                const pinMins = parseInt(pinMatch.time.replace("'", "")) || 0;
+                // Altenar usa "HT" o "45'" para descansos, normalizar
+                let altMins = parseInt(event.liveTime.replace("'", "")) || 0;
+                
+                // Ignorar discrepancias en el entretiempo (HT) o al inicio del 2T
+                const isHalfTime = event.liveTime.includes('HT') || event.liveTime === "45'";
+                
+                if (!isHalfTime && Math.abs(pinMins - altMins) > 3) {
+                    console.warn(`⚠️ STALE DATA DETECTED: ${event.name} (Pin: ${pinMatch.time} vs Alt: ${event.liveTime})`);
+                    console.warn(`   ⌛ Difference > 3 min. Triggering Pinnacle Scraper Restart...`);
+                    
+                    try {
+                        // Borramos el lockfile para forzar reinicio por el Scheduler
+                        // OJO: liveScannerService no debe reiniciar procesos directamente, 
+                        // pero puede borrar el flag de "actualizado" o el lockfile.
+                        
+                        // Opción mejor: Loggear un "Warning" visible que el MonitorDashboard pueda mostrar
+                        // O si estamos en modo agresivo, eliminar el archivo 'pinnacle_live.json' para forzar refetch
+                        
+                        // [V3] Escribir el archivo TRIGGER para que el proceso PinnacleGateway se reinicie
+                        if (!fs.existsSync(STALE_TRIGGER_FILE)) {
+                             // Escribir Timestamp como motivo
+                             fs.writeFileSync(STALE_TRIGGER_FILE, new Date().toISOString());
+                             console.warn("🔄 REINICIO FORZADO ENVIADO AL GATEWAY!");
+                        }
+                    } catch (err) {
+                        console.error("Error triggering restart logic", err);
+                    }
+                }
+            }
+
             const condition = checkTurnaroundCondition(event, pinMatch);
             
             if (condition) {
@@ -310,28 +355,92 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
                                 // Period 1 = 1st Half
                                 // Period 2 = 2nd Half
                                 
-                                // Score
-                                const homeScore = realPinLive.score?.home || 0;
-                                const awayScore = realPinLive.score?.away || 0;
-                                condition.currentScore = `${homeScore}-${awayScore}`; // Actualizar condición
-                                details.score = [homeScore, awayScore]; // Actualizar objeto Altenar (simulado)
+                                // Score - Priorizar el más alto (por si uno está atrasado)
+                                const pinH = realPinLive.score?.home || 0;
+                                const pinA = realPinLive.score?.away || 0;
+                                const altH = (event.score && event.score[0]) || 0;
+                                const altA = (event.score && event.score[1]) || 0;
+                                
+                                if ((pinH + pinA) >= (altH + altA)) {
+                                     condition.currentScore = `${pinH}-${pinA}`;
+                                     if (details) details.score = [pinH, pinA];
+                                } else {
+                                     // Altenar is fresher
+                                     condition.currentScore = `${altH}-${altA}`;
+                                     // No tocamos condition.score (que viene de Pinnacle/Altenar mixed logic)
+                                     // Pero aseguramos que el display use el más fresco.
+                                }
 
-                                // Time [FIX CRUCIAL] Priorizar reloj de Pinnacle
-                                if (realPinLive.time && realPinLive.time.length > 2) {
-                                    event.liveTime = realPinLive.time;
-                                    pinMatch.time = realPinLive.time; // Persistir en el objeto auxiliar
+                                // Time [FIX CRUCIAL] Priorizar reloj de Pinnacle SOLO SI es más reciente o Altenar falla
+                                // Si Pinnacle está congelado (realPinLive.time viejo), no sobreescribir Altenar fresco.
+                                // Solución: Comparar minutos si es posible.
+                                
+                                const pTimeStr = realPinLive.time || "";
+                                const aTimeStr = event.liveTime || "";
+                                const pMin = parseInt(pTimeStr.replace("'", "")) || 0;
+                                const aMin = parseInt(aTimeStr.replace("'", "")) || 0;
+                                
+                                // Sobrescribir solo si Pinnacle Time es MAYOR (más avanzado) o Altenar es 0/inválido
+                                if (pTimeStr.length > 2 && (pMin >= aMin || aMin === 0)) {
+                                    event.liveTime = pTimeStr;
+                                    pinMatch.time = pTimeStr; 
                                     pinMatch.score = condition.currentScore;
+                                }
+
+                                // [NEW] Inject Live Odds context safely (without overwriting pre-match)
+                                if (realPinLive.moneyline) {
+                                    // Ensure clean object structure
+                                    pinMatch.liveOdds = { 
+                                        home: realPinLive.moneyline.home,
+                                        away: realPinLive.moneyline.away,
+                                        draw: realPinLive.moneyline.draw
+                                    };
+                                }
+                                if (realPinLive.totals) {
+                                     // Ensure we don't wipe liveOdds if we just set moneyline
+                                     if (!pinMatch.liveOdds) pinMatch.liveOdds = {};
+                                     pinMatch.liveOdds.totals = realPinLive.totals;
                                 }
                             }
                         }
 
                         // NOTA: Si llegamos aquí es porque GetEventDetails funcionó. 
-                        // Usamos sus datos para refinar el tiempo si era 0.
-                        if (details.clock && details.clock.matchTime) {
-                            event.liveTime = details.clock.matchTime + "'"; 
-                            // Update condition score too just in case
-                        } else if (event.liveTime === "0'" || event.liveTime === "1'") {
-                             // Fallback final: Si GetEventDetails no trae reloj, mantenemos el cálculo de GetLiveOverview
+                        // Usamos sus datos para refinar el tiempo si era 0 O si Altenar es más fresco que Pinnacle.
+                        // [MOD] Prioridad absoluta al reloj más avanzado entre (Pinnacle Stored, Detail Clock, Event Clock)
+                        // Asegurar tipos numéricos para comparación
+                        const pStoredMin = pinMatch.time ? (parseInt(String(pinMatch.time).replace(/[^0-9]/g, "")) || 0) : 0;
+                        const dClockMin = (details.clock && details.clock.matchTime) ? (parseInt(String(details.clock.matchTime).replace(/[^0-9]/g, "")) || 0) : 0;
+                        const eLiveMin = (event.liveTime && event.liveTime !== "0'") ? (parseInt(String(event.liveTime).replace(/[^0-9]/g, "")) || 0) : 0;
+
+                        // Si el detalle trae un tiempo MAYOR al que pusimos de Pinnacle (o igual), úsalo.
+                        // Y si Pinnacle está "atrasado" (pStoredMin < eLiveMin), volver a Altenar.
+                        if (dClockMin >= pStoredMin && dClockMin > 0) {
+                            event.liveTime = details.clock.matchTime + "'";
+                            // [FIX] Update pinMatch too so UI shows fresh time
+                            if (pinMatch) pinMatch.time = event.liveTime;
+                        } else if (pStoredMin < eLiveMin && eLiveMin > 0) {
+                             // Si Pinnacle time (archivo) es MENOR que Altenar Time, ignorar Pinnacle
+                             // Esto arregla el caso donde el archivo Pinnacle está viejo/stale.
+                             
+                             // [FIX] Force update stored Pin Time with fresher Altenar time for UI consistency
+                             if (pinMatch) pinMatch.time = event.liveTime;
+                        } else if (dClockMin > 0 && pStoredMin === 0) {
+                             event.liveTime = details.clock.matchTime + "'";
+                             if (pinMatch) pinMatch.time = event.liveTime;
+                        }
+
+                        // Update condition score too from Detail if fresher
+                        if (details.score && details.score.length === 2) {
+                            // Comparar score actual vs score de details
+                            const [dsH, dsA] = details.score;
+                            // Ensure condition.currentScore is valid string
+                            const parts = (condition.currentScore || "0-0").split('-');
+                            const csH = parseInt(parts[0]) || 0;
+                            const csA = parseInt(parts[1]) || 0;
+                            
+                            if ((dsH + dsA) > (csH + csA)) {
+                                condition.currentScore = `${dsH}-${dsA}`;
+                            }
                         }
 
                         // A) Obtener Cuota Altenar (Value) - FIXED RELATIONAL MAPPING
@@ -410,11 +519,13 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
                             continue; 
                         }
 
-                        // Cálculo Kelly
+                        // Cálculo Kelly (ESTRATEGIA: LIVE_SNIPE - Alto Riesgo)
+                        // Enviamos 'LIVE_SNIPE' para usar el perfil más conservador (1/10).
                         const kellyResult = calculateKellyStake(
                             realProb, 
                             altenarOdd, 
-                            db.data.portfolio.balance || 100
+                            db.data.portfolio.balance || 100,
+                            'LIVE_SNIPE'
                         );
                         
                         // Solo push si hay valor positivo y min 1 Sol
@@ -447,6 +558,12 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
                                 ev: (((realProb)/100 * altenarOdd) - 1) * 100,
                                 kellyStake: kellyResult.amount,
 
+                                // [FIXED] Add missing pinnaclePrice for UI (Prevent "PIN OFF")
+                                // Priority: 1. Fresh Fetch (pinLiveOdds), 2. Global Feed (pinMatch.liveOdds), 3. Null
+                                pinnaclePrice: (isLivePinnacle 
+                                    ? (condition.side === 'home' ? pinLiveOdds?.home : pinLiveOdds?.away) 
+                                    : (pinMatch.liveOdds ? (condition.side === 'home' ? pinMatch.liveOdds.home : pinMatch.liveOdds.away) : null)),
+                                
                                 // [NEW] Enhanced Pinnacle Info for Frontend
                                 pinnacleInfo: {
                                     id: pinMatch.id,
@@ -516,13 +633,24 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
                     if (realOdd > 1.2) { // Filtro minimo de cuota
                         const estimatedProb = 55; // Mantenemos prob fija por ahora (TODO: Calcular real based on Live Vig)
                         
-                        // [FILTER] Min Stake
-                        const kRes = calculateKellyStake(estimatedProb, realOdd, db.data.portfolio.balance || 100);
-                        const kStake = kRes.amount * 0.25; // Fracción conservadora para Next Goal
+                        // [FIX] Usar NAV (Net Asset Value) en lugar de Balance simple para evitar sub-inversión
+                        const currentNAV = (db.data.portfolio.balance || 0) + (db.data.portfolio.activeBets || []).reduce((acc, b) => acc + (b.stake || 0), 0);
+                        
+                        // [FIX] Pasar estrategia explícita 'LIVE_SNIPE' para usar el Risk Profile correcto (0.10)
+                        const kRes = calculateKellyStake(
+                            estimatedProb, 
+                            realOdd, 
+                            currentNAV, 
+                            'LIVE_SNIPE' 
+                        );
+                        
+                        // No aplicar fracción manual extra. El Risk Profile ya lo incluye.
+                        const kStake = kRes.amount; 
 
                         if (kStake >= 1) {
                             opportunities.push({
-                                type: 'LIVE_VALUE',
+                                type: 'LIVE_VALUE', // Etiqueta para el frontend
+                                strategy: 'LIVE_SNIPE', // Etiqueta para el motor de riesgo
                                 eventId: event.id,
                                 pinnacleId: pinMatch.id, // ID de Arcadia/Pinnacle para referencia
                                 match: event.name,
@@ -544,6 +672,10 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
                                 ev: ((estimatedProb/100 * realOdd) - 1) * 100,
                                 kellyStake: kStake,
                                 
+                                // [FIXED] Add missing pinnaclePrice for UI (Next Goal Strategy)
+                                // Use LIVE totals if available, otherwise Pre-Match totals
+                                pinnaclePrice: (pinMatch?.liveOdds?.totals || pinMatch?.odds?.totals || []).find(t => Math.abs(t.line - goalValue.line) < 0.1)?.over,
+
                                 pinnacleInfo: {
                                     id: pinMatch?.id,
                                     time: pinMatch?.time || event.liveTime,

@@ -603,9 +603,9 @@ El principal desafío aquí es la normalización de dos factores críticos:
         4.  Si hay match y EV+, genera la alerta.
 
 2.  **Normalización de Tiempo (Timezone):**
-    *   **API-Sports:** Viene en UTC-5 (Offset verificable `-05:00`).
+    *   **Pinnacle / Fuente Principal:** Verificar zona horaria (generalmente UTC o UTC-5 según configuración).
     *   **Altenar:** Viene en UTC (Hora Zulu `Z`).
-    *   **Diferencia:** 5 horas (Ej: 14:30 en API-Sports son las 19:30 en Altenar).
+    *   **Diferencia:** Ajustar siempre a UTC antes de comparar.
     *   **Validación:** Si los nombres no son exactos "string-to-string" pero la hora coincide tras normalizar el timezone, y las cuotas están en un rango lógico (diferencia < 10%), asume que es el mismo partido.
 
 #### B. getLiveMatches()
@@ -1731,17 +1731,23 @@ Para evitar errores de cruce entre ligas dispares (Ej. Pro vs. U21/Reservas), se
 
 ---
 
-## 4. LÓGICA MATEMÁTICA (Money Management)
+## 4. LÓGICA MATEMÁTICA (Money Management - Portfolio Theory)
 
-Implementar funciones puras en `mathUtils.js`:
+Implementar funciones puras en `mathUtils.js` basadas en "Simultaneous Kelly Betting":
 
-1.  **Probabilidad Implícita (con Vig):** $P = 1 / Cuota$
-2.  **Fair Odds (Sin Vig):** Normalizar las probabilidades inversas de Pinnacle para que sumen 100%.
-3.  **Valor Esperado (EV):** $EV = (ProbabilidadReal \times CuotaDorado) - 1$
-4.  **Criterio de Kelly (Gestión de Bankroll):**
-    $$F = \frac{p(b+1) - 1}{b}$$
-    * Donde: $p$ = Probabilidad Real, $b$ = (Cuota - 1).
-    * **Kelly Fraccional:** Usar siempre `Kelly * 0.25` para reducir volatilidad.
+1.  **Probabilidad Implícita (Fair Odds):** Normalizar las probabilidades inversas de Pinnacle para que sumen 100% (eliminando el Vig).
+2.  **Valor Esperado (EV):** $EV = (ProbabilidadReal \times CuotaDorado) - 1$
+3.  **Net Asset Value (NAV):** Para el cálculo del bankroll, usar siempre el **Patrimonio Neto Liquidable**:
+    $$ NAV = \text{Balance Disponible} + \sum (\text{Stakes Activos}) $$
+    *   *Razón:* Ignorar las apuestas activas causa sub-inversión sistemática ("Underbetting").
+4.  **Gestión de Riesgo (Risk Profiles):**
+    *   **PREMATCH_VALUE:** 0.25 Kelly (Baja Volatilidad).
+    *   **LIVE_VALUE:** 0.125 Kelly (Ruido de Mercado).
+    *   **LIVE_SNIPE:** 0.10 Kelly (Alta Incertidumbre).
+5.  **Criterio de Kelly Simultáneo (Amortiguado):**
+    En lugar de un "Hard Cap", usar una **Curva de Saturación Exponencial** para gestionar la utilidad marginal de apuestas simultáneas:
+    $$ Stake = CAP \times (1 - e^{-\frac{KellyRaw}{CAP}}) $$
+    *   Esto permite que apuestas con EV masivo crezcan asintóticamente sin romper el banco.
 
 ---
 

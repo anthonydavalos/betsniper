@@ -8,6 +8,8 @@ const __dirname = path.dirname(__filename);
 
 // Configuration
 const REFRESH_INTERVAL = 30 * 60 * 1000; // 30 minutes
+const CHECK_STALE_FILE = path.join(__dirname, '../data/pinnacle_stale.trigger'); // Trigger File
+
 const OUTPUT_FILE = path.join(__dirname, '../data/pinnacle_live.json');
 const TOKEN_FILE = path.join(__dirname, '../data/pinnacle_token.json');
 
@@ -97,6 +99,25 @@ class PinnacleGateway {
 
             // --- INICIAR BUCLE DE PERSISTENCIA ---
             console.log("💾 Iniciando Auto-Save (Cada 5s)...");
+            
+            // Watch por el archivo TRIGGER de Stale Data para reiniciar
+            setInterval(() => {
+                try {
+                    if (fs.existsSync(CHECK_STALE_FILE)) {
+                        console.warn("⚠️ DETECTADA SOLICITUD DE REINICIO POR STALE DATA! ⚠️");
+                        console.warn("🔄 Recargando página para renovar Socket...");
+                        
+                        // Eliminar trigger
+                        fs.unlinkSync(CHECK_STALE_FILE);
+                        
+                        // Recargar página
+                        this.page.reload({ waitUntil: 'domcontentloaded' })
+                            .then(() => console.log("✅ Página Recargada."))
+                            .catch(err => console.error("❌ Error recargando:", err));
+                    }
+                } catch(e) { console.error("Error check stale:", e); }
+            }, 5000);
+
             setInterval(() => {
                  // Solo guardamos si han pasado al menos 2 segundos desde el último update de datos
                  // para evitar escribir en medio de una ráfaga.
@@ -247,11 +268,89 @@ class PinnacleGateway {
 }
 
 // Start standalone
-// ES Modules don't have require.main
-// We check if process.argv[1] matches this file
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    const gateway = new PinnacleGateway();
-    gateway.start();
+    (async () => {
+        const LOCK_FILE = path.join(__dirname, '../data/pinnacle_refresh.lock');
+        const MAX_LOCK_AGE_MS = 120000; // 2 minutes maximum wait
+
+        // 1. Check for existing lock (Another process running)
+        if (fs.existsSync(LOCK_FILE)) {
+            try {
+                const stats = fs.statSync(LOCK_FILE);
+                const age = Date.now() - stats.mtimeMs;
+
+                if (age < MAX_LOCK_AGE_MS) {
+                    console.log(`🔒 [Gateway] Otro proceso ya está refrescando token (Lock activo, ${(age / 1000).toFixed(1)}s). Esperando...`);
+                    
+                    // Wait loop until lock is gone
+                    let waited = 0;
+                    while (fs.existsSync(LOCK_FILE) && waited < MAX_LOCK_AGE_MS) {
+                        await new Promise(r => setTimeout(r, 1000));
+                        waited += 1000;
+                    }
+
+                    console.log(`🔓 [Gateway] Lock liberado o expirado. Verificando token...`);
+                    
+                    // Check if token was updated recently
+                    if (fs.existsSync(TOKEN_FILE)) {
+                        try {
+                            const tokenData = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf-8'));
+                            const tokenAge = Date.now() - new Date(tokenData.updatedAt).getTime();
+                            if (tokenAge < 60000) { // Updated < 1 min ago
+                                console.log(`✅ Token encontrado y reciente (${(tokenAge/1000).toFixed(1)}s). Usando existente.`);
+                                process.exit(0);
+                            }
+                        } catch (e) {
+                            console.warn("⚠️ Error leyendo token existente:", e.message);
+                        }
+                    }
+                } else {
+                    console.warn(`⚠️ [Gateway] Lock antiguo detectado (> 2 mins). Eliminando y forzando refresh.`);
+                    try { fs.unlinkSync(LOCK_FILE); } catch (e) {}
+                }
+            } catch (e) {
+                // If stat fails (file disappeared), continue
+            }
+        }
+
+        // 2. Create Lock and Start
+        try {
+            fs.writeFileSync(LOCK_FILE, Date.now().toString());
+            
+            const gateway = new PinnacleGateway();
+            
+            // Hook into process exit to clean up lock
+            const cleanup = () => {
+                try { 
+                    if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); 
+                    console.log("🔒 Lock file removed.");
+                } catch (e) {}
+            };
+            
+            // Handle process termination events
+            process.on('exit', cleanup);
+            process.on('SIGINT', () => { cleanup(); process.exit(); });
+            process.on('SIGTERM', () => { cleanup(); process.exit(); });
+            process.on('uncaughtException', (err) => { 
+                console.error("Uncaught Exception:", err); 
+                cleanup(); 
+                process.exit(1); 
+            });
+
+            await gateway.start();
+            
+            // Keep process alive if start() returns but listeners are active
+            // Do NOT call cleanup() here manually unless we are sure it's done.
+            // Given that PinnacleGateway relies on user closing window or internal logic calling process.exit(),
+            // we should just let the event loop keep running.
+
+        } catch (error) {
+            console.error("❌ Gateway Error:", error);
+            try { if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); } catch (e) {}
+            process.exit(1);
+        }
+
+    })();
 }
 
 export default PinnacleGateway;

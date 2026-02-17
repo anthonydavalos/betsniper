@@ -95,9 +95,15 @@ export const refreshOpportunity = async (opportunity) => {
         const fairProb = opportunity.realProb ? (opportunity.realProb / 100) : (1 / (opportunity.realPrice || opportunity.pinnaclePrice));
         
         const newEV = (fairProb * newPrice) - 1;
-        const kellyRes = calculateKellyStake(fairProb * 100, newPrice, db.data.portfolio.balance || 100);
         
-        const safeStake = marketName.includes('Winner') ? kellyRes.amount : kellyRes.amount * 0.5;
+        // Pass the strategy from original opportunity to scaling logic
+        const strategy = opportunity.strategy || opportunity.type || 'LIVE_SNIPE';
+        const kellyRes = calculateKellyStake(fairProb * 100, newPrice, db.data.portfolio.balance || 100, strategy);
+        
+        // El ajuste por MarketName (Winner vs. Totals) ahora podría estar implícito 
+        // en el STAKE DINAMICO, pero mantenemos esta capa extra si se desea.
+        // Por consistencia con mathUtils, usamos kellyRes.amount directamente.
+        const safeStake = kellyRes.amount;
 
         // Clone and Update
         const updatedOp = { ...opportunity };
