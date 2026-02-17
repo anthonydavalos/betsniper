@@ -436,11 +436,55 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             if (currentMinute >= 95 && !bet.payoutReceived) {
                 console.log(`⏰ FULL TIME SETTLEMENT: ${bet.match} - ${bet.pick} [Score: ${currentScoreStr}, Time: ${bet.liveTime}]`);
                 
-                // Calcular resultado final
-                const finalScoreArray = currentScoreStr.split('-').map(x => parseInt(x) || 0);
-                const result = settleBet(bet, finalScoreArray);
+                // Calcular resultado final inline (no podemos usar settleBet por orden de definición)
+                const homeGoals = parseInt(scH);
+                const awayGoals = parseInt(scA);
                 
-                settledBets.push(result);
+                let outcome = 'LOST';
+                
+                // A) 1x2 Logic
+                if (bet.pick === 'home' && homeGoals > awayGoals) outcome = 'WIN';
+                else if (bet.pick === 'away' && awayGoals > homeGoals) outcome = 'WIN';
+                else if (bet.pick === 'draw' && homeGoals === awayGoals) outcome = 'WIN';
+                
+                // B) Totals Logic
+                else if (bet.pick && bet.pick.startsWith('over_')) {
+                    const line = parseFloat(bet.pick.split('_')[1]);
+                    if (currentTotal > line) outcome = 'WIN';
+                }
+                else if (bet.pick && bet.pick.startsWith('under_')) {
+                    const line = parseFloat(bet.pick.split('_')[1]);
+                    if (currentTotal < line) outcome = 'WIN';
+                }
+                
+                // C) BTTS Logic
+                else if (bet.pick === 'btts_yes') {
+                    if (homeGoals > 0 && awayGoals > 0) outcome = 'WIN';
+                }
+                else if (bet.pick === 'btts_no') {
+                    if (homeGoals === 0 || awayGoals === 0) outcome = 'WIN';
+                }
+                
+                // Calcular profit
+                let returnAmt = 0;
+                let profit = -bet.stake;
+                
+                if (outcome === 'WIN') {
+                    returnAmt = parseFloat((bet.stake * bet.odd).toFixed(2));
+                    profit = parseFloat((returnAmt - bet.stake).toFixed(2));
+                }
+                
+                const settledBet = {
+                    ...bet,
+                    status: outcome === 'WIN' ? 'WON' : 'LOST',
+                    finalScore: currentScoreStr,
+                    profit: profit,
+                    return: returnAmt,
+                    closedAt: new Date().toISOString(),
+                    fullTimeSettlement: true
+                };
+                
+                settledBets.push(settledBet);
                 hasChanges = true;
                 continue;
             }
