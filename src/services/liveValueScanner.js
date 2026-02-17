@@ -226,6 +226,21 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
             // console.log(`   ⏱️ Actualizando tiempo ${event.name}: ${event.liveTime} -> ${details.liveTime}`);
             event.liveTime = details.liveTime;
         }
+
+        // [FIX] Sincronización de Tiempos Robusta (Reloj Ganador) para Evitar Congelamiento
+        // Comparamos el tiempo que trae Pinnacle (pinLiveOdds.time) vs el de Altenar (event.liveTime/details)
+        const pinTimeMin = pinLiveOdds ? (parseInt(String(pinLiveOdds.time).replace(/[^0-9]/g, "")) || 0) : 0;
+        const evtTimeMin = (event.liveTime && event.liveTime !== "0'") ? (parseInt(String(event.liveTime).replace(/[^0-9]/g, "")) || 0) : 0;
+
+        // Si Pinnacle está congelado (es menor que Altenar), forzar que el objeto Pinnacle tenga el tiempo de Altenar
+        if (pinLiveOdds && evtTimeMin > pinTimeMin) {
+            pinLiveOdds.time = event.liveTime;
+        }
+        // Si Pinnacle está adelantado (pero coherente, ej. feed oficial más rápido), actualizar Altenar
+        else if (pinLiveOdds && pinTimeMin > evtTimeMin && pinTimeMin < evtTimeMin + 15) {
+             event.liveTime = pinLiveOdds.time;
+        }
+
         if (details.score && Array.isArray(details.score) && details.score.length > 0) {
             event.score = details.score;
         }
@@ -294,58 +309,59 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
             return true;
         });
         
-        if (totalMarkets.length > 0 && pinLiveOdds.totals && pinLiveOdds.totals.length > 0) {
-            
+            // --- NUEVO ENFOQUE: AGRUPAR POR LÍNEAS (Igual que Monitor) ---
+            // Iteramos sobre TODOS los mercados de totales, y luego sobre TODAS sus cuotas internas.
+            // Agrupamos por la línea que diga SU NOMBRE ("Más de 2.5", "Menos de 2.5"), no la del mercado padre.
+
+            const totalsBuffer = new Map(); // Map<Line, {over, under}>
+
             for (const mTotal of totalMarkets) {
-                // [FIX] Soporte robusto para 'sv' (Special Value) y 'sn' usados por Altenar
-                let line = parseFloat(mTotal.activeLine || mTotal.specialOddValue || mTotal.sv || mTotal.sn);
+                const oddIds = (mTotal.desktopOddIds || []).flat();
                 
-                // [FIX - REWRITE] Si no hay línea en propiedades, BUSCAR EN LOS ODDS
-                // Altenar a veces agrupa odds (3.5, 4.5) bajo un market genérico sin 'activeLine'.
-                if (!line || isNaN(line)) {
-                    // Pre-scan odds to find true line (majority vote or explicit naming)
-                    // Este es un entorno de trading, asumimos que iteramos sobre odds después.
-                    // Pero para obtener el PINNACLE comparison, necesitamos la línea YA.
+                for (const oid of oddIds) {
+                    const o = altenarOddsMap.get(oid);
+                    if (!o || !o.name) continue; // Skip inválidos
+
+                    const name = o.name.toLowerCase();
+                    const price = o.price;
                     
-                    // Estrategia Rapida: Mirar primer odd del market que tenga numero
-                    const oddIds = (mTotal.desktopOddIds || []).flat();
-                    // Buscar primer odd válido
-                     for (const oid of oddIds) {
-                         const o = altenarOddsMap.get(oid);
-                         if (o && o.name) {
-                             const match = o.name.match(/(\d+\.?\d*)/);
-                             if (match) {
-                                  line = parseFloat(match[0]);
-                                  break;
-                             }
-                         }
-                     }
+                    // 1. Extraer línea del nombre del pick (Ej: "Más de 3.5" -> 3.5)
+                    // Esta es la Fuente de la Verdad Definitiva.
+                    const match = name.match(/(\d+\.?\d*)/);
+                    if (!match) continue; 
+                    
+                    const line = parseFloat(match[0]);
+                    if (isNaN(line)) continue;
+
+                    // 2. Filtros de Negocio
+                    if (line % 1 !== 0.5) continue; // Solo asiáticos puros (.5)
+
+                    // 3. Inicializar grupo en Buffer
+                    if (!totalsBuffer.has(line)) totalsBuffer.set(line, { line });
+                    const entry = totalsBuffer.get(line);
+
+                    // 4. Asignar Over/Under
+                    if (name.includes('más') || name.includes('over')) entry.over = { price, obj: o };
+                    else if (name.includes('menos') || name.includes('under')) entry.under = { price, obj: o };
                 }
+            }
 
-                if (!line || isNaN(line)) continue;
-
-                // [MOD] Filtro estricto: Solo líneas .5 (0.5, 1.5, 2.5...)
-                // Excluimos líneas enteras (2.0) o cuartos (2.25, 2.75) para reducir ruido
-                if (line % 1 !== 0.5) continue;
-
-                // Buscar linea equivalente en Pinnacle (Delta 0.1)
+            // --- PROCESAR EL BUFFER Y COMPARAR CON PINNACLE ---
+            totalsBuffer.forEach((altData, line) => {
+                 // Buscar linea equivalente en Pinnacle (Delta 0.1)
                 const pinLineObj = pinLiveOdds.totals.find(t => Math.abs(t.line - line) < 0.1);
                 
                 if (pinLineObj) {
-                    const oddIds = (mTotal.desktopOddIds || []).flat();
-                    const oddsObjs = oddIds.map(id => altenarOddsMap.get(id)).filter(Boolean);
-
-                    const altOver = oddsObjs.find(o => o.name.toLowerCase().includes('más') || o.name.toLowerCase().includes('over'));
-                    const altUnder = oddsObjs.find(o => o.name.toLowerCase().includes('menos') || o.name.toLowerCase().includes('under'));
-
-                    if (altOver && pinLineObj.over) checkAndAddOpp(opportunities, event, pinMatch, `Total Goals ${line}`, 'Over', altOver.price, pinLineObj.over, pinLineObj, pinLiveOdds);
-                    if (altUnder && pinLineObj.under) checkAndAddOpp(opportunities, event, pinMatch, `Total Goals ${line}`, 'Under', altUnder.price, pinLineObj.under, pinLineObj, pinLiveOdds);
-                } else {
-                    // DEBUG: Loggear si no encontramos la linea exacta para diagnosticar
-                    // console.log(`   🔸 Linea Altenar ${line} no encontrada en Pinnacle (Lines: ${pinLiveOdds.totals.map(t=>t.line).join(',')})`);
+                    // Validar Over
+                    if (altData.over && pinLineObj.over) {
+                        checkAndAddOpp(opportunities, event, pinMatch, `Total Goals ${line}`, 'Over', altData.over.price, pinLineObj.over, pinLineObj, pinLiveOdds);
+                    }
+                    // Validar Under
+                    if (altData.under && pinLineObj.under) {
+                        checkAndAddOpp(opportunities, event, pinMatch, `Total Goals ${line}`, 'Under', altData.under.price, pinLineObj.under, pinLineObj, pinLiveOdds);
+                    }
                 }
-            }
-        }
+            });
     } 
 
     if (opportunities.length > 0) {
@@ -392,7 +408,9 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
 
     // 3. EV y Kelly
     const ev = (fairProb * altOdd) - 1;
-    const kellyRes = calculateKellyStake(fairProb * 100, altOdd, db.data.portfolio.balance || 100); 
+    // ESTRATEGIA: LIVE_VALUE (Perfil Medio Riesgo)
+    // Usamos 'LIVE_VALUE' como identificador para mathUtils
+    const kellyRes = calculateKellyStake(fairProb * 100, altOdd, db.data.portfolio.balance || 100, 'LIVE_VALUE'); 
 
     // [DEBUG] Loggear Totals detectados aunque tengan poco EV para confirmar que la lógica funciona
     // if (marketName.includes('Total') && ev > -0.05) {
@@ -591,14 +609,26 @@ export const getLiveOddsComparison = async () => {
              // console.error(`Err detail ${event.id}`); 
         }
 
-        // [FIX] Actualizar visualización (Tiempo y Score) si los detalles traen mejor data
+        // [FIX] Actualizar visualización (Tiempo y Score) con lógica de "Reloj Ganador"
         if (details) {
-             if (details.liveTime && details.liveTime !== event.liveTime && details.liveTime !== "0'" && details.liveTime !== "") {
-                 event.liveTime = details.liveTime;
-             }
-             // A veces details trae clock con matchTime
-             if (details.clock && details.clock.matchTime) {
+             const pinTimeMin = pinLiveOdds ? (parseInt(String(pinLiveOdds.time).replace(/[^0-9]/g, "")) || 0) : 0;
+             const detTimeMin = (details.clock && details.clock.matchTime) ? (parseInt(String(details.clock.matchTime).replace(/[^0-9]/g, "")) || 0) : 0;
+             const evtTimeMin = (event.liveTime && event.liveTime !== "0'") ? (parseInt(String(event.liveTime).replace(/[^0-9]/g, "")) || 0) : 0;
+             
+             // 1. Si Altenar Detail tiene mejor tiempo, usarlo
+             if (detTimeMin > evtTimeMin) {
                  event.liveTime = details.clock.matchTime + "'";
+             }
+             
+             // 2. Si Pinnacle está ADELANTADO a Altenar, usar Pinnacle (pero solo si es coherente no más de 5 mins diff para evitar desync masivo)
+             // Y si Pinnacle está ATRASADO, asegurar que el objeto `pinLiveOdds` se actualice para la UI.
+             if (pinLiveOdds && pinTimeMin > detTimeMin + 1) {
+                 if (pinTimeMin < detTimeMin + 10) { // Coherencia check
+                     event.liveTime = pinLiveOdds.time; 
+                 }
+             } else if (pinLiveOdds && detTimeMin > pinTimeMin) {
+                 // CASE: Altenar is fresher. Update Pin object for UI consistency
+                 pinLiveOdds.time = event.liveTime;
              }
              
              if (details.score && Array.isArray(details.score) && details.score.length > 0) {

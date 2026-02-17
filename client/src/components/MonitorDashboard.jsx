@@ -156,17 +156,7 @@ export default function MonitorDashboard() {
                                 <td className="p-3 sticky left-0 bg-gray-800 border-r border-gray-700">
                                     <div className="font-bold text-white truncate max-w-[200px]" title={row.name}>{row.name}</div>
                                     
-                                    {/* ALTENAR (Local Bookie) */}
-                                    <div className="flex items-center gap-2 mt-1">
-                                        <span className="text-[9px] text-green-500 font-bold w-6">ALT</span>
-                                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${row.time === 'HT' ? 'bg-yellow-600 text-black' : 'bg-red-600'}`}>
-                                            {row.time}
-                                        </span>
-                                        <span className="text-gray-400 text-xs">{row.score}</span>
-                                        {!row.linked && <span className="text-red-400 text-[10px] border border-red-500 px-1 rounded ml-auto">UNLINKED</span>}
-                                    </div>
-
-                                    {/* PINNACLE (Truth Source) */}
+                                    {/* PINNACLE (Truth Source) - NOW FIRST */}
                                     {row.linked && (
                                         <div className="flex items-center gap-2 mt-1 border-gray-700/50 pt-0.5">
                                             <span className="text-[9px] text-blue-400 font-bold w-6">PIN</span>
@@ -176,6 +166,16 @@ export default function MonitorDashboard() {
                                             <span className="text-blue-300 text-xs font-mono">{row.pinnacle?.score || '0-0'}</span>
                                         </div>
                                     )}
+
+                                    {/* ALTENAR (Local Bookie) - NOW SECOND */}
+                                    <div className="flex items-center gap-2 mt-1">
+                                        <span className="text-[9px] text-green-500 font-bold w-6">ALT</span>
+                                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${row.time === 'HT' ? 'bg-yellow-600 text-black' : 'bg-red-600'}`}>
+                                            {row.time}
+                                        </span>
+                                        <span className="text-gray-400 text-xs">{row.score}</span>
+                                        {!row.linked && <span className="text-red-400 text-[10px] border border-red-500 px-1 rounded ml-auto">UNLINKED</span>}
+                                    </div>
                                 </td>
 
                                 {/* PINNACLE (Pre & Live Combined) */}

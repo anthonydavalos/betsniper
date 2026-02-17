@@ -1,6 +1,6 @@
 // Diccionario normalizado de equipos
 // Clave: Nombre "sucio" de Altenar/DoradoBet
-// Valor: Nombre "limpio" o estandarizado (como viene en API-Sports)
+// Valor: Nombre "limpio" o estandarizado
 export const TEAM_MAPPINGS = {
   // Altenar Name : API Sports Name
   "Man City": "Manchester City",

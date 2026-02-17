@@ -52,6 +52,7 @@ function App() {
   // Refs para control de notificaciones
   const isFirstLoad = useRef(true);
   const prevLiveOpsLength = useRef(0);
+  const prevOddsRef = useRef({}); // [NEW] Cache para detectar tendencias de cuotas
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
   const localDiscardedIdsRef = useRef(new Set());
@@ -98,7 +99,32 @@ function App() {
 
               return true;
           });
-          setLiveOps(cleanOps);
+
+          // [NEW] Calcular Tendencias de Cuotas (Flechas Arriba/Abajo)
+          const enrichedOps = cleanOps.map(op => {
+              const currentOdd = parseFloat(op.price || op.odd);
+              if (!currentOdd) return op;
+
+              const opKey = `${op.eventId}-${op.selection || op.action}`;
+              const prevData = prevOddsRef.current[opKey];
+              
+              let trend = 'SAME'; // Valores: 'UP', 'DOWN', 'SAME'
+              
+              if (prevData) {
+                  if (currentOdd > prevData.odd) trend = 'UP';
+                  else if (currentOdd < prevData.odd) trend = 'DOWN';
+                  else trend = prevData.trend; // Mantener estado anterior visualmente si no cambia
+              }
+
+              // Actualizar cache solo si cambió el valor o es nuevo
+              if (!prevData || currentOdd !== prevData.odd) {
+                  prevOddsRef.current[opKey] = { odd: currentOdd, trend, timestamp: Date.now() };
+              }
+
+              return { ...op, trend: prevOddsRef.current[opKey].trend };
+          });
+
+          setLiveOps(enrichedOps);
       }
       
       if (prematchRes.data?.data) {
@@ -376,7 +402,9 @@ function App() {
         // 1. Historial Real (Ya liquidadas)
         const historyData = portfolio.history.map(h => ({
             ...h,
-            date: h.matchDate || h.date || h.closedAt, 
+            // [FIX] Priorizar fecha de creación/evento real sobre fecha de cierre/liquidación
+            // Para evitar que eventos viejos aparezcan en "Hoy" solo por haberse liquidado hoy.
+            date: h.matchDate || h.createdAt || h.date || h.closedAt, 
             isFinished: true
         }));
 
@@ -723,15 +751,19 @@ function App() {
                                         </td>
                                         <td className="p-3">
                                             {/* STRATEGY BADGE */}
-                                            {isLive && (
+                                            {(isLive || showFinished || executionStatus === 'FINISHED') && (
                                                 <div className="mb-1">
                                                     {op.type === 'LIVE_VALUE' ? (
                                                         <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                            ARBITRAJE
+                                                            VALUE BET
                                                         </span>
                                                     ) : (op.type === 'LIVE_SNIPE' || op.type === 'LA_VOLTEADA') ? (
                                                         <span className="text-[9px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                            VOLTEADA
+                                                            SNIPE
+                                                        </span>
+                                                    ) : (op.type === 'PREMATCH_VALUE' || (!isLive && !op.type?.includes('LIVE'))) ? (
+                                                        <span className="text-[9px] font-bold bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                            PRE-MATCH
                                                         </span>
                                                     ) : null}
                                                 </div>
@@ -789,40 +821,66 @@ function App() {
                                         </td>
                                         <td className="p-3 text-center">
                                             <div className="flex flex-col gap-1.5 items-center justify-center">
-                                                {/* 1. PINNACLE (Amarillo - Referencia Sharp) */}
-                                                <div className="flex flex-col items-center min-h-[2.5em] justify-center">
-                                                    {/* PRE-MATCH: Mostrar SIEMPRE si existe, aunque no haya Live */}
-                                                    {op.pinnacleInfo?.prematchPrice && (
-                                                        <span className="text-[9px] font-bold text-yellow-500/60 leading-none mb-0.5" title="Pinnacle Pre-Match">
-                                                            P.M: {op.pinnacleInfo.prematchPrice.toFixed(2)}
-                                                        </span>
-                                                    )}
+                                                {/* 1. PINNACLE (Azul - Referencia Live Sharp) */}
+                                                <div className="flex flex-col items-center min-h-[2.5em] justify-center relative gap-1">
                                                     
-                                                    {/* LIVE: Mostrar si existe */}
+                                                    {/* SOLO MOSTRAR SI HAY CUOTA LIVE DE PINNACLE */}
                                                     {(op.pinnaclePrice && op.pinnaclePrice > 1) ? (
-                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/20 w-fit" title="Pinnacle (Live Odds)">
-                                                            <span className="text-[8px] font-bold text-yellow-600/80 tracking-tighter">PIN</span>
-                                                            <span className="font-mono font-bold text-xs text-yellow-400 leading-none">{op.pinnaclePrice.toFixed(2)}</span>
+                                                        <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-blue-500/10 border border-blue-500/20 w-fit relative overflow-visible shadow-[0_0_10px_rgba(59,130,246,0.05)]" title="Pinnacle (Cuota en Vivo - Snapshot)">
+                                                            <span className="text-[9px] font-bold text-blue-400 tracking-tighter">PIN</span>
+                                                            <span className="font-mono font-bold text-sm text-blue-300 leading-none">{op.pinnaclePrice.toFixed(2)}</span>
+                                                            
+                                                            {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) - Modificado para parpadear igual que Dorado */}
+                                                            {op.trend === 'UP' ? (
+                                                                <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
+                                                                    ▲
+                                                                </span>
+                                                            ) : op.trend === 'DOWN' ? (
+                                                                <span className="absolute -top-1 -right-1 text-red-500 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
+                                                                    ▼
+                                                                </span>
+                                                            ) : (
+                                                                // Si no hay tendencia, mostramos el punto rojo parpadeante (LIVE STANDARD)
+                                                                <span className="absolute -top-1 -right-1 flex h-2 w-2 z-50">
+                                                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500 border border-slate-900 shadow-sm" title="Live Market Source"></span>
+                                                                </span>
+                                                            )}
                                                         </div>
-                                                    ) : op.pinnacleInfo?.prematchPrice ? (
-                                                         // Si solo hay PreMatch pero no Live (mercado cerrado en Pin), mostrar placeholder
-                                                         <span className="text-[8px] text-slate-600 italic">Live Susp.</span>
-                                                    ) : null}
+                                                    ) : (
+                                                        // Si no hay cuota live, mostrar placeholder "OFF" discreto para mantener alineación
+                                                        <div className="px-2 py-1 rounded bg-slate-800/30 border border-slate-700/30 min-w-[60px] flex justify-center opacity-50">
+                                                            <span className="text-[8px] text-slate-600 font-bold">PIN OFF</span>
+                                                        </div>
+                                                    )}
                                                 </div>
 
                                                 {/* 2. DORADOBET (Color Distinto - Target) */}
                                                 <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 w-fit relative shadow-[0_0_10px_rgba(16,185,129,0.05)]" title="DoradoBet (Altenar)">
                                                     <span className="text-[9px] font-bold text-emerald-600/80 tracking-tighter">DOR</span>
-                                                    <span className="font-mono font-bold text-sm text-emerald-400 leading-none">
+                                                    <span className="font-mono font-bold text-sm text-emerald-400 leading-none flex items-center gap-0.5">
                                                         {(op.price || op.odd || 0).toFixed(2)}
                                                     </span>
                                                     
-                                                    {/* Punto Rojo Pulsante para LIVE */}
+                                                    {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) */}
                                                     {isLive && (
-                                                        <span className="absolute -top-1 -right-1 flex h-2 w-2">
-                                                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                                                            <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
-                                                        </span>
+                                                        op.trend === 'UP' ? (
+                                                            // Flecha Arriba (Verde) - Sin círculo
+                                                            <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
+                                                                ▲
+                                                            </span>
+                                                        ) : op.trend === 'DOWN' ? (
+                                                            // Flecha Abajo (Roja) - Sin círculo
+                                                            <span className="absolute -top-1 -right-1 text-red-500 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
+                                                                ▼
+                                                            </span>
+                                                        ) : (
+                                                            // Si no hay tendencia, mostramos el punto rojo standard (ESTILO PINNACLE)
+                                                            <span className="absolute -top-1 -right-1 flex h-2 w-2 z-50">
+                                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                                                <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500 border border-slate-900 shadow-sm"></span>
+                                                            </span>
+                                                        )
                                                     )}
                                                 </div>
                                             </div>

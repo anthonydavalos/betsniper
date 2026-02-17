@@ -5,7 +5,7 @@ Actúa como un Desarrollador Senior Full Stack y Experto en Trading Deportivo (M
 ## 1. CONTEXTO Y FUENTE DE LA VERDAD
 - **Plan Maestro:** Tu guía absoluta es el archivo `PROJECT_BLUEPRINT.md` ubicado en la raíz. **Léelo antes de escribir cualquier código.**
 - **Diccionario Técnico (SDK):** Usa el archivo `altenarWSDK.js` ubicado en la raíz como referencia para validar endpoints, nombres de parámetros y estructura de microservicios.
-- **Objetivo:** Construir un sistema de arbitraje y apuestas de valor en vivo cruzando datos de API-Sports (Pinnacle) y Altenar (DoradoBet).
+- **Objetivo:** Construir un sistema de arbitraje y apuestas de valor en vivo cruzando datos de Pinnacle y Altenar (DoradoBet).
 - **Arcadia (Truth Source):** El módulo de Pinnacle ("Arcadia") utiliza WebSockets (`ws`) y Puppeteer para obtener cuotas en tiempo real ("Live Truth").
 
 ## 2. ESTÁNDARES TECNOLÓGICOS
@@ -46,19 +46,21 @@ Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta ló
 1.  **Nombres de Equipos (Fuzzy):** Usa Levenshtein distance y limpieza de strings. Altenar usa sufijos como `(F)` o `(Res.)`.
 2.  **Contexto de Liga (CRÍTICO):** Verifica siempre si la Liga o el País coinciden para evitar falsos positivos (Ej. "Liverpool" ENG vs "Liverpool" URU). Si la liga contiene "Women", "U21", "Reserve", el match debe ser estricto.
 3.  **Sincronización Temporal (Timezone):**
-    *   API-Sports = UTC-5.
+    *   Pinnacle = Verificar Timezone.
     *   Altenar = UTC (Zulu).
     *   Regla: Si la hora coincide (+/- 20 min) tras ajustar timezone, asume match aunque los nombres no sean idénticos al 100%.
 
-## 5. LÓGICA DE NEGOCIO Y MATEMÁTICAS
-- **Value Bets:** Compara siempre Probabilidad Implícita vs Probabilidad Real (sin Vig) en mercados 1x2, Over/Under y BTTS.
+## 5. LÓGICA DE NEGOCIO Y MATEMÁTICAS (QUANT TRADING)
+- **Value Bets:** Compara siempre Probabilidad Implícita (Pinnacle Fair) vs Probabilidad Real (Altenar Implied) en mercados 1x2, Over/Under y BTTS.
 - **Estrategia "La Volteada":** 
   - **Umbral de Favorito:** Probabilidad > 55% (antes 60%). Ajustado para capturar más valor (Ej. Caso Tigres/Pumas).
   - Prioriza la eficiencia. Usa `GetLiveOverview` para el escaneo rápido y `GetEventDetails` solo para la confirmación profunda.
-- **Gestión de Bankroll:** Aplica el Criterio de Kelly Fraccional (x0.25) definido en el Blueprint.
+- **Gestión de Bankroll (Portfolio Theory):**
+  - **Base:** NAV (Net Asset Value = Balance + Active Exposure).
+  - **Risk Profiles:** Aplica fracciones dinámicas según la volatilidad (Prematch: 0.25, Live: 0.125, Snipe: 0.10).
+  - **Simultaneous Kelly:** Usa una curva de saturación logarítmica para gestionar apuestas múltiples, en lugar de un "Hard Cap" arbitrario.
 - **Protocolo de Liquidación (Settlement Logic):**
   - **Live Snipes:** Liquidación **INMEDIATA** si el evento desaparece del feed y `(Minuto >= 90 OR Tiempo Estimado > 100')`.
-  - **Pre-Match:** Buffer de seguridad obligatorio de **2.2 horas** post-inicio antes de verificar resultados.
   - **Zombie Bets:** Si `GetEventDetails` falla (evento borrado), CONSULTAR SIEMPRE `GetEventResults` (API de Resultados) antes de aplicar reglas de tiempo. Si la API confirma fin, liquidar.
 
 ## 6. ESTILO DE CÓDIGO
