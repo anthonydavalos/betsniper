@@ -16,15 +16,23 @@ import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingServic
 let cachedOpportunities = [];
 let cachedPrematchIds = new Set(); // IDs de eventos ya detectados en Pre-Match
 
-export const discardOpportunity = async (eventId) => {
+// Helper: Generar ID único por oportunidad (eventId + selection)
+// Debe coincidir con la función del frontend
+function getOpportunityId(op) {
+  const eventId = String(op.eventId || op.id);
+  const selection = op.selection || op.action || op.market || '';
+  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+}
+
+export const discardOpportunity = async (opportunityId) => {
     await initDB();
     if (!db.data.blacklist) db.data.blacklist = [];
-    const idStr = String(eventId);
+    const idStr = String(opportunityId);
     
     if (!db.data.blacklist.includes(idStr)) {
         db.data.blacklist.push(idStr);
         await db.write();
-        console.log(`🗑️ Evento DESCARTADO y añadido a Blacklist (Persistente): ${eventId}`);
+        console.log(`🗑️ Oportunidad DESCARTADA y añadida a Blacklist (Persistente): ${opportunityId}`);
     }
     return true;
 };
@@ -129,16 +137,18 @@ export const startBackgroundScanner = () => {
             if (ops && ops.length > 0) {
                 const initialCount = ops.length;
                 
-                // IDs de apuestas activas
+                // IDs de apuestas activas (comparar por eventId ya que el bet bloquea todo el evento)
                 const activeBetIds = new Set((db.data.portfolio.activeBets || []).map(b => String(b.eventId)));
                 const hiddenIds = new Set(db.data.blacklist || []);
 
                 ops = ops.filter(op => {
-                    const idStr = String(op.id || op.eventId);
-                    // 1. Filtrar si ya se apostó
-                    if (activeBetIds.has(idStr)) return false;
-                    // 2. Filtrar si se descartó por el usuario
-                    if (hiddenIds.has(idStr)) return false;
+                    const eventIdStr = String(op.id || op.eventId); // EventId simple para check de apuestas
+                    const opId = getOpportunityId(op); // ID único para check de blacklist
+                    
+                    // 1. Filtrar si ya se apostó (bloquea todo el evento)
+                    if (activeBetIds.has(eventIdStr)) return false;
+                    // 2. Filtrar si se descartó esta selección específica
+                    if (hiddenIds.has(opId)) return false;
                     
                     return true;
                 });
@@ -212,9 +222,10 @@ export const startBackgroundScanner = () => {
 export const getCachedLiveOpportunities = () => {
     // [FIX] Filtrar al momento de servir también, por si el caché tiene datos viejos o hubo una desconexión
     const hiddenMap = new Set(db.data.blacklist || []);
-    const filtered = (cachedOpportunities || []).filter(op => 
-        !hiddenMap.has(String(op.eventId || op.id))
-    );
+    const filtered = (cachedOpportunities || []).filter(op => {
+        const opId = getOpportunityId(op); // ID único por selección
+        return !hiddenMap.has(opId);
+    });
     
     return {
         timestamp: lastScanTime,

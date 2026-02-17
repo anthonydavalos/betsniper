@@ -344,9 +344,8 @@ function App() {
       }
 
       try {
-          // Backend API aún usa eventId solo para blacklist global
-          const eventId = String(op.eventId || op.id);
-          await axios.post('http://localhost:3000/api/opportunities/discard', { id: eventId });
+          // Enviar ID único (eventId + selection) para descartar solo esta selección específica
+          await axios.post('http://localhost:3000/api/opportunities/discard', { id: id });
       } catch (e) {
           console.error("Error discarding opportunity:", e);
           // Si falla, revertimos el blacklist local
