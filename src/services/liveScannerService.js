@@ -221,9 +221,11 @@ const checkTurnaroundCondition = (liveEvent, pinnacleMatch) => {
 /**
  * Función Principal del Sniper
  */
-export const scanLiveOpportunities = async (preFetchedEvents = null) => {
+export const scanLiveOpportunities = async (preFetchedEvents = null, options = { dryRun: false }) => {
     await initDB(); 
     const pinnacleDb = db.data.upcomingMatches || [];
+    
+    // ... (dryRun flag disponible para future usage si decidimos mover la lógica de apuesta aquí dentro) ...
     
     const linkedMatches = new Map();
     pinnacleDb.forEach(m => {
