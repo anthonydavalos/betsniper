@@ -430,6 +430,20 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
                 hasChanges = true;
                 continue;
             }
+            
+            // [NUEVO] Full Time Settlement (Liquidación por tiempo >= 95')
+            // Si el partido pasó los 95', liquidar todas las apuestas pendientes
+            if (currentMinute >= 95 && !bet.payoutReceived) {
+                console.log(`⏰ FULL TIME SETTLEMENT: ${bet.match} - ${bet.pick} [Score: ${currentScoreStr}, Time: ${bet.liveTime}]`);
+                
+                // Calcular resultado final
+                const finalScoreArray = currentScoreStr.split('-').map(x => parseInt(x) || 0);
+                const result = settleBet(bet, finalScoreArray);
+                
+                settledBets.push(result);
+                hasChanges = true;
+                continue;
+            }
 
             updatedActiveBets.push(bet);
 
