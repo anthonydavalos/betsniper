@@ -739,14 +739,14 @@ function App() {
                                                 <div className="flex flex-col gap-1">
                                                     <span className="flex items-center gap-1 text-red-500 animate-pulse font-bold bg-red-500/10 px-2 py-0.5 rounded w-fit text-[10px]">
                                                        <Clock className="w-3 h-3" />
-                                                       {/* Live Timer con Fallback a Pin Info (y op.liveTime si time falta) */}
-                                                       {op.pinnacleInfo?.time || op.time || op.liveTime || (
+                                                       {/* Live Timer - Prioridad a liveTime (actualizado en tiempo real) */}
+                                                       {op.liveTime || op.pinnacleInfo?.time || op.time || (
                                                             (minutesElapsed > 90 ? `90'+` : `${minutesElapsed}'`)
                                                        )}
                                                     </span>
-                                                    {/* SCORE con Prioridad Pinnacle si existe */}
+                                                    {/* SCORE con Prioridad a lastKnownScore (actualizado en tiempo real) */}
                                                     <span className="font-mono font-bold text-white text-xs pl-0.5">
-                                                        {op.pinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
+                                                        {op.lastKnownScore || op.pinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
                                                     </span>
                                                 </div>
                                             ) : showFinished ? (
