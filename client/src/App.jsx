@@ -805,20 +805,20 @@ function App() {
                                                 <div className="flex flex-wrap gap-1 mt-1.5 opacity-90">
                                                     {/* 1x2 Badge */}
                                                     {(op.pinnacleInfo.prematchContext.home || op.pinnacleInfo.prematchContext.draw || op.pinnacleInfo.prematchContext.away) && (
-                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match 1x2 Odds">
-                                                            <span className="text-emerald-500 font-sans font-bold">1x2</span>
-                                                            <span className={op.pinnacleInfo.prematchContext.home < 2.0 ? "text-emerald-400 font-bold" : ""}>{op.pinnacleInfo.prematchContext.home?.toFixed(2) || '-'}</span>
+                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match 1x2 Odds (Pinnacle)">
+                                                            <span className="text-blue-400 font-sans font-bold">1x2</span>
+                                                            <span className={op.pinnacleInfo.prematchContext.home < 2.0 ? "text-blue-300 font-bold" : ""}>{op.pinnacleInfo.prematchContext.home?.toFixed(2) || '-'}</span>
                                                             <span className="text-slate-600">|</span>
                                                             <span className={op.pinnacleInfo.prematchContext.draw < 3.0 ? "text-amber-400" : ""}>{op.pinnacleInfo.prematchContext.draw?.toFixed(2) || '-'}</span>
                                                             <span className="text-slate-600">|</span>
-                                                            <span className={op.pinnacleInfo.prematchContext.away < 2.0 ? "text-emerald-400 font-bold" : ""}>{op.pinnacleInfo.prematchContext.away?.toFixed(2) || '-'}</span>
+                                                            <span className={op.pinnacleInfo.prematchContext.away < 2.0 ? "text-blue-300 font-bold" : ""}>{op.pinnacleInfo.prematchContext.away?.toFixed(2) || '-'}</span>
                                                         </div>
                                                     )}
                                                     
                                                     {/* Totals 2.5 Badge */}
                                                     {(op.pinnacleInfo.prematchContext.over25 || op.pinnacleInfo.prematchContext.under25) && (
-                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match Over/Under 2.5">
-                                                            <span className="text-blue-500 font-sans font-bold">2.5</span>
+                                                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match Over/Under 2.5 (Pinnacle)">
+                                                            <span className="text-blue-400 font-sans font-bold">2.5</span>
                                                             <span className={op.pinnacleInfo.prematchContext.over25 < 1.8 ? "text-blue-300 font-bold" : ""}>O:{op.pinnacleInfo.prematchContext.over25?.toFixed(2) || '-'}</span>
                                                             <span className="text-slate-600">|</span>
                                                             <span className={op.pinnacleInfo.prematchContext.under25 < 1.8 ? "text-blue-300 font-bold" : ""}>U:{op.pinnacleInfo.prematchContext.under25?.toFixed(2) || '-'}</span>
@@ -855,7 +855,7 @@ function App() {
                                                             <span className="text-[9px] font-bold text-blue-400 tracking-tighter">PIN</span>
                                                             <span className="font-mono font-bold text-sm text-blue-300 leading-none">{op.pinnaclePrice.toFixed(2)}</span>
                                                             
-                                                            {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) - Modificado para parpadear igual que Dorado */}
+                                                            {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) - Modificado para parpadear igual que Altenar */}
                                                             {op.trend === 'UP' ? (
                                                                 <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
                                                                     ▲
@@ -880,9 +880,9 @@ function App() {
                                                     )}
                                                 </div>
 
-                                                {/* 2. DORADOBET (Color Distinto - Target) */}
-                                                <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 w-fit relative shadow-[0_0_10px_rgba(16,185,129,0.05)]" title="DoradoBet (Altenar)">
-                                                    <span className="text-[9px] font-bold text-emerald-600/80 tracking-tighter">DOR</span>
+                                                {/* 2. ALTENAR (Color Distinto - Target Bookie API) */}
+                                                <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 w-fit relative shadow-[0_0_10px_rgba(16,185,129,0.05)]" title="Altenar API (DoradoBet, Atlantic City, etc.)">
+                                                    <span className="text-[9px] font-bold text-emerald-600/80 tracking-tighter">ALT</span>
                                                     <span className="font-mono font-bold text-sm text-emerald-400 leading-none flex items-center gap-0.5">
                                                         {(op.price || op.odd || 0).toFixed(2)}
                                                     </span>
