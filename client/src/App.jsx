@@ -12,6 +12,14 @@ const ALERT_SOUND = "data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AA
 // Nota: Usaré un enlace externo confiable o un base64 real corto en la implementación final
 // Para este ejemplo, usaré un método de oscilador web audio api que no requiere assets externos y es más fiable.
 
+// Helper: Generar ID único por oportunidad (eventId + selection)
+// Esto permite apostar a múltiples selecciones del mismo evento (ej: Home + Under 2.5)
+function getOpportunityId(op) {
+  const eventId = String(op.eventId || op.id);
+  const selection = op.selection || op.action || op.market || '';
+  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+}
+
 function playAlert() {
   try {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -75,9 +83,16 @@ function App() {
       ]);
 
       // 1. First capture server active bets to use in filtering
+      // Crear Set de IDs con formato único (eventId_selection) para filtrado granular
       let serverActiveBetIds = new Set();
       if (portfolioRes.data?.activeBets) {
-          serverActiveBetIds = new Set(portfolioRes.data.activeBets.map(b => String(b.eventId)));
+          serverActiveBetIds = new Set(
+              portfolioRes.data.activeBets.map(b => {
+                  const eventId = String(b.eventId);
+                  const selection = b.selection || b.pick || '';
+                  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+              })
+          );
       }
 
       if (liveRes.data?.data) {
@@ -85,7 +100,7 @@ function App() {
           // Si el servidor aun trae un evento que acabamos de descartar o apostar, lo ocultamos
           const serverOps = liveRes.data.data;
           const cleanOps = serverOps.filter(op => {
-              const id = String(op.eventId || op.id);
+              const id = getOpportunityId(op); // ID único por selección
               
               // A. Si está descartado localmente
               if (localDiscardedIdsRef.current.has(id)) return false;
@@ -93,8 +108,8 @@ function App() {
               // B. Si está apostado localmente (optimistic)
               if (localPlacedBetIdsRef.current.has(id)) return false;
               
-              // C. [NEW] Si YA está en el portfolio del servidor (real)
-              // Esto arregla el "flash" donde localPlaced se limpia pero liveOps aun trae la oportunidad vieja
+              // C. Si YA está en el portfolio del servidor (real)
+              // Comparar ID completo (eventId + selection) para filtrado granular
               if (serverActiveBetIds.has(id)) return false;
 
               return true;
@@ -130,10 +145,11 @@ function App() {
       if (prematchRes.data?.data) {
            const serverOps = prematchRes.data.data;
            const cleanOps = serverOps.filter(op => {
-              const id = String(op.eventId || op.id || op.matchId);
+              const id = getOpportunityId(op); // ID único por selección
+              
               if (localDiscardedIdsRef.current.has(id)) return false;
               if (localPlacedBetIdsRef.current.has(id)) return false;
-              if (serverActiveBetIds.has(id)) return false; // [NEW] Filter strict checked
+              if (serverActiveBetIds.has(id)) return false; // Comparar ID completo
               return true;
            });
            setPrematchOps(cleanOps);
@@ -142,7 +158,15 @@ function App() {
       if (portfolioRes.data) {
           // [MOD] Optimistic merge: Si tenemos apuestas locales pendientes que aun no estan en el server, las mantenemos
           const serverActiveBets = portfolioRes.data.activeBets || [];
-          const serverIds = new Set(serverActiveBets.map(b => String(b.eventId)));
+          
+          // Crear Set de IDs con formato único (eventId_selection) para matching correcto
+          const serverIds = new Set(
+              serverActiveBets.map(b => {
+                  const eventId = String(b.eventId);
+                  const selection = b.selection || b.pick || '';
+                  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+              })
+          );
           
           // Mantener locales solo si NO han llegado del server aun
           const stillPendingLocalIds = [];
@@ -225,7 +249,7 @@ function App() {
   const [processingBets, setProcessingBets] = useState(new Set());
 
   const handlePlaceBet = async (opportunity) => {
-    const id = String(opportunity.eventId || opportunity.id);
+    const id = getOpportunityId(opportunity); // ID único por selección (eventId + selection)
     
     // Evitar doble clic
     if (processingBets.has(id)) return;
@@ -306,25 +330,27 @@ function App() {
           return; 
       }
       
-      const eventId = String(op.eventId || op.id);
-      if (!eventId) return;
+      const id = getOpportunityId(op); // ID único por selección (eventId + selection)
+      if (!id) return;
 
       // Optimistic Updates: Remover de la UI inmediatamente
       // [NEW] Persistir en blacklist LOCAL (Ref) para que el próximo fetch no lo reviva
-      localDiscardedIdsRef.current.add(eventId);
+      localDiscardedIdsRef.current.add(id);
 
       if (activeTab === 'LIVE') {
-          setLiveOps(prev => prev.filter(o => String(o.eventId || o.id) !== eventId));
+          setLiveOps(prev => prev.filter(o => getOpportunityId(o) !== id));
       } else {
-          setPrematchOps(prev => prev.filter(o => String(o.eventId || o.id) !== eventId));
+          setPrematchOps(prev => prev.filter(o => getOpportunityId(o) !== id));
       }
 
       try {
+          // Backend API aún usa eventId solo para blacklist global
+          const eventId = String(op.eventId || op.id);
           await axios.post('http://localhost:3000/api/opportunities/discard', { id: eventId });
       } catch (e) {
           console.error("Error discarding opportunity:", e);
           // Si falla, revertimos el blacklist local
-          localDiscardedIdsRef.current.delete(eventId);
+          localDiscardedIdsRef.current.delete(id);
           // Opcional: Podríamos hacer forceUpdate() para traerlo de vuelta si el poll aun no ha pasado
       }
   };
@@ -903,7 +929,7 @@ function App() {
                                                         S/. {betData.stake ? betData.stake.toFixed(2) : op.kellyStake?.toFixed(2)}
                                                      </div>
                                                 </div>
-                                            ) : processingBets.has(op.eventId) ? (
+                                            ) : processingBets.has(getOpportunityId(op)) ? (
                                                 <div className="flex flex-col items-center animate-pulse">
                                                     <span className="text-[10px] text-slate-400 font-bold">PROCESANDO...</span>
                                                 </div>
