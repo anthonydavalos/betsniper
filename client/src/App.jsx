@@ -188,12 +188,21 @@ function App() {
                             eventId: id,
                             match: originalOp ? originalOp.match : "Procesando...",
                             league: originalOp ? originalOp.league : "...",
-                            strategy: "Procesando...",
-                            type: "LIVE_SNIPE", // Default fake
-                            stake: 0,
-                            potentialReturn: 0,
+                            selection: originalOp?.selection || originalOp?.action || "...",
+                            market: originalOp?.market || "...",
+                            type: originalOp?.type || "LIVE_SNIPE",
+                            odd: originalOp?.odd || originalOp?.price || 0,
+                            price: originalOp?.price || originalOp?.odd || 0,
+                            stake: originalOp?.kellyStake || 0,
+                            kellyStake: originalOp?.kellyStake || 0,
+                            ev: originalOp?.ev || 0,
+                            realProb: originalOp?.realProb || 0,
+                            potentialReturn: (originalOp?.kellyStake || 0) * (originalOp?.odd || originalOp?.price || 1),
                             isOptimistic: true, // Flag para UI
-                            liveTime: originalOp?.time || "Live",
+                            liveTime: originalOp?.time || originalOp?.liveTime || "Live",
+                            score: originalOp?.score,
+                            pinnacleInfo: originalOp?.pinnacleInfo,
+                            pinnaclePrice: originalOp?.pinnaclePrice,
                             createdAt: new Date().toISOString()
                         };
                   })
