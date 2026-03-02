@@ -114,6 +114,35 @@ const resolveBookyGameTime = (row = {}) => {
     return null;
 };
 
+const isBookyMatchFinished = (row = {}) => {
+    const gameTimeRaw = String(resolveBookyGameTime(row) || '').trim();
+    const normalized = gameTimeRaw.toUpperCase();
+
+    if (
+        normalized === 'FINAL' ||
+        normalized === 'FT' ||
+        normalized === 'FULL TIME' ||
+        normalized === 'ENDED'
+    ) {
+        return true;
+    }
+
+    const minuteMatch = normalized.match(/(\d{1,3})/);
+    if (minuteMatch) {
+        const minute = Number(minuteMatch[1]);
+        if (Number.isFinite(minute) && minute >= 90) return true;
+        if (Number.isFinite(minute) && minute < 90) return false;
+    }
+
+    const startIso = resolveBookyEventStartIso(row) || row?.matchDate || row?.date || null;
+    if (!startIso) return false;
+    const startTs = new Date(startIso).getTime();
+    if (!Number.isFinite(startTs)) return false;
+
+    const minutesSinceStart = (Date.now() - startTs) / 60000;
+    return minutesSinceStart >= 140;
+};
+
 const resolveBookyEventStartIso = (row = {}) => {
     const fromSelection = row?.selections?.[0]?.eventDate;
     const fromSelectionRaw = row?.selections?.[0]?.raw?.eventDate;
@@ -882,7 +911,8 @@ function App() {
 
   const getFinishedDataForSelectedDate = () => {
         const settledBookyHistory = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
-            .filter(h => BOOKY_SETTLED_STATUSES.has(Number(h?.status)));
+            .filter(h => BOOKY_SETTLED_STATUSES.has(Number(h?.status)))
+            .filter(h => isBookyMatchFinished(h));
 
         const bookyHistoryData = settledBookyHistory.map((h, idx) => ({
             ...h,
@@ -890,7 +920,7 @@ function App() {
             date: h.placedAt || new Date().toISOString(),
             isFinished: true,
             isBookyHistory: true,
-            type: 'BOOKY_REAL',
+            type: String(h.type || h.strategy || h.opportunityType || 'BOOKY_REAL').toUpperCase(),
             finalScore: resolveBookyFinalScore(h),
             liveTime: resolveBookyGameTime(h)
         }));
@@ -1263,8 +1293,15 @@ function App() {
                                     // [MOD] Lógica Visual Strict: Si dice "Final", NO es live, aunque sea 'LIVE_SNIPE'.
                                     const isExplicitlyFinished = op.time === 'Final' || op.liveTime === 'Final' || (minutesElapsed > 120 && isReallyLiveType);
                                     const isStatusCompleted = op.status === 'WON' || op.status === 'LOST' || op.status === 'VOID';
+                                    const isBookySettledByStatus = BOOKY_SETTLED_STATUSES.has(Number(op?.status));
                                     
-                                    const isLive = !isStatusCompleted && !isExplicitlyFinished && (isReallyLiveType || (new Date(op.date) < new Date() && !op.isFinished && minutesElapsed < 150));
+                                    const isLive =
+                                        activeTab !== 'FINISHED' &&
+                                        !op.isBookyHistory &&
+                                        !isBookySettledByStatus &&
+                                        !isStatusCompleted &&
+                                        !isExplicitlyFinished &&
+                                        (isReallyLiveType || (new Date(op.date) < new Date() && !op.isFinished && minutesElapsed < 150));
                                     
                                     // Búsqueda en historial para ver si esta operación fue ejecutada
                                     // Fix: Linkeo robusto por eventId + selection (manejo de fallback)
@@ -1283,6 +1320,26 @@ function App() {
                                         Number(op?.kellyStake || 0),
                                         Number(op?.price || op?.odd || 0)
                                     );
+                                    const effectiveType = String(
+                                        betData?.type || betData?.strategy || op?.type || op?.strategy || ''
+                                    ).toUpperCase();
+                                    const typeUnknown = !effectiveType || effectiveType === 'BOOKY_REAL' || effectiveType === 'UNKNOWN';
+                                    const hasLiveSignal = Boolean(
+                                        betData?.liveTime ||
+                                        op?.liveTime ||
+                                        betData?.time ||
+                                        op?.time ||
+                                        betData?.raw?.selections?.[0]?.gameTime ||
+                                        op?.raw?.selections?.[0]?.gameTime
+                                    );
+                                    const showValueBadge = effectiveType === 'LIVE_VALUE';
+                                    const showSnipeBadge =
+                                        effectiveType === 'LIVE_SNIPE' ||
+                                        effectiveType === 'LA_VOLTEADA' ||
+                                        (typeUnknown && hasLiveSignal);
+                                    const showPrematchBadge =
+                                        effectiveType === 'PREMATCH_VALUE' ||
+                                        (typeUnknown && !hasLiveSignal);
                                     const displayOdd = Number(
                                         executionStatus === 'PENDING'
                                             ? (op?.price || op?.odd || 0)
@@ -1366,15 +1423,15 @@ function App() {
                                             {/* STRATEGY BADGE */}
                                             {(isLive || showFinished || executionStatus === 'FINISHED') && (
                                                 <div className="mb-1">
-                                                    {op.type === 'LIVE_VALUE' ? (
+                                                    {showValueBadge ? (
                                                         <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
                                                             VALUE BET
                                                         </span>
-                                                    ) : (op.type === 'LIVE_SNIPE' || op.type === 'LA_VOLTEADA') ? (
+                                                    ) : showSnipeBadge ? (
                                                         <span className="text-[9px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
                                                             SNIPE
                                                         </span>
-                                                    ) : (op.type === 'PREMATCH_VALUE' || (!isLive && !op.type?.includes('LIVE'))) ? (
+                                                    ) : showPrematchBadge ? (
                                                         <span className="text-[9px] font-bold bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
                                                             PRE-MATCH
                                                         </span>
