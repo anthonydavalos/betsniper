@@ -165,6 +165,18 @@ const resolveOpBetTimeIso = (row = {}, fallbackRow = null) => {
     return date && Number.isFinite(date.getTime()) ? date.toISOString() : null;
 };
 
+const formatTimeSafe = (candidate) => {
+    const date = candidate ? new Date(candidate) : null;
+    if (!date || !Number.isFinite(date.getTime())) return '--:--';
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+};
+
+const formatDateSafe = (candidate) => {
+    const date = candidate ? new Date(candidate) : null;
+    if (!date || !Number.isFinite(date.getTime())) return '--/--/----';
+    return date.toLocaleDateString();
+};
+
 const normalizeMarketLabel = (value) => {
     const raw = String(value || '').trim();
     if (!raw) return '1x2';
@@ -197,6 +209,52 @@ const resolveFinishedOpPnl = (op = {}) => {
 
     const pnl = Number(op?.profit);
     return Number.isFinite(pnl) ? pnl : 0;
+};
+
+const resolveStakeSyncFlags = (row = {}, fallbackStake = null, fallbackOdd = null) => {
+    const requestedStake = Number(
+        row?.realPlacement?.requested?.stake ??
+        row?.realPlacement?.sentStake
+    );
+    const acceptedStake = Number(
+        row?.realPlacement?.accepted?.acceptedStake ??
+        row?.realPlacement?.response?.bets?.[0]?.finalStake ??
+        row?.realPlacement?.response?.bets?.[0]?.totalStake
+    );
+    const requestedOdd = Number(
+        row?.realPlacement?.requested?.odd ??
+        row?.realPlacement?.sentOdd
+    );
+    const acceptedOdd = Number(
+        row?.realPlacement?.accepted?.acceptedOdd ??
+        row?.realPlacement?.response?.bets?.[0]?.odd
+    );
+    const baseStake = Number(fallbackStake);
+    const baseOdd = Number(fallbackOdd);
+
+    const hasRequestedStake = Number.isFinite(requestedStake) && requestedStake > 0;
+    const hasAcceptedStake = Number.isFinite(acceptedStake) && acceptedStake > 0;
+    const hasBaseStake = Number.isFinite(baseStake) && baseStake > 0;
+    const hasRequestedOdd = Number.isFinite(requestedOdd) && requestedOdd > 1;
+    const hasAcceptedOdd = Number.isFinite(acceptedOdd) && acceptedOdd > 1;
+    const hasBaseOdd = Number.isFinite(baseOdd) && baseOdd > 1;
+
+    const recalcFromPrep = row?.recalcFromPrep === true || (
+        hasRequestedStake && hasBaseStake && Math.abs(requestedStake - baseStake) >= 0.01
+    );
+
+    const recalcByOdd = row?.recalcByOdd === true || (
+        hasRequestedOdd && hasBaseOdd && Math.abs(requestedOdd - baseOdd) >= 0.001
+    );
+
+    const oddOnlyRecalc = row?.oddOnlyRecalc === true || (recalcByOdd && !recalcFromPrep);
+
+    const providerAdjusted = row?.providerAdjusted === true || (
+        (hasRequestedStake && hasAcceptedStake && Math.abs(acceptedStake - requestedStake) >= 0.01) ||
+        (hasRequestedOdd && hasAcceptedOdd && Math.abs(acceptedOdd - requestedOdd) >= 0.001)
+    );
+
+    return { recalcFromPrep, oddOnlyRecalc, providerAdjusted };
 };
 
 function playAlert(kind = 'DEFAULT') {
@@ -598,6 +656,12 @@ function App() {
         }
 
         const ticket = prepRes.data.ticket;
+        pendingBetDetailsRef.current[id] = {
+            ...opportunity,
+            ...(ticket?.opportunity || {})
+        };
+        forceUpdate();
+
         const odd = Number(ticket?.opportunity?.price || ticket?.opportunity?.odd || 0);
         const stake = Number(ticket?.opportunity?.kellyStake || 0);
         const tokenMins = Number(token?.remainingMinutes || 0);
@@ -620,19 +684,69 @@ function App() {
             return;
         }
 
-        const confirmRes = await axios.post(`/api/booky/real/confirm-fast/${ticket.id}`);
+        const isLiveSnipe = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase() === 'LIVE_SNIPE';
+        const confirmMode = isLiveSnipe ? 'confirm-fast' : 'confirm';
+        const confirmRes = await axios.post(`/api/booky/real/${confirmMode}/${ticket.id}`);
         if (confirmRes.data?.success) {
+            const sentStakeRaw =
+                Number(confirmRes?.data?.ticket?.realPlacement?.requested?.stake) ||
+                Number(confirmRes?.data?.ticket?.realPlacement?.sentStake);
+            const sentOddRaw =
+                Number(confirmRes?.data?.ticket?.realPlacement?.requested?.odd) ||
+                Number(confirmRes?.data?.ticket?.realPlacement?.sentOdd);
             const acceptedStakeRaw =
                 Number(confirmRes?.data?.ticket?.realPlacement?.accepted?.acceptedStake) ||
                 Number(confirmRes?.data?.providerResponse?.bets?.[0]?.finalStake) ||
                 Number(confirmRes?.data?.providerResponse?.bets?.[0]?.totalStake);
+            const acceptedOddRaw =
+                Number(confirmRes?.data?.ticket?.realPlacement?.accepted?.acceptedOdd) ||
+                Number(confirmRes?.data?.providerResponse?.bets?.[0]?.odd);
+            const hasSentStake = Number.isFinite(sentStakeRaw) && sentStakeRaw > 0;
             const hasAcceptedStake = Number.isFinite(acceptedStakeRaw) && acceptedStakeRaw > 0;
-            const stakeDelta = hasAcceptedStake ? Math.abs(acceptedStakeRaw - stake) : 0;
+            const hasSentOdd = Number.isFinite(sentOddRaw) && sentOddRaw > 1;
+            const hasAcceptedOdd = Number.isFinite(acceptedOddRaw) && acceptedOddRaw > 1;
+            const prepVsSentDelta = hasSentStake ? Math.abs(sentStakeRaw - stake) : 0;
+            const prepVsSentOddDelta = hasSentOdd ? Math.abs(sentOddRaw - odd) : 0;
+            const sentVsAcceptedDelta = (hasSentStake && hasAcceptedStake)
+                ? Math.abs(acceptedStakeRaw - sentStakeRaw)
+                : (hasAcceptedStake ? Math.abs(acceptedStakeRaw - stake) : 0);
+            const sentVsAcceptedOddDelta = (hasSentOdd && hasAcceptedOdd)
+                ? Math.abs(acceptedOddRaw - sentOddRaw)
+                : (hasAcceptedOdd ? Math.abs(acceptedOddRaw - odd) : 0);
 
-            if (hasAcceptedStake && stakeDelta >= 0.01) {
+            const syncedOdd = hasAcceptedOdd
+                ? acceptedOddRaw
+                : (hasSentOdd ? sentOddRaw : odd);
+            const syncedStake = hasAcceptedStake
+                ? acceptedStakeRaw
+                : (hasSentStake ? sentStakeRaw : stake);
+
+            pendingBetDetailsRef.current[id] = {
+                ...(pendingBetDetailsRef.current[id] || opportunity),
+                odd: syncedOdd,
+                price: syncedOdd,
+                stake: syncedStake,
+                kellyStake: syncedStake,
+                potentialReturn: syncedStake * syncedOdd,
+                recalcFromPrep: hasSentStake && prepVsSentDelta >= 0.01,
+                recalcByOdd: hasSentOdd && prepVsSentOddDelta >= 0.001,
+                oddOnlyRecalc: (hasSentOdd && prepVsSentOddDelta >= 0.001) && !(hasSentStake && prepVsSentDelta >= 0.01),
+                providerAdjusted: (hasAcceptedStake && sentVsAcceptedDelta >= 0.01) || (hasAcceptedOdd && sentVsAcceptedOddDelta >= 0.001),
+                confirmedAt: new Date().toISOString()
+            };
+            forceUpdate();
+
+            if (hasSentStake && prepVsSentDelta >= 0.01 && (!hasAcceptedStake || sentVsAcceptedDelta < 0.01)) {
+                alert(
+                    'ℹ️ Cuota/stake recalculados al confirmar (refresh en tiempo real).\n\n' +
+                    `Stake mostrado en botón: S/. ${stake.toFixed(2)}\n` +
+                    `Stake enviado: S/. ${sentStakeRaw.toFixed(2)}\n\n` +
+                    'No fue ajuste de Booky; fue recálculo interno por cambio de cuota.'
+                );
+            } else if (hasAcceptedStake && sentVsAcceptedDelta >= 0.01) {
                 alert(
                     '⚠️ Apuesta REAL confirmada con ajuste de stake por Booky.\n\n' +
-                    `Stake solicitado: S/. ${stake.toFixed(2)}\n` +
+                    `Stake solicitado: S/. ${(hasSentStake ? sentStakeRaw : stake).toFixed(2)}\n` +
                     `Stake aceptado: S/. ${acceptedStakeRaw.toFixed(2)}\n\n` +
                     'La casa puede aplicar mínimo/múltiplos por mercado.'
                 );
@@ -1164,6 +1278,25 @@ function App() {
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
                                     const betTimeIso = resolveOpBetTimeIso(betData, op);
                                     const marketLabel = normalizeMarketLabel(op.market);
+                                    const stakeSyncFlags = resolveStakeSyncFlags(
+                                        betData,
+                                        Number(op?.kellyStake || 0),
+                                        Number(op?.price || op?.odd || 0)
+                                    );
+                                    const displayOdd = Number(
+                                        executionStatus === 'PENDING'
+                                            ? (op?.price || op?.odd || 0)
+                                            : (betData?.price || betData?.odd || op?.price || op?.odd || 0)
+                                    );
+                                    const previewStake = Number(op?.kellyStake || 0);
+                                    const isFastModePreview = String(op?.type || '').toUpperCase() === 'LIVE_SNIPE';
+                                    const betButtonTitle = [
+                                        'Enviar apuesta real a Booky',
+                                        `Modo: ${isFastModePreview ? 'confirm-fast (LIVE_SNIPE)' : 'confirm (seguro)'}`,
+                                        `Cuota actual: ${displayOdd > 0 ? displayOdd.toFixed(2) : '--'}`,
+                                        `Stake sugerido: S/. ${previewStake.toFixed(2)}`,
+                                        'Nota: en vivo puede haber recálculo al confirmar.'
+                                    ].join('\n');
 
                                     // Display Logic Fixes: Include Explicit Finish here
                                     const showFinished = executionStatus === 'FINISHED' || op.isFinished || isExplicitlyFinished;
@@ -1186,7 +1319,7 @@ function App() {
                                                         {op.lastKnownScore || op.pinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
                                                     </span>
                                                     <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
-                                                        {new Date(eventStartIso || op.matchDate || op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                        {formatTimeSafe(eventStartIso || op.matchDate || op.date)}
                                                     </span>
                                                 </div>
                                             ) : showFinished ? (
@@ -1200,7 +1333,7 @@ function App() {
                                                      </span>
                                                      {/* DATE BELOW SCORE */}
                                                      <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
-                                                                          {new Date(op.isBookyHistory ? (resolveBookyEventStartIso(op) || op.matchDate || op.date) : (op.matchDate || op.date)).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                                          {formatTimeSafe(op.isBookyHistory ? (resolveBookyEventStartIso(op) || op.matchDate || op.date) : (op.matchDate || op.date))}
                                                      </span>
                                                 </div>
                                             ) : (op.manualStatus === 'WAIT_RES' || minutesElapsed > 150) ? (
@@ -1217,10 +1350,10 @@ function App() {
                                                     {op.date ? (
                                                         <>
                                                             <span className="text-slate-200 font-mono font-bold">
-                                                                {new Date(op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                                {formatTimeSafe(op.date)}
                                                             </span>
                                                             <span className="text-[10px] text-slate-500">
-                                                                {new Date(op.date).toLocaleDateString()}
+                                                                {formatDateSafe(op.date)}
                                                             </span>
                                                         </>
                                                     ) : (
@@ -1233,11 +1366,7 @@ function App() {
                                             {/* STRATEGY BADGE */}
                                             {(isLive || showFinished || executionStatus === 'FINISHED') && (
                                                 <div className="mb-1">
-                                                    {op.isBookyHistory ? (
-                                                        <span className="text-[9px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                            BOOKY
-                                                        </span>
-                                                    ) : op.type === 'LIVE_VALUE' ? (
+                                                    {op.type === 'LIVE_VALUE' ? (
                                                         <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
                                                             VALUE BET
                                                         </span>
@@ -1257,7 +1386,7 @@ function App() {
                                                 <div className="text-slate-500 text-[10px] flex gap-2 flex-wrap items-center">
                                                     <span>{op.league || '-'}</span>
                                                     <span className="text-slate-600">|</span>
-                                                    <span>{new Date(betTimeIso || op.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                                    <span>{formatTimeSafe(betTimeIso || op.date)}</span>
                                                     {ticketIdForRow && (
                                                         <>
                                                             <span className="text-slate-600">|</span>
@@ -1359,7 +1488,7 @@ function App() {
                                                 <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 w-fit relative shadow-[0_0_10px_rgba(16,185,129,0.05)]" title="Altenar API (DoradoBet, Atlantic City, etc.)">
                                                     <span className="text-[9px] font-bold text-emerald-600/80 tracking-tighter">ALT</span>
                                                     <span className="font-mono font-bold text-sm text-emerald-400 leading-none flex items-center gap-0.5">
-                                                        {(op.price || op.odd || 0).toFixed(2)}
+                                                        {displayOdd.toFixed(2)}
                                                     </span>
                                                     
                                                     {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) */}
@@ -1402,6 +1531,34 @@ function App() {
                                                      <div className={`font-mono font-bold text-sm px-2 py-0.5 rounded ${executionStatus === 'ACTIVE' ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-700 text-slate-300'}`}>
                                                         S/. {betData.stake ? betData.stake.toFixed(2) : op.kellyStake?.toFixed(2)}
                                                      </div>
+                                                     {(stakeSyncFlags.recalcFromPrep || stakeSyncFlags.oddOnlyRecalc || stakeSyncFlags.providerAdjusted) && (
+                                                        <div className="mt-1 flex items-center gap-1 flex-wrap justify-center">
+                                                            {stakeSyncFlags.recalcFromPrep && (
+                                                                <span
+                                                                    className="text-[9px] font-bold bg-blue-500/15 text-blue-300 border border-blue-500/30 px-1.5 py-0.5 rounded uppercase tracking-wide"
+                                                                    title="Stake/cuota recalculados al confirmar por cambio de mercado"
+                                                                >
+                                                                    RECALC
+                                                                </span>
+                                                            )}
+                                                            {stakeSyncFlags.oddOnlyRecalc && (
+                                                                <span
+                                                                    className="text-[9px] font-bold bg-violet-500/15 text-violet-300 border border-violet-500/30 px-1.5 py-0.5 rounded uppercase tracking-wide"
+                                                                    title="Solo cambió la cuota al confirmar; stake se mantuvo"
+                                                                >
+                                                                    CUOTA Δ
+                                                                </span>
+                                                            )}
+                                                            {stakeSyncFlags.providerAdjusted && (
+                                                                <span
+                                                                    className="text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded uppercase tracking-wide"
+                                                                    title="Booky ajustó stake final (mínimo/múltiplo/límite)"
+                                                                >
+                                                                    AJUSTE BOOKY
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                     )}
                                                 </div>
                                             ) : processingBets.has(getOpportunityId(op)) ? (
                                                 <div className="flex flex-col items-center animate-pulse">
@@ -1413,7 +1570,7 @@ function App() {
                                                     <button 
                                                         onClick={(e) => { e.stopPropagation(); handlePlaceBet(op); }}
                                                         className="flex items-center gap-2 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/50 hover:border-emerald-400 text-emerald-100 rounded px-3 py-1.5 w-full justify-between transition-all group cursor-pointer shadow-[0_0_10px_rgba(16,185,129,0.1)] hover:shadow-[0_0_15px_rgba(16,185,129,0.3)] active:scale-95"
-                                                        title="Enviar apuesta real a Booky"
+                                                        title={betButtonTitle}
                                                     >
                                                         <span className="font-bold text-[10px] group-hover:text-white">APOSTAR</span>
                                                         <span className="font-mono font-bold text-sm">S/. {(op.kellyStake || 0).toFixed(2)}</span>

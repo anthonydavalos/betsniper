@@ -1106,6 +1106,10 @@ export const confirmRealPlacement = async (ticketId) => {
     placedAt: nowIso(),
     endpoint: draft.endpoint,
     requestId: draft.payload.requestId,
+    requested: {
+      stake: Number(draft?.payload?.stakes?.[0] ?? 0),
+      odd: Number(draft?.payload?.betMarkets?.[0]?.odds?.[0]?.price ?? 0)
+    },
     accepted: acceptedMeta,
     response: data
   };
@@ -1186,6 +1190,10 @@ export const confirmRealPlacementFast = async (ticketId) => {
     endpoint: draft.endpoint,
     requestId: draft.payload.requestId,
     fastMode: true,
+    requested: {
+      stake: Number(draft?.payload?.stakes?.[0] ?? 0),
+      odd: Number(draft?.payload?.betMarkets?.[0]?.odds?.[0]?.price ?? 0)
+    },
     accepted: acceptedMeta,
     response: data
   };
