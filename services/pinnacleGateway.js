@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const projectRoot = path.resolve(__dirname, '..');
 
 // Configuration
 const REFRESH_INTERVAL = 30 * 60 * 1000; // 30 minutes
@@ -12,6 +13,13 @@ const CHECK_STALE_FILE = path.join(__dirname, '../data/pinnacle_stale.trigger');
 
 const OUTPUT_FILE = path.join(__dirname, '../data/pinnacle_live.json');
 const TOKEN_FILE = path.join(__dirname, '../data/pinnacle_token.json');
+const BOOK_PROFILE = (process.env.BOOK_PROFILE || 'doradobet').toLowerCase();
+const DEFAULT_SHARED_BOOKY_PROFILE_DIR = path.join(projectRoot, 'data', 'booky', `chrome-profile-${BOOK_PROFILE}`);
+const PINNACLE_PROFILE_DIR = process.env.PINNACLE_CHROME_PROFILE_DIR
+    ? (path.isAbsolute(process.env.PINNACLE_CHROME_PROFILE_DIR)
+        ? process.env.PINNACLE_CHROME_PROFILE_DIR
+        : path.join(projectRoot, process.env.PINNACLE_CHROME_PROFILE_DIR))
+    : DEFAULT_SHARED_BOOKY_PROFILE_DIR;
 
 class PinnacleGateway {
     constructor() {
@@ -20,24 +28,69 @@ class PinnacleGateway {
 
         this.page = null;
         this.client = null;
+        this.staleCheckInterval = null;
+        this.autoSaveInterval = null;
+        this.shuttingDown = false;
         this.dataStore = {
             events: {}, // Map by ID
             lastUpdate: Date.now()
         };
     }
 
+    async shutdown() {
+        if (this.shuttingDown) return;
+        this.shuttingDown = true;
+
+        if (this.staleCheckInterval) {
+            clearInterval(this.staleCheckInterval);
+            this.staleCheckInterval = null;
+        }
+
+        if (this.autoSaveInterval) {
+            clearInterval(this.autoSaveInterval);
+            this.autoSaveInterval = null;
+        }
+
+        try {
+            if (this.browser && this.browser.isConnected()) {
+                await this.browser.close();
+            }
+        } catch (error) {
+            // Ignorar errores esperados de cierre en Windows (proceso ya finalizado)
+        }
+    }
+
     async start() {
         console.log("🚀 Starting Pinnacle Gateway (Puppeteer)...");
-        
-        this.browser = await puppeteer.launch({
+
+        if (!fs.existsSync(PINNACLE_PROFILE_DIR)) {
+            fs.mkdirSync(PINNACLE_PROFILE_DIR, { recursive: true });
+        }
+
+        const useSystemChrome = (process.env.PINNACLE_USE_SYSTEM_CHROME || 'true').toLowerCase() !== 'false';
+        const launchOptions = {
             headless: false,
             defaultViewport: null,
+            userDataDir: PINNACLE_PROFILE_DIR,
+            ignoreDefaultArgs: ['--enable-automation'],
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--start-maximized' 
+                '--start-maximized',
+                '--disable-blink-features=AutomationControlled',
+                '--lang=es-ES'
             ]
-        });
+        };
+
+        if (useSystemChrome) {
+            launchOptions.channel = 'chrome';
+        }
+
+        console.log(`👤 Perfil Chrome Pinnacle: ${PINNACLE_PROFILE_DIR}`);
+        console.log(`👤 BOOK_PROFILE activo: ${BOOK_PROFILE}`);
+        console.log(`🌐 Chrome del sistema: ${useSystemChrome ? 'Sí' : 'No (Chromium de Puppeteer)'}`);
+        
+        this.browser = await puppeteer.launch(launchOptions);
 
         this.page = await this.browser.newPage();
         this.client = await this.page.target().createCDPSession();
@@ -81,6 +134,8 @@ class PinnacleGateway {
 
         // Detectar cuando el usuario cierra la ventana manualmente
         this.browser.on('disconnected', () => {
+            if (this.shuttingDown) return;
+            this.shuttingDown = true;
             console.log("👋 Navegador cerrado por el usuario. Terminando proceso...");
             process.exit(0);
         });
@@ -101,7 +156,7 @@ class PinnacleGateway {
             console.log("💾 Iniciando Auto-Save (Cada 5s)...");
             
             // Watch por el archivo TRIGGER de Stale Data para reiniciar
-            setInterval(() => {
+            this.staleCheckInterval = setInterval(() => {
                 try {
                     if (fs.existsSync(CHECK_STALE_FILE)) {
                         console.warn("⚠️ DETECTADA SOLICITUD DE REINICIO POR STALE DATA! ⚠️");
@@ -118,7 +173,7 @@ class PinnacleGateway {
                 } catch(e) { console.error("Error check stale:", e); }
             }, 5000);
 
-            setInterval(() => {
+            this.autoSaveInterval = setInterval(() => {
                  // Solo guardamos si han pasado al menos 2 segundos desde el último update de datos
                  // para evitar escribir en medio de una ráfaga.
                  const timeSinceObjUpdate = Date.now() - this.dataStore.lastUpdate;
@@ -262,7 +317,8 @@ class PinnacleGateway {
     }
 
     async restart() {
-        if (this.browser) await this.browser.close();
+        await this.shutdown();
+        this.shuttingDown = false;
         this.start();
     }
 }
@@ -320,22 +376,39 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
             const gateway = new PinnacleGateway();
             
             // Hook into process exit to clean up lock
+            let isCleaningUp = false;
+            let isShuttingDown = false;
             const cleanup = () => {
+                if (isCleaningUp) return;
+                isCleaningUp = true;
                 try { 
                     if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); 
-                    console.log("🔒 Lock file removed.");
                 } catch (e) {}
+            };
+
+            const shutdownAndExit = async (exitCode = 0, err = null) => {
+                if (isShuttingDown) return;
+                isShuttingDown = true;
+
+                if (err) {
+                    console.error("Uncaught Exception:", err);
+                }
+
+                try {
+                    await gateway.shutdown();
+                } catch (e) {
+                    // Ignorar errores de cierre para evitar ruido en consola
+                }
+
+                cleanup();
+                process.exit(exitCode);
             };
             
             // Handle process termination events
             process.on('exit', cleanup);
-            process.on('SIGINT', () => { cleanup(); process.exit(); });
-            process.on('SIGTERM', () => { cleanup(); process.exit(); });
-            process.on('uncaughtException', (err) => { 
-                console.error("Uncaught Exception:", err); 
-                cleanup(); 
-                process.exit(1); 
-            });
+            process.on('SIGINT', () => { shutdownAndExit(0); });
+            process.on('SIGTERM', () => { shutdownAndExit(0); });
+            process.on('uncaughtException', (err) => { shutdownAndExit(1, err); });
 
             await gateway.start();
             

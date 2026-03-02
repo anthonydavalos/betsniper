@@ -26,6 +26,11 @@ const defaultData = {
     initialCapital: 100,
     activeBets: [], // Apuestas en juego
     history: []     // Apuestas cerradas
+  },
+  // FLUJO SEMI-AUTO BOOKY (Fase 1)
+  booky: {
+    pendingTickets: [],
+    history: []
   }
 };
 
@@ -51,6 +56,9 @@ export const initDB = async () => {
   if (!db.data.mappedTeams) { db.data.mappedTeams = defaultData.mappedTeams; modified = true; }
   if (!db.data.blacklist) { db.data.blacklist = []; modified = true; } // [NEW] Ensure blacklist exists
   if (!db.data.liveTracking) { db.data.liveTracking = []; modified = true; }
+  if (!db.data.booky) { db.data.booky = { pendingTickets: [], history: [] }; modified = true; }
+  if (!db.data.booky.pendingTickets) { db.data.booky.pendingTickets = []; modified = true; }
+  if (!db.data.booky.history) { db.data.booky.history = []; modified = true; }
   
   // Solo escribir si hubo cambios estructurales (evita trigger nodemon loop)
   if (modified) {

@@ -43,12 +43,16 @@ La API de Altenar devuelve datos normalizados (separados).
 
 ## 4.1 NORMALIZACIÓN (DESAFÍO PRINCIPAL)
 Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta lógica de Matcher:
-1.  **Nombres de Equipos (Fuzzy):** Usa Levenshtein distance y limpieza de strings. Altenar usa sufijos como `(F)` o `(Res.)`.
-2.  **Contexto de Liga (CRÍTICO):** Verifica siempre si la Liga o el País coinciden para evitar falsos positivos (Ej. "Liverpool" ENG vs "Liverpool" URU). Si la liga contiene "Women", "U21", "Reserve", el match debe ser estricto.
-3.  **Sincronización Temporal (Timezone):**
+1.  **Nombres de Equipos (Fuzzy):** Usa Levenshtein distance y limpieza de strings. Altenar usa sufijos como `(F)` o `(Res.)`. Los aliases dinámicos se leen de `src/utils/dynamicAliases.json` y se recargan **sin reiniciar** (hot-reload cada 30s sobre mtime). Añade aliases ahí para correcciones rápidas de nombre.
+2.  **Diagnóstico de no-match:** Usa `diagnoseNoMatch(teamName, startDate, candidates, league)` de `teamMatcher.js` para obtener `probableReason` (p.ej. `time_window_5m`, `category_mismatch`, `similarity_below_threshold`) y `bestScore`.
+3.  **Contexto de Liga (CRÍTICO):** Verifica siempre si la Liga o el País coinciden para evitar falsos positivos (Ej. "Liverpool" ENG vs "Liverpool" URU). Si la liga contiene "Women", "U21", "Reserve", "(F)", "II", "III", el match debe ser estricto.
+4.  **Sincronización Temporal (Timezone):**
     *   Pinnacle = Verificar Timezone.
     *   Altenar = UTC (Zulu).
-    *   Regla: Si la hora coincide (+/- 20 min) tras ajustar timezone, asume match aunque los nombres no sean idénticos al 100%.
+    *   **Tolerancia configurable vía `.env`:**
+        - `MATCH_TIME_TOLERANCE_MINUTES` (default 5 min) — ventana primaria.
+        - `MATCH_TIME_EXTENDED_TOLERANCE_MINUTES` (default 30 min) — ventana extendida para candidatos secundarios.
+    *   Ajusta `MATCH_TIME_TOLERANCE_MINUTES=10` si el diagnóstico muestra `time_window_5m` como razón dominante.
 
 ## 5. LÓGICA DE NEGOCIO Y MATEMÁTICAS (QUANT TRADING)
 - **Value Bets:** Compara siempre Probabilidad Implícita (Pinnacle Fair) vs Probabilidad Real (Altenar Implied) en mercados 1x2, Over/Under y BTTS.
@@ -66,3 +70,16 @@ Al cruzar datos entre dos fuentes (Pinnacle vs Altenar), aplica siempre esta ló
 ## 6. ESTILO DE CÓDIGO
 - Usa Español para comentarios explicativos, especialmente en la lógica financiera.
 - Mantén el código modular: separa la lógica de la API (`services/`), la lógica matemática (`utils/`) y las rutas (`routes/`).
+
+## 7. PROTOCOLO DE COLOCACIÓN REAL (Booky)
+Cuando se trabaja en el flujo de apuesta real (`src/services/bookySemiAutoService.js`), respetar estas reglas adicionales:
+
+1.  **SIEMPRE DRY-RUN PRIMERO:** Antes de implementar `confirmRealPlacement`, verifica vía `POST /api/booky/real/dryrun/:id` que el payload `placeWidget` esté bien construido.
+2.  **FLAG DE HABILITACIÓN:** `BOOKY_REAL_PLACEMENT_ENABLED=true` debe estar explícito en `.env` para que cualquier función de placement real ejecute. Por defecto es `false`.
+3.  **GUARDAS OBLIGATORIAS (`enforceValueGuardsOrThrow`):**
+    - Token JWT válido con al menos `BOOKY_TOKEN_MIN_REMAINING_MINUTES` de vida.
+    - EV del ticket ≥ `BOOKY_MIN_EV_PERCENT`.
+    - Drop máximo de cuota desde el snapshot ≤ `BOOKY_MAX_ODD_DROP` (protege ante cuota antigua).
+4.  **ESTADO INCIERTO:** Si el request a `placeWidget` devuelve timeout/error de red SIN confirmación, llamar a `archiveUncertainRealPlacement()`. **NUNCA reintentar ciegamente.** Primero verificar via `GET /api/booky/account?refresh=1` si la apuesta ya existe.
+5.  **PERFIL ANTES DE TOKEN:** El perfil (`BOOK_PROFILE`, `ALTENAR_INTEGRATION`, `ALTENAR_ORIGIN`) debe estar correcto ANTES de extraer el JWT. Usa `npm run book:dorado` o `npm run book:acity` primero, luego `npm run token:booky:wait-close`.
+6.  **BASE KELLEY:** El stake real se calcula sobre `getKellyBankrollBase()` que tiene 3 niveles de fallback: balance real `booky-real` → `portfolio` → `config.bankroll`. Nunca hardcodear el NAV.

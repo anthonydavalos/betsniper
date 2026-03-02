@@ -47,7 +47,7 @@ async function findLiveMatches() {
         });
 
         for (const m of matchups) {
-            // 🛑 FILTRO CRÍTICO: Solo procesar unidades "Regular" (Match Winner)
+            // 🛑 FILTRO CRÍTICO: Solo procesar unidades "Regular" (1x2)
             // Ignorar "Corners", "Yellow Cards", " 1st Half", etc. para evitar scores parciales/stale.
             if (m.units && m.units !== 'Regular') continue;
 
@@ -56,7 +56,7 @@ async function findLiveMatches() {
 
             // Buscar cuotas moneyline asociadas
             // Relaxed filter: type moneyline OR key s;0;m
-            // Relaxed period: sometimes period 0 covers live match winner too
+            // Relaxed period: sometimes period 0 covers live 1x2 too
             const market = markets.find(mk => mk.matchupId === m.id && (mk.type === 'moneyline' || mk.key === 's;0;m'));
             
             if (market) {
@@ -94,7 +94,7 @@ async function findLiveMatches() {
 
         console.log("\n⚽ EJEMPLOS DE PARTIDOS EN VIVO AHORA MISMO:\n");
         if(liveWithOdds.length === 0) {
-            console.log("⚠️ No se encontraron partidos con cuotas activas (Match Winner) en este momento.");
+            console.log("⚠️ No se encontraron partidos con cuotas activas (1x2) en este momento.");
             console.log("Probablemente solo hay tiempos de descanso o ligas menores sin mercado principal.");
         }
 

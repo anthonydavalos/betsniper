@@ -12,6 +12,8 @@ const CREDS_PATH = path.join(__dirname, '../../data/pinnacle_token.json');
 const REFRESHER_SCRIPT = path.join(__dirname, '../../services/pinnacleGateway.js');
 
 const BASE_URL = 'https://api.arcadia.pinnacle.com/0.1';
+const BASE_MIN_REQUEST_GAP_MS = 500; // ~2 RPS máximo por proceso
+const MAX_MIN_REQUEST_GAP_MS = 3000;
 
 // Cargar credenciales iniciales
 let credentials = loadCredentials();
@@ -42,7 +44,52 @@ function loadCredentials() {
 class PinnacleChameleon {
     constructor() {
         this.baseUrl = BASE_URL;
+        this.requestQueue = Promise.resolve();
+        this.lastRequestAt = 0;
+        this.minRequestGapMs = BASE_MIN_REQUEST_GAP_MS;
+        this.backoffUntil = 0;
         this.startHeartbeat();
+    }
+
+    async scheduleArcadiaRequest(requestFn) {
+        const task = async () => {
+            const now = Date.now();
+
+            // Backoff global por señales de rate-limit/WAF
+            if (this.backoffUntil > now) {
+                await new Promise(r => setTimeout(r, this.backoffUntil - now));
+            }
+
+            // Gap mínimo entre requests para respetar techo RPS
+            const elapsed = Date.now() - this.lastRequestAt;
+            if (elapsed < this.minRequestGapMs) {
+                await new Promise(r => setTimeout(r, this.minRequestGapMs - elapsed));
+            }
+
+            this.lastRequestAt = Date.now();
+
+            try {
+                const result = await requestFn();
+                // Recuperación gradual al baseline si todo va bien
+                if (this.minRequestGapMs > BASE_MIN_REQUEST_GAP_MS) {
+                    this.minRequestGapMs = Math.max(BASE_MIN_REQUEST_GAP_MS, this.minRequestGapMs - 100);
+                }
+                return result;
+            } catch (error) {
+                const status = error?.response?.status;
+                if (status === 429 || status === 403) {
+                    // Endurecer techo automáticamente ante señales de ban/rate-limit
+                    this.minRequestGapMs = Math.min(MAX_MIN_REQUEST_GAP_MS, this.minRequestGapMs + 400);
+                    this.backoffUntil = Date.now() + 2000;
+                    console.warn(`⚠️ Arcadia throttle/backoff activo. Gap=${this.minRequestGapMs}ms`);
+                }
+                throw error;
+            }
+        };
+
+        const run = this.requestQueue.then(task, task);
+        this.requestQueue = run.then(() => undefined, () => undefined);
+        return run;
     }
 
     startHeartbeat() {
@@ -78,8 +125,6 @@ class PinnacleChameleon {
     }
 
     async makeRequest(method, endpoint, config = {}, retries = 1) {
-        const cacheBuster = Date.now();
-        
         // Construir headers usando lo que tenemos en archivo (Exactos del navegador)
         // Mantenemos headers estáticos mínimos por si acaso
         const headers = {
@@ -109,7 +154,7 @@ class PinnacleChameleon {
         };
 
         try {
-            const response = await axios(requestConfig);
+            const response = await this.scheduleArcadiaRequest(() => axios(requestConfig));
             return response.data;
 
         } catch (error) {

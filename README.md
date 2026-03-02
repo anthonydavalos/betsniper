@@ -15,6 +15,7 @@
 ## 📖 Tabla de Contenidos
 
 - [Descripción General](#-descripción-general)
+- [Cambios Recientes (Último Commit)](#-cambios-recientes-último-commit)
 - [Características Principales](#-características-principales)
 - [Arquitectura del Sistema](#-arquitectura-del-sistema)
 - [Estrategias de Trading](#-estrategias-de-trading)
@@ -39,6 +40,70 @@
 3.  **Cálculo Matemático:** Aplicación de Kelly Criterion con perfiles de riesgo dinámicos para determinar el tamaño óptimo de cada apuesta.
 4.  **Ejecución Simulada:** Sistema de Paper Trading que simula la ejecución de apuestas y trackea P&L en tiempo real.
 5.  **Monitoreo Continuo:** Seguimiento del estado de apuestas activas y liquidación automática basada en resultados reales.
+
+---
+
+## 🆕 Cambios Recientes (Último Commit)
+
+Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
+
+### 1) Matcher Pinnacle ↔ Altenar reforzado
+
+- **Hot-reload de aliases dinámicos** en `src/utils/teamMatcher.js` leyendo `src/utils/dynamicAliases.json` sin reiniciar proceso.
+- **Diagnóstico de no-match** con `diagnoseNoMatch(...)` y razones probables (`time_window_*`, `category_mismatch`, `similarity_below_threshold`, etc.).
+- **Umbrales por entorno**:
+  - `MATCH_DIAGNOSTIC_LOG`
+  - `MATCH_FUZZY_THRESHOLD`
+  - `MATCH_MIN_ACCEPT_SCORE`
+  - `MATCH_TIME_TOLERANCE_MINUTES`
+  - `MATCH_TIME_EXTENDED_TOLERANCE_MINUTES`
+- **Validación al boot** (clamp/rango) para umbrales y flags inválidos.
+- **Fallback inverso (away-team)** en `src/services/liveScannerService.js` cuando el match por home no alcanza score mínimo.
+- **Resumen agregado por ciclo** en logs: `MATCH_DIAG_SUMMARY` y `MATCH_DIAG_RECOMMENDATION`.
+
+### 2) Cobertura PREMATCH más robusta (Pinnacle + Altenar)
+
+- `services/pinnacleLight.js` ahora mantiene **canal prematch separado** y guarda en `data/pinnacle_prematch.json`.
+- `src/services/pinnacleService.js` agrega `getAllPinnaclePrematchOdds()` (cache-first con fallback API).
+- `src/services/prematchScannerService.js` usa cache prematch, hace **upsert** a DB y persiste con retry anti-lock (`EPERM/EBUSY`).
+- Se añade filtro consistente para excluir variantes no deseadas (corners/cards/bookings/8 games).
+- Ventana temporal prematch en horario PE (noche extendida hasta 06:00 del día siguiente).
+
+### 3) Scheduler adaptativo Altenar Prematch
+
+- Nuevo servicio: `src/services/altenarPrematchScheduler.js`.
+- Discovery + refresh por prioridad temporal/evento enlazado, con concurrencia controlada y backoff por fallos.
+- Integrado en `server.js` con `startAltenarPrematchAdaptiveScheduler()`.
+
+### 4) Flujo Booky semi-auto + placement real controlado
+
+- Nuevas rutas en `src/routes/booky.js` bajo `/api/booky/*`.
+- Nuevo servicio `src/services/bookySemiAutoService.js`:
+  - Tickets draft/confirm/cancel.
+  - `dryrun` de payload real (`placeWidget`).
+  - `confirm` y `confirm-fast` con guardas de valor y manejo de estado incierto.
+  - Control de token JWT (`ALTENAR_BOOKY_AUTH_TOKEN`) y renovación asistida.
+- Nuevo servicio `src/services/bookyAccountService.js`:
+  - Balance real por perfil (`BOOK_PROFILE`).
+  - Historial remoto reconciliado con historial local.
+  - Base de bankroll Kelly con fallback (`booky-real` → `portfolio` → `config`).
+- `src/db/database.js` agrega estructura persistente `booky`.
+
+### 5) Hardening Live (calidad de señal)
+
+- Estabilidad por ticks en `src/services/liveValueScanner.js` y `src/services/scannerService.js` para filtrar falsos spikes.
+- Guardia de sincronización de marcador Alt vs Pin antes de publicar oportunidades live.
+- Normalización de mercado `1x2` en payloads y refresh.
+- Cálculo de stake usando bankroll base centralizado (`getKellyBankrollBase()`).
+
+### 6) Scripts nuevos de operación y diagnóstico
+
+- Perfil rápido de booky: `npm run book:dorado`, `npm run book:acity`.
+- Extracción token: `npm run token:booky:*`.
+- Captura payload placeWidget: `npm run capture:booky:*`.
+- Spy de historial/endpoints: `npm run spy:booky:history`.
+- Smoke test API booky: `npm run smoke:booky` y `npm run smoke:booky:live`.
+- Plantilla de experimento matcher: `MATCH_DIAG_TEMPLATE.md` (guía A/B para ajustar `MATCH_TIME_TOLERANCE_MINUTES` con baseline prefilled).
 
 ## 🚀 Características Principales
 
@@ -78,7 +143,7 @@ El sistema ajusta automáticamente la agresividad de las apuestas según la vola
 - Matcher inteligente con Fuzzy Logic + Levenshtein Distance para normalización de nombres.
 
 **3. Live Scanner ("The Sniper")**
-- Escaneo de alta frecuencia (intervalo ~4-5s) con jitter aleatorio para evasión de detección.
+- Escaneo de alta frecuencia con **polling adaptativo** (~2s a ~7s según actividad/errores).
 - Detección de dos tipos de oportunidades en tiempo real:
   - **Value Bets Live:** Discrepancias de cuotas en eventos en juego.
   - **"La Volteada":** Estrategia especializada (ver sección Estrategias).
@@ -143,7 +208,7 @@ El sistema ajusta automáticamente la agresividad de las apuestas según la vola
 **Descripción:** Arbitraje algorítmico en eventos en curso.
 
 **Flujo:**
-1.  Escaneo continuo de partidos en vivo (cada ~4s).
+1.  Escaneo continuo de partidos en vivo con **polling adaptativo** (~2s a ~7s según actividad y errores).
 2.  Comparación de cuotas actualizadas en tiempo real.
 3.  Detección de valor positivo mediante Fair Odds de Pinnacle Live.
 4.  Ejecución si Kelly sugiere stake ≥ S/1.00.
@@ -302,7 +367,7 @@ const kellyStake = calculateKellyStake(realProb, odd, currentNAV, strategy);
         │  ┌─────────────────────────────────────────────┐  │
         │  │   Background Scanner (Bucle Infinito)       │  │
         │  │   - Pre-Match Scan (cada 2 min)             │  │
-        │  │   - Live Scan (cada 4-5s)                   │  │
+        │  │   - Live Scan (polling adaptativo)          │  │
         │  │   - Active Bets Monitoring                  │  │
         │  └─────────────────────────────────────────────┘  │
         │                                                    │
@@ -312,6 +377,7 @@ const kellyStake = calculateKellyStake(realProb, odd, currentNAV, strategy);
         │  │   /api/portfolio                             │  │
         │  │   /api/monitor                               │  │
         │  │   /api/matcher                               │  │
+        │  │   /api/booky                                 │  │
         │  └─────────────────────────────────────────────┘  │
         └──────────────┬──────────────────┬────────────────┘
                        │                  │
@@ -348,7 +414,7 @@ const kellyStake = calculateKellyStake(realProb, odd, currentNAV, strategy);
     - Frames recibidos cada ~500ms, parseados y escritos en `data/pinnacle_live.json`.
 
 2.  **Procesamiento (Terminal 1 - `server.js`):**
-    - Background Scanner lee `pinnacle_live.json` cada 4-5s.
+    - Background Scanner lee `pinnacle_live.json` con polling adaptativo (~2s a ~7s).
     - Consulta eventos en vivo desde Altenar (`GetLivenow`).
     - Matcher fuzzy para vincular eventos Pinnacle ↔ Altenar.
     - Evalúa condiciones de estrategias (Value, Volteada, Next Goal).
@@ -432,7 +498,7 @@ npm run dev
 **¿Qué hace?**
 - Expone API en `http://localhost:3000`
 - Ejecuta ingesta automática de Pinnacle/Altenar cada 2 horas
-- Scanner de oportunidades Live en bucle (cada ~4-5s)
+- Scanner de oportunidades Live en bucle (polling adaptativo según actividad)
 - Monitoreo de apuestas activas y liquidación automática
 
 **Logs Esperados:**
@@ -499,6 +565,32 @@ VITE v5.0.0  ready in 324 ms
 ---
 
 ### Herramientas Opcionales (Debugging)
+
+#### Flujo Booky (perfil, token, captura, smoke)
+
+```bash
+# 1) Seleccionar perfil operativo
+npm run book:acity
+# o
+npm run book:dorado
+
+# 2) Capturar token auth real (abre Chrome)
+npm run token:booky:wait-close
+
+# 3) Capturar payloads placeWidget/betslip
+npm run capture:booky
+
+# 4) Ver salud de token y flujo seguro (sin apostar real)
+npm run smoke:booky
+```
+
+Para pruebas con envío real controlado (solo si habilitas `BOOKY_REAL_PLACEMENT_ENABLED=true`):
+
+```bash
+npm run smoke:booky:live
+```
+
+> Recomendación: mantener `BOOKY_REAL_PLACEMENT_ENABLED=false` en desarrollo normal.
 
 #### Scanner Manual (Modo Observador)
 
@@ -793,32 +885,95 @@ El servidor expone los siguientes endpoints REST:
 
 ---
 
+### **Booky (Semi-Auto + Real Controlado)**
+
+**`GET /api/booky/tickets`**
+- Retorna tickets pendientes + histórico booky.
+
+**`POST /api/booky/prepare`**
+- Prepara ticket draft desde una oportunidad.
+
+**`POST /api/booky/confirm/:id`**
+- Confirma ticket en modo semi-auto (espejo en portfolio).
+
+**`POST /api/booky/cancel/:id`**
+- Cancela ticket draft.
+
+**`GET /api/booky/token-health`**
+- Estado del JWT real (`exp`, minutos restantes, autenticación).
+
+**`POST /api/booky/token/renew`**
+- Dispara renovación asistida de token.
+
+**`GET /api/booky/account?refresh=1&historyLimit=60`**
+- Snapshot de cuenta real por perfil (balance + historial remoto reconciliado).
+
+**`GET /api/booky/capture/latest`**
+- Última captura de payloads en `data/booky`.
+
+**`POST /api/booky/real/dryrun/:id`**
+- Construye payload final `placeWidget` sin enviar apuesta real.
+
+**`POST /api/booky/real/confirm/:id`**
+- Confirmación real estándar (con guardas).
+
+**`POST /api/booky/real/confirm-fast/:id`**
+- Confirmación real rápida con manejo de estado incierto y reintento controlado.
+
+---
+
 ## ⚙️ Configuración Avanzada
 
 ### Variables de Entorno (`.env`)
 
 ```env
-# Puerto del servidor
+# Core
+NODE_ENV=development
 PORT=3000
-
-# Bankroll inicial (Paper Trading)
-INITIAL_BANKROLL=1000
-
-# Timezone (para cálculos de tiempo)
 TZ=America/Lima
+DISABLE_BACKGROUND_WORKERS=false
 
-# Configuración de Pinnacle
-PINNACLE_CLIENT_ID=tu_client_id_opcional
-PINNACLE_API_KEY=tu_api_key_opcional
+# Altenar Profile (set-book-profile.js)
+BOOK_PROFILE=doradobet
+ALTENAR_INTEGRATION=doradobet
+ALTENAR_ORIGIN=https://doradobet.com
+ALTENAR_REFERER=https://doradobet.com/deportes-en-vivo
+ALTENAR_COUNTRY_CODE=PE
+ALTENAR_CULTURE=es-ES
+ALTENAR_TIMEZONE_OFFSET=300
+ALTENAR_NUM_FORMAT=en-GB
+ALTENAR_DEVICE_TYPE=1
+ALTENAR_SPORT_ID=0
 
-# Intervalos de Escaneo (ms)
-SCAN_INTERVAL_LIVE=4000
-SCAN_INTERVAL_PREMATCH=120000
+# Overrides opcionales
+# ALTENAR_WIDGET_BASE_URL=https://sb2frontend-altenar2.biahosted.com/api/widget
+# ALTENAR_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36
+# ALTENAR_ACCEPT_LANGUAGE=es-ES,es;q=0.9,en;q=0.8
 
-# Thresholds
-MIN_EV_PERCENT=5.0
-MIN_STAKE_AMOUNT=1.00
-MAX_STAKE_PERCENT=3.5
+# Booky / Real Placement
+# ALTENAR_BOOKY_URL=https://www.casinoatlanticcity.com/apuestas-deportivas#/overview
+# ALTENAR_LOGIN_USERNAME=tu_usuario
+# ALTENAR_LOGIN_PASSWORD=tu_password
+# ALTENAR_BOOKY_AUTH_TOKEN=Bearer <jwt>
+# BOOKY_REAL_PLACEMENT_ENABLED=false
+# BOOKY_KEEP_REAL_PLACEMENT_ON_TOKEN_REFRESH=false
+# BOOKY_AUTO_TOKEN_REFRESH_ENABLED=true
+# BOOKY_TOKEN_MIN_REMAINING_MINUTES=2
+# BOOKY_MIN_EV_PERCENT=2
+# BOOKY_MAX_ODD_DROP=0.20
+
+# Matcher diagnostics/tuning
+# MATCH_DIAGNOSTIC_LOG=1
+# MATCH_FUZZY_THRESHOLD=0.77
+# MATCH_MIN_ACCEPT_SCORE=0.60
+# MATCH_TIME_TOLERANCE_MINUTES=5
+# MATCH_TIME_EXTENDED_TOLERANCE_MINUTES=30
+
+# Housekeeping historial/cuenta booky (opcionales)
+# BOOKY_BALANCE_REFRESH_MS=45000
+# BOOKY_HISTORY_REFRESH_MS=60000
+# BOOKY_HISTORY_RETENTION_DAYS=30
+# BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
 ```
 
 ### Personalización de Risk Profiles
@@ -905,6 +1060,30 @@ ops = ops.filter(op => op.kellyStake >= 1.00); // Cambiar a 0.50 para capturar m
 
 ---
 
+### Problema: "Token Booky inválido o vencido"
+
+**Síntoma:** endpoints `/api/booky/real/*` responden `BOOKY_TOKEN_RENEWAL_REQUIRED`.
+
+**Solución:**
+1. Cambia al perfil correcto: `npm run book:acity` o `npm run book:dorado`.
+2. Renueva token: `npm run token:booky:wait-close`.
+3. Verifica estado: `GET /api/booky/token-health`.
+
+---
+
+### Problema: "No se confirmó placeWidget (estado incierto)"
+
+**Síntoma:** respuesta `BOOKY_REAL_CONFIRMATION_UNCERTAIN`.
+
+**Interpretación:** la casa pudo aceptar la apuesta, pero no devolvió confirmación definitiva (timeout/red).
+
+**Acción recomendada:**
+1. Revisar Open Bets/History en Booky.
+2. Revisar `GET /api/booky/account?refresh=1`.
+3. No reintentar ciegamente hasta validar si la apuesta ya existe.
+
+---
+
 ## 🗺️ Roadmap
 
 ### V3.1 (Q1 2026)
@@ -932,7 +1111,7 @@ ISC License - Ver archivo `LICENSE` para detalles.
 
 ## ⚠️ Disclaimer
 
-Este software es una herramienta de investigación cuantitativa y simulación (Paper Trading). **No ejecuta apuestas reales**. El trading deportivo involucra riesgo de pérdida de capital. Usa bajo tu propia responsabilidad.
+Este software está orientado a investigación cuantitativa, simulación y operación asistida. El módulo de ejecución real existe pero está **protegido por flags y validaciones** (`BOOKY_REAL_PLACEMENT_ENABLED`, guardas de token/valor). El trading deportivo involucra riesgo de pérdida de capital. Usa bajo tu propia responsabilidad.
 
 ---
 

@@ -7,6 +7,78 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ALIAS_FILE = path.join(__dirname, 'dynamicAliases.json');
 
+const parseThresholdFromEnv = (rawValue, fallback, envName, sourceTag) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}="${rawValue}" no es numérico. Usando default ${fallback}.`);
+        return fallback;
+    }
+    if (parsed < 0) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}=${parsed} fuera de rango [0,1]. Se ajusta a 0.`);
+        return 0;
+    }
+    if (parsed > 1) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}=${parsed} fuera de rango [0,1]. Se ajusta a 1.`);
+        return 1;
+    }
+    return parsed;
+};
+
+const parseMinutesFromEnv = (rawValue, fallback, envName, sourceTag) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}="${rawValue}" no es numérico. Usando default ${fallback}.`);
+        return fallback;
+    }
+
+    if (parsed < 0) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}=${parsed} es negativo. Se ajusta a 0.`);
+        return 0;
+    }
+
+    if (parsed > 180) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}=${parsed} es muy alto. Se ajusta a 180.`);
+        return 180;
+    }
+
+    return Number(parsed.toFixed(2));
+};
+
+const MATCH_FUZZY_THRESHOLD = parseThresholdFromEnv(
+    process.env.MATCH_FUZZY_THRESHOLD,
+    0.77,
+    'MATCH_FUZZY_THRESHOLD',
+    'TeamMatcher'
+);
+const MATCH_TIME_TOLERANCE_MINUTES = parseMinutesFromEnv(
+    process.env.MATCH_TIME_TOLERANCE_MINUTES,
+    5,
+    'MATCH_TIME_TOLERANCE_MINUTES',
+    'TeamMatcher'
+);
+let MATCH_TIME_EXTENDED_TOLERANCE_MINUTES = parseMinutesFromEnv(
+    process.env.MATCH_TIME_EXTENDED_TOLERANCE_MINUTES,
+    30,
+    'MATCH_TIME_EXTENDED_TOLERANCE_MINUTES',
+    'TeamMatcher'
+);
+if (MATCH_TIME_EXTENDED_TOLERANCE_MINUTES < MATCH_TIME_TOLERANCE_MINUTES) {
+    console.warn(
+        `⚠️ [TeamMatcher] MATCH_TIME_EXTENDED_TOLERANCE_MINUTES=${MATCH_TIME_EXTENDED_TOLERANCE_MINUTES} ` +
+        `es menor que MATCH_TIME_TOLERANCE_MINUTES=${MATCH_TIME_TOLERANCE_MINUTES}. ` +
+        `Se iguala al valor primario.`
+    );
+    MATCH_TIME_EXTENDED_TOLERANCE_MINUTES = MATCH_TIME_TOLERANCE_MINUTES;
+}
+
 /**
  * UTILIDAD DE NORMALIZACIÓN Y MATCHING DE EQUIPOS
  * Combina limpieza de strings + Levenshtein Distance + Ventanas de Tiempo
@@ -390,15 +462,53 @@ const STATIC_ALIASES = {
 
 // Cargar alias dinámicos
 let DYNAMIC_ALIASES = {};
+let dynamicAliasesMtimeMs = 0;
 try {
     if (fs.existsSync(ALIAS_FILE)) {
         DYNAMIC_ALIASES = JSON.parse(fs.readFileSync(ALIAS_FILE, 'utf8'));
+        dynamicAliasesMtimeMs = fs.statSync(ALIAS_FILE).mtimeMs || 0;
     }
 } catch (e) {
     console.error("Error loading dynamic aliases:", e);
 }
 
 export const TEAM_ALIASES = { ...STATIC_ALIASES, ...DYNAMIC_ALIASES };
+
+const extractCandidateHomeName = (raw = '') => {
+    if (!raw) return '';
+    const splitMatch = raw.match(/\s+vs\.?\s+/i);
+    if (splitMatch) return raw.split(splitMatch[0])[0].trim();
+    if (raw.includes(' vs ')) return raw.split(' vs ')[0].trim();
+    return raw.trim();
+};
+
+const getTimeDiffMinutes = (dateStr1, dateStr2) => {
+    const d1 = new Date(dateStr1).getTime();
+    const d2 = new Date(dateStr2).getTime();
+    if (!Number.isFinite(d1) || !Number.isFinite(d2)) return null;
+    return Math.abs(d1 - d2) / (1000 * 60);
+};
+
+const refreshDynamicAliasesIfChanged = () => {
+    try {
+        const exists = fs.existsSync(ALIAS_FILE);
+        const currentMtime = exists ? (fs.statSync(ALIAS_FILE).mtimeMs || 0) : 0;
+
+        if (currentMtime === dynamicAliasesMtimeMs) return;
+
+        DYNAMIC_ALIASES = exists
+            ? JSON.parse(fs.readFileSync(ALIAS_FILE, 'utf8'))
+            : {};
+        dynamicAliasesMtimeMs = currentMtime;
+
+        Object.keys(TEAM_ALIASES).forEach(key => delete TEAM_ALIASES[key]);
+        Object.assign(TEAM_ALIASES, STATIC_ALIASES, DYNAMIC_ALIASES);
+
+        console.log('🔄 [TeamMatcher] Dynamic aliases recargados en caliente.');
+    } catch (e) {
+        console.error('Error refreshing dynamic aliases:', e);
+    }
+};
   
   /**
    * Normaliza un nombre de equipo:
@@ -458,6 +568,9 @@ export const registerDynamicAlias = (targetName, candidateName) => {
         // pero TEAM_ALIASES suele usarse [candidate] -> target.
         
         fs.writeFileSync(ALIAS_FILE, JSON.stringify(DYNAMIC_ALIASES, null, 2));
+        dynamicAliasesMtimeMs = fs.existsSync(ALIAS_FILE)
+            ? (fs.statSync(ALIAS_FILE).mtimeMs || dynamicAliasesMtimeMs)
+            : dynamicAliasesMtimeMs;
         console.log(`🧠 [TeamMatcher] Learned new alias: "${normCand}" -> "${normTarget}"`);
         
         // Actualizar la referencia en memoria
@@ -603,7 +716,7 @@ export const getTokenSimilarity = (name1, name2) => {
       return false;
   };
 
-  export const isTimeMatch = (dateStr1, dateStr2, toleranceMinutes = 5) => { // Tolerancia reducida a 5m (Estricta)
+    export const isTimeMatch = (dateStr1, dateStr2, toleranceMinutes = MATCH_TIME_TOLERANCE_MINUTES) => {
     const d1 = new Date(dateStr1).getTime();
     const d2 = new Date(dateStr2).getTime();
     const diffMs = Math.abs(d1 - d2);
@@ -621,6 +734,9 @@ export const getTokenSimilarity = (name1, name2) => {
    */
   export const findMatch = (targetTeamName, targetDate, candidatesList, targetId = null, targetLeague = '') => {
     const isDebug = false; // Set true if needed
+
+        // Hot-reload de aliases dinámicos para reflejar cambios manuales sin reiniciar proceso.
+        refreshDynamicAliasesIfChanged();
 
     // 0. Match Directo por ID (Priority #1)
     if (targetId) {
@@ -723,7 +839,7 @@ export const getTokenSimilarity = (name1, name2) => {
         }
     }
   
-    if (highestScore >= 0.77) {
+    if (highestScore >= MATCH_FUZZY_THRESHOLD) {
         return bestMatch;
     }
     } // END of strict window matching check
@@ -734,11 +850,11 @@ export const getTokenSimilarity = (name1, name2) => {
     // 1. Coincidencia EXACTA de nombres normalizados.
     // 2. Coincidencia de ALIAS conocido.
     {
-        const EXTENDED_WINDOW = 30; // 30 minutos
+           const EXTENDED_WINDOW = MATCH_TIME_EXTENDED_TOLERANCE_MINUTES;
         // console.log(`DEBUG Extended: Buscando en ventana ${EXTENDED_WINDOW}m para ${targetTeamName}`);
         const extendedCandidates = candidatesList.filter(c => {
              const inWindow = isTimeMatch(targetDate, c.startDate || c.date, EXTENDED_WINDOW);
-             const alreadyChecked = isTimeMatch(targetDate, c.startDate || c.date, 5);
+               const alreadyChecked = isTimeMatch(targetDate, c.startDate || c.date, MATCH_TIME_TOLERANCE_MINUTES);
              // if (inWindow && !alreadyChecked) console.log(`  -> Candidato aceptado para extended: ${c.home || c.name}`);
              return inWindow && !alreadyChecked;
         });
@@ -768,3 +884,99 @@ export const getTokenSimilarity = (name1, name2) => {
 
     return null;
   };
+
+export const diagnoseNoMatch = (targetTeamName, targetDate, candidatesList = [], targetLeague = '') => {
+    refreshDynamicAliasesIfChanged();
+
+    const normTarget = normalizeName(targetTeamName);
+    const resolvedTarget = TEAM_ALIASES[normTarget] || normTarget;
+
+    const timeCandidatesPrimary = [];
+    const timeCandidatesExtended = [];
+    let malformedCandidates = 0;
+    let categoryMismatchesPrimary = 0;
+    let strictAliasEquivalentCount = 0;
+    let bestScore = -1;
+    let bestCandidate = null;
+
+    for (const candidate of candidatesList) {
+        const candidateDate = candidate?.startDate || candidate?.date;
+        const diffMins = getTimeDiffMinutes(targetDate, candidateDate);
+        const inPrimary = isTimeMatch(targetDate, candidateDate, MATCH_TIME_TOLERANCE_MINUTES);
+        const inExtended = isTimeMatch(targetDate, candidateDate, MATCH_TIME_EXTENDED_TOLERANCE_MINUTES);
+
+        if (inPrimary) timeCandidatesPrimary.push(candidate);
+        if (inExtended) timeCandidatesExtended.push(candidate);
+
+        if (!inPrimary) continue;
+
+        const rawName = candidate?.home || candidate?.name || '';
+        const candidateHome = extractCandidateHomeName(rawName);
+        if (!candidateHome) {
+            malformedCandidates++;
+            continue;
+        }
+
+        const candidateLeague = candidate?.league || '';
+        const isMismatch = isCategoryMismatch(targetTeamName, candidateHome, targetLeague, candidateLeague);
+        if (isMismatch) {
+            categoryMismatchesPrimary++;
+            continue;
+        }
+
+        const normCandidate = normalizeName(candidateHome);
+        const resolvedCandidate = TEAM_ALIASES[normCandidate] || normCandidate;
+
+        if (resolvedTarget === resolvedCandidate) {
+            strictAliasEquivalentCount++;
+        }
+
+        const tokenScore = getTokenSimilarity(normTarget, normCandidate);
+        const fuzzyScore = getSimilarity(normTarget, normCandidate);
+        const mergedScore = Math.max(tokenScore, fuzzyScore);
+
+        if (mergedScore > bestScore) {
+            bestScore = mergedScore;
+            bestCandidate = {
+                name: candidateHome,
+                league: candidateLeague || '',
+                timeDiffMinutes: diffMins,
+                tokenScore: Number(tokenScore.toFixed(3)),
+                fuzzyScore: Number(fuzzyScore.toFixed(3)),
+                normalized: normCandidate,
+                resolved: resolvedCandidate
+            };
+        }
+    }
+
+    let probableReason = 'unknown';
+    if (timeCandidatesPrimary.length === 0) probableReason = `time_window_${MATCH_TIME_TOLERANCE_MINUTES}m`;
+    else if (categoryMismatchesPrimary === timeCandidatesPrimary.length) probableReason = 'category_mismatch';
+    else if (strictAliasEquivalentCount > 0) probableReason = 'score_threshold_or_flow';
+    else if (bestScore >= 0.70 && bestScore < MATCH_FUZZY_THRESHOLD) probableReason = 'similarity_below_threshold';
+    else if (timeCandidatesExtended.length > timeCandidatesPrimary.length) {
+        probableReason = `time_window_requires_extended_${MATCH_TIME_EXTENDED_TOLERANCE_MINUTES}m`;
+    }
+
+    return {
+        targetTeamName,
+        targetLeague: targetLeague || '',
+        normalizedTarget: normTarget,
+        resolvedTarget,
+        aliasApplied: resolvedTarget !== normTarget,
+        primaryWindowMinutes: MATCH_TIME_TOLERANCE_MINUTES,
+        extendedWindowMinutes: MATCH_TIME_EXTENDED_TOLERANCE_MINUTES,
+        totalCandidates: candidatesList.length,
+        inWindow5: timeCandidatesPrimary.length,
+        inWindow30: timeCandidatesExtended.length,
+        inPrimaryWindow: timeCandidatesPrimary.length,
+        inExtendedWindow: timeCandidatesExtended.length,
+        categoryMismatches5: categoryMismatchesPrimary,
+        categoryMismatchesPrimary,
+        malformedCandidates,
+        strictAliasEquivalentCount,
+        bestScore: bestScore >= 0 ? Number(bestScore.toFixed(3)) : null,
+        bestCandidate,
+        probableReason
+    };
+};

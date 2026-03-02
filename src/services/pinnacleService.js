@@ -7,6 +7,64 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_DATA_PATH = path.join(__dirname, '../../data/pinnacle_live.json');
+const LOCAL_PREMATCH_DATA_PATH = path.join(__dirname, '../../data/pinnacle_prematch.json');
+const NIGHT_MODE_START_HOUR_PE = 18;
+const NEXT_DAY_CUTOFF_HOUR_PE = 6;
+const EXCLUDED_MATCH_TERMS = [
+    'corners',
+    'corner',
+    'bookings',
+    'booking',
+    'cards',
+    'card',
+    'tarjetas',
+    '8 games',
+    '8 game'
+];
+
+const normalizeMarketText = (value = '') => String(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+const isExcludedMarketVariant = ({ home = '', away = '', league = '', units = '' } = {}) => {
+    if (units && String(units).toLowerCase() !== 'regular') return true;
+    const blob = normalizeMarketText(`${home} ${away} ${league} ${units}`);
+    return EXCLUDED_MATCH_TERMS.some(term => blob.includes(term));
+};
+
+const getPrematchWindowUtc = () => {
+    const nowUtcMs = Date.now();
+    const peruOffsetMs = -5 * 60 * 60 * 1000;
+    const nowPeru = new Date(nowUtcMs + peruOffsetMs);
+    const hourPeru = nowPeru.getUTCHours();
+
+    let endPeruMs;
+    if (hourPeru >= NIGHT_MODE_START_HOUR_PE) {
+        endPeruMs = Date.UTC(
+            nowPeru.getUTCFullYear(),
+            nowPeru.getUTCMonth(),
+            nowPeru.getUTCDate() + 1,
+            NEXT_DAY_CUTOFF_HOUR_PE,
+            0,
+            0,
+            0
+        );
+    } else {
+        endPeruMs = Date.UTC(
+            nowPeru.getUTCFullYear(),
+            nowPeru.getUTCMonth(),
+            nowPeru.getUTCDate(),
+            23,
+            59,
+            59,
+            999
+        );
+    }
+
+    const endUtcMs = endPeruMs - peruOffsetMs;
+    return { nowUtcMs, endUtcMs, hourPeru };
+};
 
 // Conversor de American Odds a Decimal (Pinnacle usa American)
 const americanToDecimal = (american) => {
@@ -70,6 +128,15 @@ export const getAllPinnacleLiveOdds = async () => {
                 // Assuming Mock structure for now or safe parsing.
                 const homePart = ev.participants?.find(p => p.alignment === 'home') || { name: ev.home || "Unknown Home" };
                 const awayPart = ev.participants?.find(p => p.alignment === 'away') || { name: ev.away || "Unknown Away" };
+
+                if (isExcludedMarketVariant({
+                    home: homePart.name,
+                    away: awayPart.name,
+                    league: ev.league?.name,
+                    units: ev.units
+                })) {
+                    continue;
+                }
 
                 // Build Prices (Soporte Dual: Estructura Plana vs Anidada Legacy)
                 let moneyline = null;
@@ -222,9 +289,13 @@ export const getAllPinnacleLiveOdds = async () => {
         // PASO A: Indexar Metadata (Filtrando solo Units="Regular")
         const metaMap = new Map();
         matchupsSafe.forEach(m => {
-            // Solo nos interesan partidos de fútbol regulares (no corners/cards)
-            // Si units no existe, asumimos que es regular. Si dice 'Corners' o 'Yellow Cards', lo ignoramos OR lo usamos solo para referenciar parent.
-            if (m.units && m.units !== 'Regular') return;
+            // Solo nos interesan partidos de fútbol regulares (no corners/cards/bookings/8 games)
+            if (isExcludedMarketVariant({
+                home: m.participants?.find(p => p.alignment === 'home')?.name,
+                away: m.participants?.find(p => p.alignment === 'away')?.name,
+                league: m.league?.name,
+                units: m.units
+            })) return;
 
             // Extraer Score Correcto
             const home = m.participants.find(p => p.alignment === 'home');
@@ -274,7 +345,7 @@ export const getAllPinnacleLiveOdds = async () => {
             // A) MONEYLINE (1x2)
             if (market.period === 0 && (market.type === 'moneyline' || market.key === 's;0;m')) {
                 // [Security Fix] Check if we already have a Moneyline and compare cutoffAt
-                // We want the OLDEST cutoffAt (True Match Winner), not "Rest of Match"
+                // We want the OLDEST cutoffAt (True 1x2), not "Rest of Match"
                 const currentCutoff = market.cutoffAt || '9999';
                 const existingCutoff = parsed._mlCutoff || '9999';
 
@@ -327,6 +398,159 @@ export const getAllPinnacleLiveOdds = async () => {
     }
 };
 
+// --------------------------------------------------------------------------------------
+// 1.1 PREMATCH CACHE FETCH (CANAL SEPARADO)
+// --------------------------------------------------------------------------------------
+export const getAllPinnaclePrematchOdds = async () => {
+    const mapFromFeed = (events = []) => {
+        const oddsMap = new Map();
+
+        for (const ev of events) {
+            const homePart = ev.participants?.find(p => p.alignment === 'home') || { name: ev.home || 'Unknown Home' };
+            const awayPart = ev.participants?.find(p => p.alignment === 'away') || { name: ev.away || 'Unknown Away' };
+
+            if (isExcludedMarketVariant({
+                home: homePart.name,
+                away: awayPart.name,
+                league: ev.league?.name,
+                units: ev.units
+            })) {
+                continue;
+            }
+
+            let moneyline = null;
+            const totals = [];
+
+            if (ev.markets && Array.isArray(ev.markets)) {
+                const mlMarket = ev.markets.find(m => m.type === 'moneyline' && m.period === 0 && m.status === 'open');
+                if (mlMarket?.prices) {
+                    const p = {};
+                    mlMarket.prices.forEach(pr => {
+                        const val = Math.abs(pr.price) > 20 ? americanToDecimal(pr.price) : pr.price;
+                        p[pr.designation] = Number(val.toFixed(3));
+                    });
+                    moneyline = {
+                        home: p.home,
+                        away: p.away,
+                        draw: p.draw || 0,
+                        isLive: false
+                    };
+                }
+
+                ev.markets.filter(m => m.type === 'total' && m.period === 0 && m.status === 'open').forEach(m => {
+                    const overP = m.prices?.find(x => x.designation === 'over');
+                    const underP = m.prices?.find(x => x.designation === 'under');
+                    if (overP && underP) {
+                        const valO = Math.abs(overP.price) > 20 ? americanToDecimal(overP.price) : overP.price;
+                        const valU = Math.abs(underP.price) > 20 ? americanToDecimal(underP.price) : underP.price;
+                        totals.push({
+                            line: overP.points || m.points,
+                            over: Number(valO.toFixed(3)),
+                            under: Number(valU.toFixed(3))
+                        });
+                    }
+                });
+            }
+
+            oddsMap.set(ev.id, {
+                id: ev.id,
+                match: `${homePart.name} vs ${awayPart.name}`,
+                home: homePart.name,
+                away: awayPart.name,
+                score: '0-0',
+                time: 'PRE',
+                date: ev.startTime || ev.date || new Date().toISOString(),
+                league: ev.league?.name || 'Unknown League',
+                isLive: false,
+                moneyline,
+                doubleChance: moneyline ? calculateDCFromMoneyline(moneyline.home, moneyline.draw || 100, moneyline.away) : null,
+                totals
+            });
+        }
+
+        return oddsMap;
+    };
+
+    // A) Cache local prematch (preferido)
+    if (fs.existsSync(LOCAL_PREMATCH_DATA_PATH)) {
+        try {
+            const fileContent = fs.readFileSync(LOCAL_PREMATCH_DATA_PATH, 'utf-8');
+            const feed = JSON.parse(fileContent);
+            const fromLocal = mapFromFeed(feed.events || []);
+            if (fromLocal.size > 0) return fromLocal;
+        } catch (e) {
+            console.warn("⚠️ Error leyendo Feed Local PREMATCH. Fallback a API.", e.message);
+        }
+    }
+
+    // B) Fallback API (solo si el cache falta o está vacío)
+    try {
+        console.log('   🌐 [Pinnacle] Fallback PREMATCH via API (cache miss).');
+        const [marketData, matchupData] = await Promise.all([
+            pinnacleClient.get('/sports/29/markets/straight', { primaryOnly: false, withSpecials: false, _: Date.now() }),
+            pinnacleClient.get('/sports/29/matchups', { brandId: 0, _: Date.now() })
+        ]);
+
+        const { nowUtcMs, endUtcMs } = getPrematchWindowUtc();
+        const metaMap = new Map();
+
+        (matchupData || []).forEach(m => {
+            const startTs = m.startTime ? new Date(m.startTime).getTime() : 0;
+            const isLikelyLive = !!m.liveMode || m.state?.minutes !== undefined;
+
+            if (!startTs || startTs < nowUtcMs - 10 * 60 * 1000 || startTs > endUtcMs) return;
+            if (isLikelyLive) return;
+
+            const home = m.participants?.find(p => p.alignment === 'home');
+            const away = m.participants?.find(p => p.alignment === 'away');
+
+            if (isExcludedMarketVariant({
+                home: home?.name,
+                away: away?.name,
+                league: m.league?.name,
+                units: m.units
+            })) return;
+
+            metaMap.set(m.id, {
+                id: m.id,
+                participants: m.participants,
+                home: home?.name || 'Home',
+                away: away?.name || 'Away',
+                startTime: m.startTime,
+                league: m.league,
+                units: m.units
+            });
+        });
+
+        const grouped = new Map();
+        (marketData || []).forEach(m => {
+            if (!metaMap.has(m.matchupId)) return;
+            if (m.period !== 0 || m.status !== 'open') return;
+
+            if (!grouped.has(m.matchupId)) grouped.set(m.matchupId, []);
+            grouped.get(m.matchupId).push(m);
+        });
+
+        const events = [];
+        grouped.forEach((markets, matchupId) => {
+            const meta = metaMap.get(matchupId);
+            events.push({
+                id: matchupId,
+                participants: meta.participants,
+                startTime: meta.startTime,
+                league: meta.league,
+                units: meta.units,
+                markets
+            });
+        });
+
+        return mapFromFeed(events);
+    } catch (e) {
+        console.error('❌ Error fallback API PREMATCH:', e.message);
+        return new Map();
+    }
+};
+
 /**
  * Obtiene las cuotas en vivo de un partido específico desde Pinnacle Arcadia.
  * @param {string|number} pinnacleMatchId - ID del partido en Pinnacle.
@@ -347,9 +571,9 @@ export const getPinnacleLiveOdds = async (pinnacleMatchId) => {
         // ----------------------------------------------------------------
         // 1. MONEYLINE (1x2) & DOUBLE CHANCE
         // ----------------------------------------------------------------
-        // Buscamos periodo 0 (Match) o periodo 1/2 si es live (pero para "Full Match Match Winner" sigue siendo periodo 0)
+        // Buscamos periodo 0 (Match) o periodo 1/2 si es live (pero para "Full Match 1x2" sigue siendo periodo 0)
         // [Security Fix] Filtramos múltiples mercados para evitar "Rest of Match"
-        // El verdadero Match Winner es el que tiene el cutoffAt más antiguo (original).
+        // El verdadero mercado 1x2 es el que tiene el cutoffAt más antiguo (original).
         
         const allMoneylines = data.filter(m => (m.key === 's;0;m' || m.type === 'moneyline') && m.period === 0 && m.status === 'open');
         

@@ -372,6 +372,7 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             
             // Parse current minute
             const currentMinute = parseInt(bet.liveTime?.replace(/[^0-9]/g, '') || '0');
+            const minsSinceLastUpdate = (Date.now() - new Date(bet.lastUpdate || bet.createdAt).getTime()) / 60000;
             
             // 1. Under perdido matemáticamente (más goles que la línea)
             if (bet.pick && bet.pick.startsWith('under_')) {
@@ -382,12 +383,6 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             // 2. BTTS No perdido (ambos anotaron)
             if (bet.pick === 'btts_no') {
                 if (scH > 0 && scA > 0) earlyLoss = true;
-            }
-
-            // [NUEVO] Si ya se pagó (Early Payout), no recalcular trigger, solo mantener activo
-            if (bet.payoutReceived) {
-                updatedActiveBets.push(bet);
-                continue;
             }
 
             if (earlyWin) {
@@ -430,10 +425,28 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
                 hasChanges = true;
                 continue;
             }
+
+            // [SAFE CLOSE] Si hubo Early Payout y el reloj quedó estancado en 90+,
+            // cerramos administrativamente para evitar partidos congelados en Activas.
+            if ((bet.payoutReceived || bet.earlyPayoutCollected) && currentMinute >= 90 && minsSinceLastUpdate >= 12) {
+                console.log(`🧊 STALE FT CLOSE: ${bet.match} [${bet.liveTime}, stale ${minsSinceLastUpdate.toFixed(1)}m]`);
+                settledBets.push({
+                    ...bet,
+                    status: bet.status || 'WON',
+                    finalScore: currentScoreStr,
+                    closedAt: new Date().toISOString(),
+                    fullTimeSettlement: true,
+                    earlyPayoutCollected: true,
+                    staleClose: true
+                });
+                hasChanges = true;
+                continue;
+            }
             
             // [NUEVO] Full Time Settlement (Liquidación por tiempo >= 95')
-            // Si el partido pasó los 95', liquidar todas las apuestas pendientes
-            if (currentMinute >= 95 && !bet.payoutReceived) {
+            // Si el partido pasó los 95', liquidar también las que ya tuvieron Early Payout
+            // para moverlas de ACTIVES -> HISTORY y evitar "congeladas" en UI.
+            if (currentMinute >= 95) {
                 console.log(`⏰ FULL TIME SETTLEMENT: ${bet.match} - ${bet.pick} [Score: ${currentScoreStr}, Time: ${bet.liveTime}]`);
                 
                 // Calcular resultado final inline (no podemos usar settleBet por orden de definición)
@@ -473,6 +486,13 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
                     returnAmt = parseFloat((bet.stake * bet.odd).toFixed(2));
                     profit = parseFloat((returnAmt - bet.stake).toFixed(2));
                 }
+
+                // Si ya tuvo Early Payout, NO volver a pagar retorno en balance.
+                // Mantenemos resultado y cierre administrativo únicamente.
+                if (bet.payoutReceived || bet.earlyPayoutCollected) {
+                    returnAmt = bet.return ?? returnAmt;
+                    profit = bet.profit ?? profit;
+                }
                 
                 const settledBet = {
                     ...bet,
@@ -481,7 +501,8 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
                     profit: profit,
                     return: returnAmt,
                     closedAt: new Date().toISOString(),
-                    fullTimeSettlement: true
+                    fullTimeSettlement: true,
+                    earlyPayoutCollected: !!(bet.payoutReceived || bet.earlyPayoutCollected)
                 };
                 
                 settledBets.push(settledBet);
