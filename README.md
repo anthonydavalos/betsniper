@@ -20,6 +20,7 @@
 - [Arquitectura del Sistema](#-arquitectura-del-sistema)
 - [Estrategias de Trading](#-estrategias-de-trading)
 - [Gestión Financiera](#-gestión-financiera-portfolio-theory)
+- [Guía de Configuración Pre-Operativa](#-guía-de-configuración-pre-operativa)
 - [Instalación y Despliegue](#-instalación-y-despliegue)
 - [Interfaz de Usuario](#-interfaz-de-usuario-dashboard)
 - [API Endpoints](#-api-endpoints)
@@ -437,6 +438,271 @@ const kellyStake = calculateKellyStake(realProb, odd, currentNAV, strategy);
     - Liquida apuesta si hay resultado oficial.
 
 ---
+
+## 🔧 Guía de Configuración Pre-Operativa
+
+Antes de instalar el sistema necesitas tener cuentas activas en los servicios externos que BetSniper consume. Esta sección detalla **qué cuentas abrir**, **qué datos extraer de cada una** y **cómo volcarlas al `.env`**.
+
+---
+
+### Paso 1: Servicios a los que debes suscribirte
+
+#### 1A. Pinnacle (obligatorio — fuente de probabilidades reales)
+
+| Campo | Detalle |
+|---|---|
+| **Web** | [pinnacle.com](https://www.pinnacle.com) |
+| **Tipo** | Sharp Bookie — márgenes muy bajos, acepta ganadores |
+| **Qué necesitas** | Cuenta activa con acceso a la sección "Sports" (Live Soccer visible) |
+| **Restricciones** | No disponible en todos los países. Usar VPN si es necesario (recomendado: servidor NL o MT). |
+| **Uso en BetSniper** | Solo como fuente de cuotas. **No se colocan apuestas en Pinnacle.** |
+| **Coste** | Gratuito (solo necesitas la cuenta para acceder a la API de cuotas en tiempo real) |
+
+> **Por qué Pinnacle:** Su API pública (`api.arcadia.pinnacle.com`) expone cuotas con márgenes de 2-3%, lo que las convierte en el mejor proxy de probabilidad real del mercado.
+
+#### 1B. DoradoBet (obligatorio para modo live — bookie objetivo principal)
+
+| Campo | Detalle |
+|---|---|
+| **Web** | [doradobet.com](https://doradobet.com) |
+| **Plataforma** | Altenar (mismo backend que ACity) |
+| **Qué necesitas** | Cuenta registrada con saldo real |
+| **Perfil en `.env`** | `BOOK_PROFILE=doradobet` |
+| **Uso en BetSniper** | Detección de value bets + colocación real (si habilitas `BOOKY_REAL_PLACEMENT_ENABLED`) |
+| **Restricciones** | Disponible principalmente en Perú. Si operas desde otro país, verificar disponibilidad. |
+
+#### 1C. Casino Atlantic City — ACity (alternativo — mismo motor Altenar)
+
+| Campo | Detalle |
+|---|---|
+| **Web** | [casinoatlanticcity.com/apuestas-deportivas](https://www.casinoatlanticcity.com/apuestas-deportivas) |
+| **Plataforma** | Altenar (misma API, distinto `integration` y `origin`) |
+| **Qué necesitas** | Cuenta registrada con saldo real |
+| **Perfil en `.env`** | `BOOK_PROFILE=acity` |
+| **Uso en BetSniper** | Alternativa a DoradoBet. Puedes operar en ambas en sesiones separadas. |
+
+> **Nota:** DoradoBet y ACity usan el mismo motor Altenar pero con integraciones distintas. BetSniper soporta cambiar entre ellas con un solo comando (`npm run book:dorado` / `npm run book:acity`) sin reiniciar el servidor.
+
+---
+
+### Paso 2: Configuración detallada del `.env`
+
+Copia el archivo de plantilla:
+
+```bash
+cp .env.example .env
+```
+
+Luego edita `.env` siguiendo esta guía variable por variable:
+
+---
+
+#### 🔧 Variables de Sistema
+
+```env
+NODE_ENV=development
+```
+> Usa `development` siempre. Solo cambiar a `production` si despliegas en servidor remoto.
+
+```env
+PORT=3000
+```
+> Puerto del backend. Si tienes conflicto con otro proceso, cámbialo (ej. `3001`).
+
+```env
+TZ=America/Lima
+```
+> Timezone del proceso. **Importante:** afecta el horario mostrado en el dashboard y los filtros de ventana prematch nocturna. Ajústar según tu país si no estás en Perú.
+
+```env
+DISABLE_BACKGROUND_WORKERS=false
+```
+> Pon `true` solo para depurar el servidor Express sin que los scanners consuman CPU.
+
+---
+
+#### 🎯 Variables de Perfil Altenar (Bookie objetivo)
+
+Estas variables se auto-escriben con `npm run book:dorado` o `npm run book:acity`. Pero si prefieres editarlas manualmente:
+
+**Para DoradoBet:**
+```env
+BOOK_PROFILE=doradobet
+ALTENAR_INTEGRATION=doradobet
+ALTENAR_ORIGIN=https://doradobet.com
+ALTENAR_REFERER=https://doradobet.com/deportes-en-vivo
+```
+
+**Para ACity:**
+```env
+BOOK_PROFILE=acity
+ALTENAR_INTEGRATION=casinoatlanticcity
+ALTENAR_ORIGIN=https://www.casinoatlanticcity.com
+ALTENAR_REFERER=https://www.casinoatlanticcity.com/apuestas-deportivas
+```
+
+**Comunes a ambos (no cambiar salvo que el bookie cambie de país):**
+```env
+ALTENAR_COUNTRY_CODE=PE        # Código ISO del país de la cuenta
+ALTENAR_CULTURE=es-ES           # Idioma de la API (no cambiar)
+ALTENAR_TIMEZONE_OFFSET=300     # UTC-5 (Perú). GMT-4=240, GMT-6=360
+ALTENAR_NUM_FORMAT=en-GB        # VITAL: garantiza decimales con punto (1.50 no 1,50)
+ALTENAR_DEVICE_TYPE=1           # 1=Desktop. No cambiar.
+ALTENAR_SPORT_ID=0              # 0=todos los deportes. 66=solo fútbol.
+```
+
+> **`ALTENAR_NUM_FORMAT=en-GB` es crítico.** Si usas `es-ES`, las cuotas llegan como `1,50` y el parser falla silenciosamente.
+
+---
+
+#### 🔐 Variables de Autenticación Booky (Para apuestas reales)
+
+Esto es necesario **solo si quieres ejecutar apuestas reales**. En modo Paper Trading puedes omitir esta sección.
+
+**Paso 1 — URL de acceso al bookie:**
+```env
+# DoradoBet:
+ALTENAR_BOOKY_URL=https://doradobet.com/deportes-en-vivo
+
+# ACity:
+ALTENAR_BOOKY_URL=https://www.casinoatlanticcity.com/apuestas-deportivas#/overview
+```
+> Esta es la URL a la que Puppeteer navega para iniciar sesión y capturar el JWT.
+
+**Paso 2 — Credenciales de tu cuenta:**
+```env
+ALTENAR_LOGIN_USERNAME=tu_email_o_usuario
+ALTENAR_LOGIN_PASSWORD=tu_contraseña
+```
+> Se usan para el login automático con Puppeteer. Se leen en tiempo de ejecución del script, nunca se loggean.
+
+**Paso 3 — Capturar el JWT real:**
+
+Con las credenciales en `.env`, ejecuta:
+
+```bash
+# Abre Chrome, inicia sesión automáticamente y espera a que cierres la ventana
+npm run token:booky:wait-close
+
+# Alternativa: headless con timeout de 90 segundos
+npm run token:booky:timeout
+```
+
+El script escribe automáticamente en tu `.env`:
+```env
+ALTENAR_BOOKY_AUTH_TOKEN=Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXV...
+```
+
+> **El JWT caduca en ~24-72h** dependiendo del bookie. Necesitarás renovarlo periódicamente con el mismo comando. Si `BOOKY_AUTO_TOKEN_REFRESH_ENABLED=true`, el sistema lo notifica automáticamente cuando queden menos de `BOOKY_TOKEN_MIN_REMAINING_MINUTES` minutos.
+
+---
+
+#### 🛡️ Variables de Seguridad — Guardas de Placement Real
+
+```env
+BOOKY_REAL_PLACEMENT_ENABLED=false
+```
+> **Esta variable es el interruptor principal.** Mientras sea `false`, el sistema NUNCA envía apuestas reales aunque el resto esté configurado. Cámbiala a `true` solo cuando hayas validado todo el flujo con dry-run.
+
+```env
+BOOKY_TOKEN_MIN_REMAINING_MINUTES=2
+```
+> Si el JWT tiene menos de X minutos de vida, el sistema rechaza el placement y notifica para renovar. Recomendado: `5` para mayor margen.
+
+```env
+BOOKY_MIN_EV_PERCENT=2
+```
+> EV mínimo para permitir placement real. Con `2`, solo apuesta si la ventaja esperada es ≥ 2%. Sube a `5` si quieres filtrar solo oportunidades de alta calidad.
+
+```env
+BOOKY_MAX_ODD_DROP=0.20
+```
+> Drop máximo de cuota desde el snapshot del ticket. Si la cuota bajó más de 20% entre cuando detectaste la oportunidad y cuando intentas apostar, el placement se rechaza. Recomendado: `0.15` para mercados volátiles.
+
+```env
+BOOKY_AUTO_TOKEN_REFRESH_ENABLED=true
+```
+> Activa el sistema de alertas automáticas cuando el token está por vencer.
+
+```env
+BOOKY_KEEP_REAL_PLACEMENT_ON_TOKEN_REFRESH=false
+```
+> Si `false` (recomendado): el sistema desactiva placements reales al detectar token vencido hasta renovación manual. Si `true`: intenta renovar y retomar solo (solo si `BOOKY_AUTO_TOKEN_REFRESH_ENABLED=true`).
+
+---
+
+#### 🧮 Variables del Matcher Pinnacle ↔ Altenar
+
+```env
+MATCH_DIAGNOSTIC_LOG=1
+```
+> Activa logs de diagnóstico del matcher. `0`=off (producción silenciosa), `1`=resumen por ciclo (recomendado para puesta en marcha), `2`=verbose por cada evento.
+
+```env
+MATCH_FUZZY_THRESHOLD=0.77
+```
+> Similitud mínima de Levenshtein entre nombres de equipo para considerar que son el mismo. Rango: `0.0–1.0`.
+> - `0.90+` → muy estricto, pocos matches, casi sin falsos positivos.
+> - `0.70–0.80` → equilibrado (recomendado).
+> - `<0.65` → permisivo, más matches pero riesgo de falsos positivos.
+
+```env
+MATCH_MIN_ACCEPT_SCORE=0.60
+```
+> Score compuesto mínimo para dar por válido un match (combina similitud de nombre + ventana temporal + contexto de liga). Bajar a `0.50` si hay muchos eventos sin match en ligas menores.
+
+```env
+MATCH_TIME_TOLERANCE_MINUTES=5
+```
+> Ventana temporal primaria (en minutos) para buscar candidatos. Si Pinnacle dice que el partido empieza a las 15:00 y Altenar dice 15:04, con tolerancia de 5 se linked correctamente.
+> - Subir a `10` si el diagnóstico muestra `time_window_5m` como razón dominante de no-match.
+> - Bajar a `3` solo si tienes muchos falsos positivos por partidos cercanos en horario.
+
+```env
+MATCH_TIME_EXTENDED_TOLERANCE_MINUTES=30
+```
+> Ventana secundaria para candidatos con alta similitud de nombre. Permite matchear eventos con diferencia de horario maior (ajustes de timezone inesperados). No bajar de `20`.
+
+---
+
+#### 🧹 Variables de Housekeeping (Opcionales)
+
+```env
+BOOKY_BALANCE_REFRESH_MS=45000
+```
+> Cada cuántos milisegundos se refresca el balance real del bookie. `45000` = 45 segundos.
+
+```env
+BOOKY_HISTORY_REFRESH_MS=60000
+```
+> Frecuencia de sincronización del historial remoto de apuestas.
+
+```env
+BOOKY_HISTORY_RETENTION_DAYS=30
+```
+> Cuántos días de historial conservar en `db.json`. Apuestas más antiguas se purgan automáticamente.
+
+```env
+BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
+```
+> Límite de entradas de historial por perfil en DB. Evita que `db.json` crezca indefinidamente.
+
+---
+
+### Paso 3: Resumen — ¿qué es obligatorio vs opcional?
+
+| Variable / Paso | Paper Trading | Live Apuestas Reales |
+|---|:---:|:---:|
+| Cuenta Pinnacle activa | ✅ | ✅ |
+| Cuenta DoradoBet o ACity con saldo | ❌ | ✅ |
+| `BOOK_PROFILE` + `ALTENAR_*` | ✅ | ✅ |
+| `ALTENAR_LOGIN_USERNAME` + `PASSWORD` | ❌ | ✅ |
+| `ALTENAR_BOOKY_AUTH_TOKEN` | ❌ | ✅ |
+| `BOOKY_REAL_PLACEMENT_ENABLED=true` | ❌ | ✅ |
+| Guards (`BOOKY_MIN_EV_PERCENT`, etc.) | ❌ | ✅ Recomendado |
+| `MATCH_*` (matcher tuning) | Opcional | Opcional |
+
+> **Recomendación para nuevos usuarios:** arranca con Paper Trading (sin credenciales de bookie) durante al menos 3-5 días para validar que el matcher detecta correctamente los eventos en tu región antes de habilitar apuestas reales.
 
 ---
 
