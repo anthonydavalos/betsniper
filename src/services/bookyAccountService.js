@@ -951,6 +951,8 @@ const mapBookyHistoryItem = (entry = {}) => {
     stake: Number.isFinite(Number(opportunity.kellyStake)) ? Number(opportunity.kellyStake) : null,
     eventId: opportunity.eventId || null,
     pinnacleId: opportunity.pinnacleId || null,
+    type: opportunity.type || entry?.payload?.type || null,
+    strategy: opportunity.strategy || entry?.payload?.strategy || null,
     integration: integration || null
   };
 };
@@ -988,17 +990,55 @@ export const getBookyHistory = async (limit = 60) => {
 
   for (const row of localRows) {
     const key = row.providerBetId ? `pb_${row.providerBetId}` : `${row.match || 'na'}_${row.placedAt || 'na'}_${row.stake || 0}`;
-    if (!merged.has(key)) merged.set(key, row);
+    if (!merged.has(key)) {
+      merged.set(key, row);
+      continue;
+    }
+
+    const remoteRow = merged.get(key) || {};
+    merged.set(key, {
+      ...remoteRow,
+      type: remoteRow.type || row.type || null,
+      strategy: remoteRow.strategy || row.strategy || null,
+      opportunityType: remoteRow.opportunityType || row.opportunityType || null
+    });
   }
 
   const rows = Array.from(merged.values())
     .sort((a, b) => new Date(b.placedAt || 0) - new Date(a.placedAt || 0))
     .slice(0, max);
 
-  upsertProfileHistory(ctx.key, rows);
+  const localTypeByProvider = new Map();
+  for (const item of history) {
+    const providerBetId = item?.realPlacement?.response?.bets?.[0]?.id;
+    if (providerBetId === null || providerBetId === undefined || providerBetId === '') continue;
+
+    const type = item?.opportunity?.type || item?.payload?.type || null;
+    const strategy = item?.opportunity?.strategy || item?.payload?.strategy || null;
+    if (!type && !strategy) continue;
+
+    localTypeByProvider.set(String(providerBetId), { type, strategy });
+  }
+
+  const enrichedRows = rows.map((row) => {
+    const providerBetId = row?.providerBetId;
+    if (providerBetId === null || providerBetId === undefined || providerBetId === '') return row;
+
+    const localMeta = localTypeByProvider.get(String(providerBetId));
+    if (!localMeta) return row;
+
+    return {
+      ...row,
+      type: row?.type || localMeta.type || null,
+      strategy: row?.strategy || localMeta.strategy || null,
+      opportunityType: row?.opportunityType || localMeta.type || localMeta.strategy || null
+    };
+  });
+
+  upsertProfileHistory(ctx.key, enrichedRows);
   await db.write();
 
-  return rows;
+  return enrichedRows;
 };
 
 export const cleanupBookyHistoricalData = async ({ retentionDays, maxPerProfile } = {}) => {
