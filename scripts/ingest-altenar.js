@@ -6,6 +6,8 @@ import { fileURLToPath } from 'url';
 export const ingestAltenarPrematch = async (force = false) => {
   await initDB();
 
+  const activeIntegration = altenarClient?.defaults?.params?.integration || 'unknown';
+
   // --- SMART SKIP LOGIC ---
   if (!force && db.data.altenarLastUpdate) {
       const lastRun = new Date(db.data.altenarLastUpdate).getTime();
@@ -18,7 +20,7 @@ export const ingestAltenarPrematch = async (force = false) => {
       }
   }
 
-  console.log('🚀 INICIANDO INGESTA MASIVA PRE-MATCH ALTENAR (DoradoBet)...');
+  console.log(`🚀 INICIANDO INGESTA MASIVA PRE-MATCH ALTENAR (${activeIntegration})...`);
 
   try {
     // Calcular rango de fechas (SOLO HOY para optimizar tráfico)
@@ -41,21 +43,38 @@ export const ingestAltenarPrematch = async (force = false) => {
     endDate.setHours(23, 59, 59, 999); // Final del día seleccionado
 
     console.log(`📡 Consultando API Altenar /GetUpcoming (Hasta: ${endDate.toISOString()})...`);
+
+    // Re-aplicamos headers/params explícitos en ESTA llamada para reforzar comportamiento anti-bot,
+    // pero tomados del perfil activo del axiosClient (BOOK_PROFILE / .env), NO hardcodeados.
+    const defaultHeaders = altenarClient.defaults.headers || {};
+    const headerCommon = defaultHeaders.common || {};
+
+    const requestHeaders = {
+      'User-Agent': defaultHeaders['User-Agent'] || headerCommon['User-Agent'],
+      'Referer': defaultHeaders['Referer'] || headerCommon['Referer'],
+      'Origin': defaultHeaders['Origin'] || headerCommon['Origin'],
+      'Sec-Fetch-Dest': defaultHeaders['Sec-Fetch-Dest'] || headerCommon['Sec-Fetch-Dest'] || 'empty',
+      'Sec-Fetch-Mode': defaultHeaders['Sec-Fetch-Mode'] || headerCommon['Sec-Fetch-Mode'] || 'cors',
+      'Sec-Fetch-Site': defaultHeaders['Sec-Fetch-Site'] || headerCommon['Sec-Fetch-Site'] || 'cross-site'
+    };
+
+    const defaultParams = altenarClient.defaults.params || {};
+    const requestParams = {
+      culture: defaultParams.culture,
+      timezoneOffset: defaultParams.timezoneOffset,
+      integration: defaultParams.integration,
+      deviceType: defaultParams.deviceType,
+      numFormat: defaultParams.numFormat,
+      countryCode: defaultParams.countryCode,
+      sportId: 66
+    };
     
     // PARAMS EXACTOS DEL APPS SCRIPT (Sin eventCount explicito si el default es masivo)
     // Añadimos endDate al request si la API lo soporta, pero filtramos localmente igual.
     // Altenar suele traer todo por defecto o paginado. Filtramos en memoria.
     const response = await altenarClient.get('/GetUpcoming', {
-      params: { 
-          culture: 'es-ES',
-          timezoneOffset: 300,
-          integration: 'doradobet',
-          deviceType: 1,
-          numFormat: 'en-GB',
-          countryCode: 'PE',
-          sportId: 66
-          // eventCount REMOVIDO intencionalmente para probar el default behavior
-      } 
+      headers: requestHeaders,
+      params: requestParams
     });
 
     const events = response.data.events || [];
@@ -181,6 +200,25 @@ export const ingestAltenarPrematch = async (force = false) => {
 // Helper Unificado para extraer todas las cuotas
 const extractOdds = (event, marketsMap, oddsMap) => {
   if (!event.marketIds) return { home: 0, draw: 0, away: 0, totals: [], btts: {} };
+
+  const extractLineFromText = (value = '') => {
+    const normalized = String(value).toLowerCase().replace(',', '.');
+    const match = normalized.match(/(\d+(?:\.\d+)?)/);
+    if (!match) return NaN;
+    const line = parseFloat(match[1]);
+    return Number.isFinite(line) ? line : NaN;
+  };
+
+  const upsertTotal = (line, side, price) => {
+    if (!Number.isFinite(line) || !Number.isFinite(price) || price <= 1) return;
+    let entry = result.totals.find(t => Math.abs(t.line - line) < 0.01);
+    if (!entry) {
+      entry = { line, over: 0, under: 0 };
+      result.totals.push(entry);
+    }
+    if (side === 'over' && (!entry.over || entry.over <= 0)) entry.over = price;
+    if (side === 'under' && (!entry.under || entry.under <= 0)) entry.under = price;
+  };
   
   let result = { 
       home: 0, 
@@ -207,34 +245,88 @@ const extractOdds = (event, marketsMap, oddsMap) => {
     }
 
     // B) Mercado Totales (typeId 18 o name 'Total')
-    // Agregamos variantes de nombre comunes como 'Total Goals'
-    if (market.typeId === 18 || market.name === 'Total' || (market.name && market.name.includes('Total'))) {
-        let lineVal = parseFloat(market.sv || market.sn || market.activeLine || market.specialOddValue); 
+    // [FIX] Filtrado Estricto de Mercados de Totales (Over/Under)
+    // Ignorar "Team Total", "First Half Total", etc.
+    const mName = (market.name || "").toLowerCase();
+    
+    // Whitelist
+    const isValidTotal = market.typeId === 18;
+    
+    // Blacklist
+    const forbidden = [
+        'corner', 'esquina', 'card', 'tarjeta', 'half', 'mitad', 'tiempo', '1st', '2nd', '1er', '2do',
+        'team', 'equipo', 'player', 'doble', 'btts', 'result', 'handicap', 'asian', 'exact', 'rest',
+        'both', 'ambos', 'marca', 'combinada', 'combo', 'winning', 'ganador', 'margin',
+        '1x2', 'multi', 'escala', 'rango', 'range',
+        // Team Totals Keywords
+        'local', 'visitante', 'home', 'away', 'casa', 'fuera', 'anota', 'score', 'portería'
+    ];
 
-        if (!isNaN(lineVal)) {
-            let overPrice = 0;
-            let underPrice = 0;
+    let isTeamTotal = false;
+    if (isValidTotal) {
+      const hasCompetitorBinding = Number.isFinite(Number(market.competitorId)) ||
+        (Array.isArray(market.competitorIds) && market.competitorIds.length > 0);
+      if (hasCompetitorBinding) isTeamTotal = true;
+
+        // Check blacklist
+        if (forbidden.some(word => mName.includes(word))) isTeamTotal = true;
+        
+        // Check Team Name Match
+        if (!isTeamTotal && event.name) {
+          const normalizeName = (str = '') => String(str)
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .trim();
+          const cleanName = (str = '') => normalizeName(str).split(/\s+/).filter(w => w.length >= 2);
+          const eventParts = String(event.name || '').split(/\s+vs\.?\s+/i);
+          const homeParts = cleanName(eventParts[0] || '');
+          const awayParts = cleanName(eventParts[1] || '');
             
-            for (const oddId of market.oddIds) {
-                const odd = oddsMap.get(oddId);
-                if (odd) {
-                    // TypeId 12 = Over, TypeId 13 = Under (Segun Blueprint)
-                    // A veces varía, pero confiamos en Blueprint + Data Real
-                    // Tambien chequeamos name por si acaso (Más de / Menos de)
-                    const nameLower = (odd.name || "").toLowerCase();
-                    if (odd.typeId === 12 || nameLower.includes('más') || nameLower.includes('over')) overPrice = odd.price;
-                    if (odd.typeId === 13 || nameLower.includes('menos') || nameLower.includes('under')) underPrice = odd.price;
-                }
+            const stopWords = ['fc', 'sc', 'cd', 'ca', 'club', 'de', 'la', 'el', 'los', 'al', 'united', 'city', 'real', 'sport', 'res', 'u21', 'women', 'femenino'];
+
+            if ([...homeParts, ...awayParts].some(part => {
+                if (stopWords.includes(part)) return false; 
+                return part.length >= 3 && mName.includes(part); 
+            })) {
+                isTeamTotal = true;
             }
 
-            if (overPrice > 0 && underPrice > 0) {
-                result.totals.push({
-                    line: lineVal,
-                    over: overPrice,
-                    under: underPrice
-                });
+            if (!isTeamTotal) {
+              const oddTexts = (market.oddIds || [])
+                .map(id => oddsMap.get(id))
+                .filter(Boolean)
+                .map(o => String(o.name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''));
+
+              if (oddTexts.some(txt => [...homeParts, ...awayParts].some(part => part.length >= 3 && !stopWords.includes(part) && txt.includes(part)))) {
+                isTeamTotal = true;
+              }
             }
         }
+    }
+
+    if (isValidTotal && !isTeamTotal) {
+          const marketLine = parseFloat(market.sv || market.sn || market.activeLine || market.specialOddValue);
+
+          for (const oddId of market.oddIds || []) {
+            const odd = oddsMap.get(oddId);
+            if (!odd) continue;
+
+            const nameLower = String(odd.name || '').toLowerCase();
+            const oddLine = extractLineFromText(nameLower);
+            const lineVal = Number.isFinite(oddLine) ? oddLine : (Number.isFinite(marketLine) ? marketLine : NaN);
+
+            if (!Number.isFinite(lineVal)) continue;
+
+            if (odd.typeId === 12 || nameLower.includes('más') || nameLower.includes('over')) {
+              upsertTotal(lineVal, 'over', odd.price);
+            }
+
+            if (odd.typeId === 13 || nameLower.includes('menos') || nameLower.includes('under')) {
+              upsertTotal(lineVal, 'under', odd.price);
+            }
+          }
     }
 
     // C) Mercado BTTS (typeId 29 o name 'Ambos equipos marcan')
@@ -257,6 +349,9 @@ const extractOdds = (event, marketsMap, oddsMap) => {
          }
     }
   }
+
+  // Mantener solo líneas completas (over+under)
+  result.totals = result.totals.filter(t => t.over > 0 && t.under > 0);
   
   // Ordenar totales por linea para consistencia (1.5, 2.5, 3.5)
   result.totals.sort((a,b) => a.line - b.line);

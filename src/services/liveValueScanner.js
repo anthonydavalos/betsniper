@@ -2,6 +2,161 @@ import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { findMatch } from '../utils/teamMatcher.js'; // [NEW]
+import { getKellyBankrollBase } from './bookyAccountService.js';
+
+let liveKellyBankroll = 100;
+
+const liveOpportunityStability = new Map();
+const STABILITY_WINDOW_MS = 25000;
+const STABILITY_MIN_HITS = 2;
+const STABILITY_MIN_AGE_MS = 4000;
+
+const shouldPublishStableOpportunity = (opKey) => {
+    const now = Date.now();
+    const prev = liveOpportunityStability.get(opKey);
+
+    if (!prev || (now - prev.lastSeenAt) > STABILITY_WINDOW_MS) {
+        liveOpportunityStability.set(opKey, {
+            firstSeenAt: now,
+            lastSeenAt: now,
+            hits: 1
+        });
+        return false;
+    }
+
+    const next = {
+        firstSeenAt: prev.firstSeenAt,
+        lastSeenAt: now,
+        hits: prev.hits + 1
+    };
+    liveOpportunityStability.set(opKey, next);
+
+    const age = now - next.firstSeenAt;
+    return next.hits >= STABILITY_MIN_HITS && age >= STABILITY_MIN_AGE_MS;
+};
+
+const pruneStabilityCache = () => {
+    const now = Date.now();
+    for (const [key, state] of liveOpportunityStability.entries()) {
+        if ((now - state.lastSeenAt) > STABILITY_WINDOW_MS * 2) {
+            liveOpportunityStability.delete(key);
+        }
+    }
+};
+
+const normalizeMarketText = (value = '') => String(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+const normalizeApiMarketLabel = (value = '') => {
+    const normalized = normalizeMarketText(value);
+    if (!normalized) return value;
+    if (normalized === '1x2' || normalized.includes('match winner') || normalized.includes('match result') || normalized.includes('moneyline')) {
+        return '1x2';
+    }
+    return value;
+};
+
+const is1x2MarketName = (value = '') => {
+    const normalized = normalizeMarketText(value);
+    return (
+        normalized === '1x2' ||
+        normalized === '1 x 2' ||
+        normalized.includes('match winner') ||
+        normalized.includes('match result') ||
+        normalized.includes('moneyline')
+    );
+};
+
+const tokenizeMarketText = (value = '') => normalizeMarketText(value).split(/\s+/).filter(Boolean);
+
+const flattenMarketOddIds = (market = {}) => {
+    if (Array.isArray(market.desktopOddIds)) return market.desktopOddIds.flat().filter(Boolean);
+    if (Array.isArray(market.oddIds)) return market.oddIds.filter(Boolean);
+    return [];
+};
+
+const parseScorePair = (value) => {
+    if (Array.isArray(value) && value.length >= 2) {
+        const home = parseInt(value[0], 10);
+        const away = parseInt(value[1], 10);
+        if (Number.isFinite(home) && Number.isFinite(away)) return [home, away];
+    }
+
+    if (typeof value === 'string') {
+        const match = value.match(/(\d+)\s*[-:]\s*(\d+)/);
+        if (match) {
+            const home = parseInt(match[1], 10);
+            const away = parseInt(match[2], 10);
+            if (Number.isFinite(home) && Number.isFinite(away)) return [home, away];
+        }
+    }
+
+    if (value && typeof value === 'object') {
+        const home = Number(value.home ?? value.h ?? value.homeScore);
+        const away = Number(value.away ?? value.a ?? value.awayScore);
+        if (Number.isFinite(home) && Number.isFinite(away)) return [home, away];
+    }
+
+    return null;
+};
+
+const isScoreSynchronized = (altenarScore, pinnacleScore) => {
+    const a = parseScorePair(altenarScore);
+    const p = parseScorePair(pinnacleScore);
+
+    if (!a || !p) return false;
+
+    return a[0] === p[0] && a[1] === p[1];
+};
+
+const isMatchTotalMarket = (market, eventName, oddsMap) => {
+    const n = normalizeMarketText(market?.name || '');
+    if (!n) return false;
+
+    const whitelist = ['total', 'over under', 'linea de gol', 'goals', 'goles'];
+    if (!whitelist.some(v => n.includes(v))) return false;
+
+    const forbidden = [
+        'corner', 'esquina', 'card', 'tarjeta', 'amarilla', 'roja', 'booking',
+        'half', 'mitad', 'tiempo', '1st', '2nd', '1er', '2do', 'primer', 'segundo',
+        'team', 'equipo', 'player', 'jugador', 'goleador', 'scorer',
+        'doble', 'chance', 'btts', 'both', 'ambos', 'marca',
+        'result', 'resultado', 'handicap', 'asian', 'asiatico', 'exact', 'range', 'rango',
+        'rest', 'odd even', 'par impar', 'winning', 'margin', 'margen',
+        '1x2', 'multi', 'escala', 'team total', 'total del equipo', 'total de equipo',
+        'goles del equipo', 'equipo total', 'equipo 1', 'equipo 2', 'home total', 'away total',
+        'local', 'visitante', 'home', 'away', 'casa', 'fuera', 'anota', 'score', 'porteria', 'arco'
+    ];
+    if (forbidden.some(word => n.includes(word))) return false;
+
+    const hasCompetitorBinding = Number.isFinite(Number(market?.competitorId)) ||
+        (Array.isArray(market?.competitorIds) && market.competitorIds.length > 0);
+    if (hasCompetitorBinding) return false;
+
+    const eventParts = String(eventName || '').split(/\s+vs\.?\s+/i);
+    const homeParts = tokenizeMarketText(eventParts[0] || '').filter(w => w.length >= 3);
+    const awayParts = tokenizeMarketText(eventParts[1] || '').filter(w => w.length >= 3);
+    const stopWords = new Set([
+        'fc', 'sc', 'cd', 'ca', 'club', 'de', 'la', 'el', 'los', 'al',
+        'united', 'city', 'real', 'sport', 'res', 'u21', 'u20', 'u19', 'women', 'femenino', 'b'
+    ]);
+    const teamTokens = [...new Set([...homeParts, ...awayParts].filter(t => !stopWords.has(t)))];
+
+    if (teamTokens.some(t => n.includes(t))) return false;
+
+    const oddTexts = flattenMarketOddIds(market)
+        .map(id => oddsMap.get(id))
+        .filter(Boolean)
+        .map(o => normalizeMarketText(o.name || ''));
+
+    if (oddTexts.some(txt => teamTokens.some(t => txt.includes(t)))) return false;
+
+    return true;
+};
 
 // =====================================================================
 // SERVICE: LIVE VALUE SCANNER v2
@@ -120,6 +275,9 @@ export const getEventDetails = async (eventId) => {
  */
 export const scanLiveOpportunities = async (preFetchedEvents = null) => {
     await initDB(); 
+    pruneStabilityCache();
+    const bankrollBase = await getKellyBankrollBase();
+    liveKellyBankroll = bankrollBase.amount;
     const pinnacleDb = db.data.upcomingMatches || [];
     
     // Mapa: AltenarID -> PinnacleMatchData
@@ -245,6 +403,16 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
             event.score = details.score;
         }
 
+        // [ANTI-FALSO-POSITIVO] Si marcador Altenar y Pinnacle no están sincronizados,
+        // NO evaluamos oportunidades en este ciclo para evitar alertas falsas post-gol.
+        const scoreInSync = isScoreSynchronized(event.score, pinLiveOdds.score);
+        if (!scoreInSync) {
+            const altScore = parseScorePair(event.score);
+            const pinScore = parseScorePair(pinLiveOdds.score);
+            console.log(`⏸️ [SYNC-GUARD] Skip ${event.name}: marcador desincronizado Alt=${altScore ? `${altScore[0]}-${altScore[1]}` : 'N/A'} vs Pin=${pinScore ? `${pinScore[0]}-${pinScore[1]}` : 'N/A'}`);
+            continue;
+        }
+
         const altenarOddsMap = new Map();
         if (details.odds && Array.isArray(details.odds)) {
             details.odds.forEach(o => altenarOddsMap.set(o.id, o));
@@ -262,9 +430,9 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
             const altDraw = oddsObjs.find(o => o.typeId === 2);
             const altAway = oddsObjs.find(o => o.typeId === 3);
 
-            if (altHome && pinLiveOdds.moneyline.home) checkAndAddOpp(opportunities, event, pinMatch, 'Match Winner', 'Home', altHome.price, pinLiveOdds.moneyline.home, pinLiveOdds.moneyline, pinLiveOdds);
-            if (altAway && pinLiveOdds.moneyline.away) checkAndAddOpp(opportunities, event, pinMatch, 'Match Winner', 'Away', altAway.price, pinLiveOdds.moneyline.away, pinLiveOdds.moneyline, pinLiveOdds);
-            if (altDraw && pinLiveOdds.moneyline.draw) checkAndAddOpp(opportunities, event, pinMatch, 'Match Winner', 'Draw', altDraw.price, pinLiveOdds.moneyline.draw, pinLiveOdds.moneyline, pinLiveOdds);
+            if (altHome && pinLiveOdds.moneyline.home) checkAndAddOpp(opportunities, event, pinMatch, '1x2', 'Home', altHome.price, pinLiveOdds.moneyline.home, pinLiveOdds.moneyline, pinLiveOdds);
+            if (altAway && pinLiveOdds.moneyline.away) checkAndAddOpp(opportunities, event, pinMatch, '1x2', 'Away', altAway.price, pinLiveOdds.moneyline.away, pinLiveOdds.moneyline, pinLiveOdds);
+            if (altDraw && pinLiveOdds.moneyline.draw) checkAndAddOpp(opportunities, event, pinMatch, '1x2', 'Draw', altDraw.price, pinLiveOdds.moneyline.draw, pinLiveOdds.moneyline, pinLiveOdds);
         }
 
         // >>> ESTRATEGIA B: DOUBLE CHANCE (DOBLE OPORTUNIDAD) <<<
@@ -282,31 +450,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
 
         // >>> ESTRATEGIA C: OVER/UNDER (TOTAL GOALS) <<<
         const totalMarkets = details.markets.filter(m => {
-            // Strict Filter Logic (Copy of Monitor Logic)
-            const n = (m.name || "").toLowerCase();
-            const valid = ['total', 'over/under', 'línea de gol', 'goals', 'goles'];
-            if (!valid.some(v => n.includes(v))) return false;
-            
-            // Extended Blacklist (SYNC WITH MONITOR LOGIC)
-            const forbidden = [
-                'corner', 'esquina', 'card', 'tarjeta', 'half', 'mitad', 'tiempo', '1st', '2nd', '1er', '2do',
-                'team', 'equipo', 'player', 'doble', 'btts', 'result', 'handicap', 'asian', 'exact', 'rest',
-                'both', 'ambos', 'marca', 'combinada', 'combo', 'winning', 'ganador', 'margin',
-                '1x2', 'multi', 'escala', 'rango', 'range' 
-            ];
-            
-            // [NEW] Block Markets containing Team Names (Team Totals)
-            const homeParts = (event.name || "").split(' vs ')[0].toLowerCase().split(' ');
-            const awayParts = (event.name || "").split(' vs ')[1]?.toLowerCase().split(' ') || [];
-            
-            // Check if market has significant part of team name (min length 4 to avoid 'fc')
-            const hasTeamName = [...homeParts, ...awayParts].some(part => 
-                part.length > 3 && n.includes(part)
-            );
-            if (hasTeamName) return false;
-
-            if (forbidden.some(word => n.includes(word))) return false;
-            return true;
+            return isMatchTotalMarket(m, event.name, altenarOddsMap);
         });
         
             // --- NUEVO ENFOQUE: AGRUPAR POR LÍNEAS (Igual que Monitor) ---
@@ -410,7 +554,7 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
     const ev = (fairProb * altOdd) - 1;
     // ESTRATEGIA: LIVE_VALUE (Perfil Medio Riesgo)
     // Usamos 'LIVE_VALUE' como identificador para mathUtils
-    const kellyRes = calculateKellyStake(fairProb * 100, altOdd, db.data.portfolio.balance || 100, 'LIVE_VALUE'); 
+    const kellyRes = calculateKellyStake(fairProb * 100, altOdd, liveKellyBankroll || 100, 'LIVE_VALUE'); 
 
     // [DEBUG] Loggear Totals detectados aunque tengan poco EV para confirmar que la lógica funciona
     // if (marketName.includes('Total') && ev > -0.05) {
@@ -419,10 +563,15 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
 
     // Umbral estricto para producción: EV > 2%
     if (ev > 0.02 && kellyRes.amount > 0) {
-        const safeStake = marketName.includes('Winner') ? kellyRes.amount : kellyRes.amount * 0.5;
+        const safeStake = is1x2MarketName(marketName) ? kellyRes.amount : kellyRes.amount * 0.5;
 
         // [FILTER] Min Stake 1.00 PEN (Evitar centavos)
         if (safeStake < 1) return;
+
+        // [ANTI-FAKE-SPIKE] Requerir confirmación temporal en 2 ticks antes de publicar.
+        // Evita falsas oportunidades cuando un feed actualiza antes que el otro por unos segundos.
+        const oppKey = `${event.id}|${marketName}|${selection}`;
+        if (!shouldPublishStableOpportunity(oppKey)) return;
 
         // console.log(`   🔥 VALOR DETECTADO: ${event.name} | ${marketName} ${selection} | Alt: ${altOdd} vs Real: ${fairPrice.toFixed(2)} | EV: ${(ev*100).toFixed(1)}%`);
         
@@ -437,7 +586,7 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
             // Normalize Market Name for Comparison
             const normalizedMarket = marketName.toLowerCase();
 
-            if (normalizedMarket.includes('match winner') || normalizedMarket.includes('ganador')) {
+            if (is1x2MarketName(normalizedMarket) || normalizedMarket.includes('ganador')) {
                 if (selection === 'Home') pinPrematchPrice = pinMatch.odds.home;
                 if (selection === 'Draw') pinPrematchPrice = pinMatch.odds.draw;
                 else if (selection === 'Away') pinPrematchPrice = pinMatch.odds.away;
@@ -475,7 +624,7 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
             pinnacleId: pinMatch.id,
             match: event.name,
             league: (pinMatch.league && pinMatch.league.name) ? pinMatch.league.name : (pinMatch.isDynamic ? "Dynamic Link" : "Unknown"),
-            market: marketName,
+            market: normalizeApiMarketLabel(marketName),
             selection: selection,
             price: altOdd,
             pinnaclePrice: pinOdd, // Raw Pinnacle Odds (With Vig)
@@ -570,6 +719,7 @@ export const getLiveOddsComparison = async () => {
         }
 
         // CLONE OBJECT to avoid mutation of global cache
+        // [FIX] El clone definitivo se refresca luego de la sincronización de reloj para evitar lag visual en monitor.
         let monitorPinOdds = pinLiveOdds ? { ...pinLiveOdds, totals: [...(pinLiveOdds.totals || [])] } : null;
 
         // --- FILTRO DE INTEGRIDAD DE LÍNEAS (Anti-Zombies) ---
@@ -634,6 +784,16 @@ export const getLiveOddsComparison = async () => {
              if (details.score && Array.isArray(details.score) && details.score.length > 0) {
                  event.score = details.score;
              }
+
+             // [FIX] Refrescar clone del monitor con el tiempo/score ya sincronizado.
+             if (monitorPinOdds) {
+                 monitorPinOdds.time = pinLiveOdds?.time || event.liveTime || monitorPinOdds.time;
+                 if (pinLiveOdds?.score) {
+                    monitorPinOdds.score = pinLiveOdds.score;
+                 } else if (Array.isArray(event.score) && event.score.length >= 2) {
+                    monitorPinOdds.score = `${event.score[0]}-${event.score[1]}`;
+                 }
+             }
         }
 
         const altenarData = {
@@ -664,48 +824,7 @@ export const getLiveOddsComparison = async () => {
             // Agrupamos todas las cuotas (desktopOddIds) de todos los mercados Totales seleccionados
             // y las organizamos por línea extraida de SU NOMBRE, no del mercado.
             const totalMarkets = details.markets.filter(m => {
-                // 1. ANÁLISIS POR NOMBRE (Name-First Approach)
-                // Ignoramos TypeId por ahora porque a veces Type 18 se usa para mitades en ligas raras.
-                const n = (m.name || "").toLowerCase();
-                
-                // A) LISTA BLANCA (Debe tener uno de estos)
-                const validNames = ['total', 'over/under', 'línea de gol', 'goals', 'goles'];
-                if (!validNames.some(v => n.includes(v))) return false;
-
-                // B) LISTA NEGRA EXTENDIDA (No debe tener ninguno de estos)
-                const forbidden = [
-                    'corner', 'esquina', 'card', 'tarjeta', 'amarilla', 'roja', 'booking',
-                    'half', 'mitad', 'tiempo', '1st', '2nd', '1er', '2do', 'primer', 'segundo', // Mitades
-                    'team', 'equipo', 'local', 'visita', 'home', 'away', // Team Totals
-                    'player', 'jugador', 'goleador', 'scorer',
-                    'double', 'doble', 'chance', 'oportunidad', // 1x2 + Total
-                    'both', 'ambos', 'btts', 'marca', // Total + BTTS
-                    'result', 'resultado', // Resultado + Total
-                    'handicap', 'hándicap', 'asiático', 'asian', // Handicap
-                    'exact', 'exacto', 'range', 'rango', 'multi', // Goles exactos
-                    'rest', 'resto', // Resto del partido
-                    'odd/even', 'par/impar', // Par/Impar
-                    'winning', 'margin', 'margen', // Margen de victoria,
-                    '1x2', 'multi', 'escala', 'rango', 'range' 
-                ];
-                
-                // [NEW] Block Markets containing Team Names (Team Totals)
-                const homeParts = (event.name || "").split(' vs ')[0].toLowerCase().split(' ');
-                const awayParts = (event.name || "").split(' vs ')[1]?.toLowerCase().split(' ') || [];
-                
-                // Check if market has significant part of team name (min length 4 to avoid 'fc')
-                const hasTeamName = [...homeParts, ...awayParts].some(part => 
-                    part.length > 3 && n.includes(part)
-                );
-                if (hasTeamName) return false;
-
-                if (forbidden.some(word => n.includes(word))) return false;
-
-                // 2. CHECK EXTRA: Si pasó el filtro de nombre, validamos que SEA un mercado de goles real
-                // Muchos mercados basura tienen nombres limpios pero TypeIds raros.
-                // Type 18 es el estándar. Si no es 18, mirar con mucho recelo.
-                // Permitimos pasar si NO es 18 pero tiene nombre MUY CLARO ("Total gOALS").
-                return true;
+                return isMatchTotalMarket(m, event.name, altenarOddsMap);
             });
             
             const totalsBuffer = new Map(); // Map<Line, {over, under}>

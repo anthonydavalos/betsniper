@@ -1,7 +1,25 @@
 import altenarClient from '../config/axiosClient.js';
 import { getEventDetails } from './liveValueScanner.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
-import db from '../db/database.js';
+import { getKellyBankrollBase } from './bookyAccountService.js';
+
+const normalizeMarketText = (value = '') => String(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const is1x2MarketName = (value = '') => {
+    const normalized = normalizeMarketText(value);
+    return (
+        normalized === '1x2' ||
+        normalized === '1 x 2' ||
+        normalized === 'match winner' ||
+        normalized === 'match result' ||
+        normalized === 'moneyline'
+    );
+};
 
 /**
  * Refresca la cuota de una oportunidad Live utilizando la API de Altenar en tiempo real.
@@ -21,14 +39,14 @@ export const refreshOpportunity = async (opportunity) => {
         // Porque la op original no guardó los IDs explícitos (error de diseño previo, lo corregimos aquí con heurística)
         
         let targetOdd = null;
-        let marketName = opportunity.market || 'Match Winner'; // [FIX] Default to Match Winner if undefined
+        let marketName = opportunity.market || '1x2'; // Default consistente con payload API
         let selectionName = opportunity.selection;
 
         for (const market of details.markets) {
             // Mapeo básico de nombres de mercado
             let isTargetMarket = false;
-            // [FIX] Soporte para '1x2' o 'Match Winner' indistintamente
-            if ((marketName === 'Match Winner' || marketName === '1x2') && (market.typeId === 1 || market.name === 'Match Result' || market.name === '1x2')) isTargetMarket = true;
+            // [FIX] Soporte canonical + legacy para 1x2
+            if (is1x2MarketName(marketName) && (market.typeId === 1 || market.name === 'Match Result' || market.name === '1x2')) isTargetMarket = true;
             else if (marketName === 'Double Chance' && market.typeId === 10) isTargetMarket = true;
             else if (marketName.includes('Total Goals') && (market.typeId === 18 || market.name.includes('Total'))) {
                  // Check line
@@ -46,7 +64,7 @@ export const refreshOpportunity = async (opportunity) => {
                 
                 // Buscar la selección correcta
                 // A) Por tipo standard (1x2)
-                if (marketName === 'Match Winner' || marketName === '1x2') {
+                if (is1x2MarketName(marketName)) {
                     if (selectionName === 'Home' && oddsObjs.some(o => o.typeId === 1)) targetOdd = oddsObjs.find(o => o.typeId === 1);
                     else if (selectionName === 'Draw' && oddsObjs.some(o => o.typeId === 2)) targetOdd = oddsObjs.find(o => o.typeId === 2);
                     else if (selectionName === 'Away' && oddsObjs.some(o => o.typeId === 3)) targetOdd = oddsObjs.find(o => o.typeId === 3);
@@ -98,7 +116,14 @@ export const refreshOpportunity = async (opportunity) => {
         
         // Pass the strategy from original opportunity to scaling logic
         const strategy = opportunity.strategy || opportunity.type || 'LIVE_SNIPE';
-        const kellyRes = calculateKellyStake(fairProb * 100, newPrice, db.data.portfolio.balance || 100, strategy);
+        const bankrollBase = await getKellyBankrollBase();
+        const bankroll = Number(bankrollBase?.amount);
+        const kellyRes = calculateKellyStake(
+            fairProb * 100,
+            newPrice,
+            Number.isFinite(bankroll) && bankroll > 0 ? bankroll : 100,
+            strategy
+        );
         
         // El ajuste por MarketName (Winner vs. Totals) ahora podría estar implícito 
         // en el STAKE DINAMICO, pero mantenemos esta capa extra si se desea.
@@ -107,9 +132,13 @@ export const refreshOpportunity = async (opportunity) => {
 
         // Clone and Update
         const updatedOp = { ...opportunity };
+        if (is1x2MarketName(marketName)) {
+            updatedOp.market = '1x2';
+        }
         updatedOp.price = newPrice;
         updatedOp.ev = Number((newEV * 100).toFixed(2));
         updatedOp.kellyStake = Number(safeStake.toFixed(2));
+        updatedOp.kellyBankrollSource = bankrollBase?.source || null;
         updatedOp.lastUpdate = new Date().toISOString();
 
         console.log(`✅ Refresh Odds [${opportunity.match}]: ${oldPrice} -> ${newPrice} | Stake: ${updatedOp.kellyStake}`);

@@ -1,6 +1,79 @@
 import db from '../db/database.js';
 import { findMatch, isTimeMatch } from '../utils/teamMatcher.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
+import { getAllPinnaclePrematchOdds } from './pinnacleService.js';
+import { getKellyBankrollBase } from './bookyAccountService.js';
+
+const NIGHT_MODE_START_HOUR_PE = 18;
+const NEXT_DAY_CUTOFF_HOUR_PE = 6;
+const EXCLUDED_MATCH_TERMS = [
+    'corners',
+    'corner',
+    'bookings',
+    'booking',
+    'cards',
+    'card',
+    'tarjetas',
+    '8 games',
+    '8 game'
+];
+
+const normalizeMarketText = (value = '') => String(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+const isExcludedMarketVariant = ({ home = '', away = '', league = '' } = {}) => {
+    const blob = normalizeMarketText(`${home} ${away} ${league}`);
+    return EXCLUDED_MATCH_TERMS.some(term => blob.includes(term));
+};
+
+const getPrematchWindowUtc = () => {
+    const nowUtcMs = Date.now();
+    const peruOffsetMs = -5 * 60 * 60 * 1000;
+    const nowPeru = new Date(nowUtcMs + peruOffsetMs);
+    const hourPeru = nowPeru.getUTCHours();
+
+    let endPeruMs;
+    if (hourPeru >= NIGHT_MODE_START_HOUR_PE) {
+        endPeruMs = Date.UTC(
+            nowPeru.getUTCFullYear(),
+            nowPeru.getUTCMonth(),
+            nowPeru.getUTCDate() + 1,
+            NEXT_DAY_CUTOFF_HOUR_PE,
+            0,
+            0,
+            0
+        );
+    } else {
+        endPeruMs = Date.UTC(
+            nowPeru.getUTCFullYear(),
+            nowPeru.getUTCMonth(),
+            nowPeru.getUTCDate(),
+            23,
+            59,
+            59,
+            999
+        );
+    }
+
+    const endUtcMs = endPeruMs - peruOffsetMs;
+    return { nowUtcMs, endUtcMs, hourPeru };
+};
+
+const writeDbWithRetry = async (maxRetries = 12, waitMs = 300) => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            await db.write();
+            return true;
+        } catch (error) {
+            const isLockErr = error?.code === 'EPERM' || error?.code === 'EBUSY';
+            if (!isLockErr || attempt === maxRetries) throw error;
+            await new Promise(r => setTimeout(r, waitMs * attempt));
+        }
+    }
+    return false;
+};
 
 // =====================================================================
 // SERVICE: PRE-MATCH VALUE SCANNER & LINKER
@@ -13,8 +86,131 @@ export const scanPrematchOpportunities = async () => {
         // 1. Leer DB (Ahora poblada por ingesta Pinnacle y Altenar)
         await db.read();
         
-        const pinnacleMatches = db.data.upcomingMatches || [];
+        let dbPinnacleMatches = db.data.upcomingMatches || [];
         const altenarCachedEvents = db.data.altenarUpcoming || [];
+        let dbWasUpdatedFromCache = false;
+
+        // [NEW] Cache-First para Pinnacle Pre-Match
+        // 1) Intentar usar canal separado (pinnacle_prematch.json)
+        // 2) Fallback a snapshot legacy en DB cuando falte data
+        let pinnacleMatches = dbPinnacleMatches;
+        try {
+            const prematchMap = await getAllPinnaclePrematchOdds();
+            if (prematchMap && prematchMap.size > 0) {
+                const { nowUtcMs, endUtcMs } = getPrematchWindowUtc();
+                const inWindow = (dateVal) => {
+                    if (!dateVal) return false;
+                    const ts = new Date(dateVal).getTime();
+                    if (!Number.isFinite(ts)) return false;
+                    return ts >= nowUtcMs - 10 * 60 * 1000 && ts <= endUtcMs;
+                };
+
+                const dbById = new Map(dbPinnacleMatches.map(m => [String(m.id), m]));
+                const cacheDriven = [];
+                const cacheIds = new Set();
+
+                prematchMap.forEach((p) => {
+                    const candidateDate = p.date || dbById.get(String(p.id))?.date;
+                    if (!inWindow(candidateDate)) return;
+
+                    const id = String(p.id);
+                    cacheIds.add(id);
+
+                    const dbMatch = dbById.get(id);
+                    const safeHome = p.home || dbMatch?.home || (p.match || '').split(' vs ')[0] || 'Home';
+                    const safeAway = p.away || dbMatch?.away || (p.match || '').split(' vs ')[1] || 'Away';
+
+                    cacheDriven.push({
+                        id,
+                        home: safeHome,
+                        away: safeAway,
+                        date: p.date || dbMatch?.date,
+                        league: dbMatch?.league || { name: p.league || 'Unknown League' },
+                        bookmaker: 'Pinnacle',
+                        odds: {
+                            home: p.moneyline?.home || dbMatch?.odds?.home || 0,
+                            draw: p.moneyline?.draw || dbMatch?.odds?.draw || 0,
+                            away: p.moneyline?.away || dbMatch?.odds?.away || 0,
+                            totals: (p.totals && p.totals.length > 0) ? p.totals : (dbMatch?.odds?.totals || []),
+                            btts: dbMatch?.odds?.btts || null
+                        },
+                        altenarId: dbMatch?.altenarId || null,
+                        altenarName: dbMatch?.altenarName || null,
+                        source: 'prematch-cache'
+                    });
+                });
+
+                const fallbackLegacy = dbPinnacleMatches.filter(m => {
+                    if (cacheIds.has(String(m.id))) return false;
+                    if (!inWindow(m.date)) return false;
+                    return !isExcludedMarketVariant({ home: m.home, away: m.away, league: m.league?.name });
+                });
+                pinnacleMatches = [...cacheDriven, ...fallbackLegacy];
+
+                console.log(`   🧠 Pinnacle Source: PREMATCH CACHE (${cacheDriven.length}) + Fallback DB (${fallbackLegacy.length}).`);
+
+                // [NEW] Persistencia Automática a DB desde canal prematch (cache-first)
+                // Mantiene upcomingMatches fresco sin depender de scripts legacy.
+                const byId = new Map(dbPinnacleMatches.map((m, idx) => [String(m.id), { idx, val: m }]));
+                const merged = [...dbPinnacleMatches];
+                let changedCount = 0;
+
+                for (const pm of cacheDriven) {
+                    const id = String(pm.id);
+                    const found = byId.get(id);
+
+                    const existing = found?.val || {};
+                    const nextObj = {
+                        ...existing,
+                        id: pm.id,
+                        home: pm.home,
+                        away: pm.away,
+                        date: pm.date || existing.date,
+                        league: pm.league || existing.league,
+                        bookmaker: 'Pinnacle',
+                        odds: pm.odds,
+                        // Preservar enlaces existentes y metadatos útiles
+                        altenarId: existing.altenarId || pm.altenarId || null,
+                        altenarName: existing.altenarName || pm.altenarName || null,
+                        lastUpdated: new Date().toISOString()
+                    };
+
+                    if (!found) {
+                        merged.push(nextObj);
+                        changedCount++;
+                        continue;
+                    }
+
+                    const changed =
+                        existing.home !== nextObj.home ||
+                        existing.away !== nextObj.away ||
+                        existing.date !== nextObj.date ||
+                        JSON.stringify(existing.odds || {}) !== JSON.stringify(nextObj.odds || {}) ||
+                        JSON.stringify(existing.league || {}) !== JSON.stringify(nextObj.league || {});
+
+                    if (changed) {
+                        merged[found.idx] = nextObj;
+                        changedCount++;
+                    }
+                }
+
+                const pruned = merged.filter(m => {
+                    if (!inWindow(m.date)) return false;
+                    return !isExcludedMarketVariant({ home: m.home, away: m.away, league: m.league?.name });
+                });
+                if (changedCount > 0 || pruned.length !== dbPinnacleMatches.length) {
+                    db.data.upcomingMatches = pruned;
+                    dbPinnacleMatches = pruned;
+                    dbWasUpdatedFromCache = true;
+                    console.log(`   💾 Cache Prematch -> DB: ${changedCount} upserts en upcomingMatches.`);
+                }
+            } else {
+                console.log('   ℹ️ Pinnacle Source: fallback DB (cache prematch vacío).');
+            }
+        } catch (cacheError) {
+            console.warn(`   ⚠️ Cache prematch no disponible. Usando DB legacy. (${cacheError.message})`);
+            pinnacleMatches = dbPinnacleMatches;
+        }
 
         if (pinnacleMatches.length === 0 || altenarCachedEvents.length === 0) {
             console.log('   ⚠️ Faltan datos en DB. Ejecuta los scripts de ingesta (node scripts/ingest-pinnacle.js y node scripts/ingest-altenar.js).');
@@ -47,6 +243,7 @@ export const scanPrematchOpportunities = async () => {
         // Esto asegura que reportes y futuros análisis tengan la data cruzada.
         for (const pinMatch of pinnacleMatches) {
              let altenarEvent = null;
+               const dbMirror = dbPinnacleMatches.find(m => String(m.id) === String(pinMatch.id));
 
              // RE-VALIDACIÓN ESTRICTA DE LINKS EXISTENTES 
              // (Crucial si cambiamos tolerancias de tiempo)
@@ -60,6 +257,10 @@ export const scanPrematchOpportunities = async () => {
                          console.log(`   ✂️ ROMPIENDO ENLACE INVÁLIDO (Tiempo): ${pinMatch.home} vs ${altenarEvent.name || altenarEvent.home}`);
                          pinMatch.altenarId = null;
                          pinMatch.altenarName = null;
+                        if (dbMirror) {
+                           dbMirror.altenarId = null;
+                           dbMirror.altenarName = null;
+                        }
                          altenarEvent = null;
                     }
                 } else {
@@ -77,6 +278,10 @@ export const scanPrematchOpportunities = async () => {
                 if (matchResult) {
                     pinMatch.altenarId = matchResult.match.id;  
                     pinMatch.altenarName = matchResult.match.name; 
+                    if (dbMirror) {
+                        dbMirror.altenarId = matchResult.match.id;
+                        dbMirror.altenarName = matchResult.match.name;
+                    }
                     newLinksCreated++;
                     console.log(`   🔗 NUEVO ENLACE: ${pinMatch.home} (Pin) <--> ${matchResult.match.name} (Alt)`);
                 }
@@ -110,6 +315,9 @@ export const scanPrematchOpportunities = async () => {
             return { p1: i1 / sum, p2: i2 / sum };
         };
 
+        const bankrollBase = await getKellyBankrollBase();
+        const currentBankroll = bankrollBase.amount;
+
         // 2. Iterar sobre Pinnacle (SOLO VÁLIDOS FUTUROS)
         for (const pinMatch of validPinnacleMatches) {
             
@@ -125,7 +333,6 @@ export const scanPrematchOpportunities = async () => {
                 totalMatchesFound++;
                 
                 // ... Analysis Logic ...
-                const currentBankroll = db.data.portfolio.balance || db.data.config.bankroll || 100;
                 const altenarOdds = altenarEvent.odds;
 
                 // A) Analizar Oportunidades 1x2
@@ -175,10 +382,12 @@ export const scanPrematchOpportunities = async () => {
             }
         }
 
-        // 3. PERSISTIR LOS ENLACES
-        if (newLinksCreated > 0) {
-            await db.write();
-            console.log(`   🔗 ${newLinksCreated} nuevos enlaces Pinnacle-Altenar guardados en DB.`);
+        // 3. PERSISTIR CAMBIOS (links + cache prematch)
+        if (newLinksCreated > 0 || dbWasUpdatedFromCache) {
+            await writeDbWithRetry();
+            if (newLinksCreated > 0) {
+                console.log(`   🔗 ${newLinksCreated} nuevos enlaces Pinnacle-Altenar guardados en DB.`);
+            }
         }
 
         // ORDENAMIENTO CRÍTICO: Partidos más cercanos primero
@@ -189,12 +398,6 @@ export const scanPrematchOpportunities = async () => {
         console.log(`   - Partidos Pinnacle (DB):   ${pinnacleMatches.length}`);
         console.log(`   - Filtrados (Ya iniciaron): ${expiredCount}`);
         console.log(`   - Enlazados con Altenar:    ${totalLinked}`);
-
-        // PERSISTENCIA DE ENLACES (CRÍTICO)
-        if (newLinksCreated > 0) {
-            console.log(`   💾 Guardando ${newLinksCreated} nuevos enlaces en base de datos...`);
-            await db.write();
-        }
 
         if (valueBets.length > 0) {
             console.log(`💎 ${valueBets.length} VALUE BETS DETECTADAS`);

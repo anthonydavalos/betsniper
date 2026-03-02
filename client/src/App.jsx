@@ -12,35 +12,239 @@ const ALERT_SOUND = "data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AA
 // Nota: Usaré un enlace externo confiable o un base64 real corto en la implementación final
 // Para este ejemplo, usaré un método de oscilador web audio api que no requiere assets externos y es más fiable.
 
-// Helper: Generar ID único por oportunidad (eventId + selection)
-// Esto permite apostar a múltiples selecciones del mismo evento (ej: Home + Under 2.5)
-function getOpportunityId(op) {
-  const eventId = String(op.eventId || op.id);
-  const selection = op.selection || op.action || op.market || '';
-  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+// Helper: Generar PICK normalizado para IDs consistentes entre UI y backend
+function normalizePick(obj = {}) {
+    if (obj.pick) return String(obj.pick).toLowerCase();
+
+    const actionStr = (obj.action || '').toUpperCase();
+    const selectionStr = (obj.selection || '').toUpperCase();
+    const marketStr = (obj.market || '').toUpperCase();
+    const combined = `${selectionStr} ${actionStr} ${marketStr}`;
+
+    if (selectionStr === 'HOME' || actionStr.includes('LOCAL')) return 'home';
+    if (selectionStr === 'AWAY' || actionStr.includes('VISITA')) return 'away';
+    if (selectionStr === 'DRAW' || actionStr.includes('EMPATE')) return 'draw';
+
+    if (combined.includes('BTTS') && (combined.includes('YES') || combined.includes('SI') || combined.includes('SÍ'))) return 'btts_yes';
+    if (combined.includes('BTTS') && combined.includes('NO')) return 'btts_no';
+
+    if (combined.includes('OVER') || combined.includes('MÁS') || combined.includes('MAS')) {
+        const line = parseFloat((selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/) || [0])[0]);
+        return `over_${Number.isNaN(line) ? 0 : line}`;
+    }
+
+    if (combined.includes('UNDER') || combined.includes('MENOS')) {
+        const line = parseFloat((selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/) || [0])[0]);
+        return `under_${Number.isNaN(line) ? 0 : line}`;
+    }
+
+    return String(obj.selection || obj.action || obj.market || '').replace(/\s+/g, '_');
 }
 
-function playAlert() {
+// Helper: Generar ID único por oportunidad (eventId + pick normalizado)
+function getOpportunityId(op) {
+    const eventId = String(op.eventId || op.id);
+    return `${eventId}_${normalizePick(op)}`;
+}
+
+const BOOKY_SETTLED_STATUSES = new Set([1, 2, 4, 8, 18]);
+
+const resolveBookyOutcome = (row = {}) => {
+    const status = Number(row?.status);
+    const stake = Number(row?.stake);
+    const payout = Number(row?.payout);
+    const potentialReturn = Number(row?.potentialReturn);
+
+    const safeStake = Number.isFinite(stake) ? stake : 0;
+    let returnAmount = 0;
+
+    if (Number.isFinite(payout) && payout > 0) {
+        returnAmount = payout;
+    } else if (Number.isFinite(potentialReturn) && potentialReturn > 0 && status === 1) {
+        returnAmount = potentialReturn;
+    } else if (status === 4 || status === 18) {
+        returnAmount = safeStake;
+    }
+
+    const pnl = returnAmount - safeStake;
+
+    if (status === 2) {
+        return { label: 'PERDIDA', pnl: -Math.abs(safeStake), colorClass: 'text-red-400' };
+    }
+    if (status === 4 || status === 18) {
+        return { label: 'ANULADA', pnl: 0, colorClass: 'text-slate-300' };
+    }
+    if (status === 8) {
+        return { label: 'CASHOUT', pnl, colorClass: pnl >= 0 ? 'text-emerald-400' : 'text-red-400' };
+    }
+    if (status === 1) {
+        return { label: 'GANADA', pnl, colorClass: pnl >= 0 ? 'text-emerald-400' : 'text-red-400' };
+    }
+
+    return { label: 'LIQUIDADA', pnl, colorClass: pnl >= 0 ? 'text-emerald-400' : 'text-red-400' };
+};
+
+const normalizeScoreText = (value) => {
+    if (typeof value !== 'string') return null;
+    const clean = value.trim();
+    if (!clean) return null;
+    if (clean.includes(':')) return clean.replace(':', '-');
+    return clean;
+};
+
+const resolveBookyFinalScore = (row = {}) => {
+    const fromSelectionRaw = row?.selections?.[0]?.raw?.eventScore;
+    const fromRawSelection = row?.raw?.selections?.[0]?.eventScore;
+    const fromRawRoot = row?.raw?.eventScore;
+    const fromDirect = row?.score;
+    return (
+        normalizeScoreText(fromSelectionRaw) ||
+        normalizeScoreText(fromRawSelection) ||
+        normalizeScoreText(fromRawRoot) ||
+        normalizeScoreText(fromDirect) ||
+        null
+    );
+};
+
+const resolveBookyGameTime = (row = {}) => {
+    const fromSelectionRaw = row?.selections?.[0]?.raw?.gameTime;
+    const fromRawSelection = row?.raw?.selections?.[0]?.gameTime;
+    if (typeof fromSelectionRaw === 'string' && fromSelectionRaw.trim()) return fromSelectionRaw.trim();
+    if (typeof fromRawSelection === 'string' && fromRawSelection.trim()) return fromRawSelection.trim();
+    return null;
+};
+
+const resolveBookyEventStartIso = (row = {}) => {
+    const fromSelection = row?.selections?.[0]?.eventDate;
+    const fromSelectionRaw = row?.selections?.[0]?.raw?.eventDate;
+    const fromRawSelection = row?.raw?.selections?.[0]?.eventDate;
+
+    const candidate = fromSelection || fromSelectionRaw || fromRawSelection || null;
+    const date = candidate ? new Date(candidate) : null;
+    return date && Number.isFinite(date.getTime()) ? date.toISOString() : null;
+};
+
+const resolveOpEventStartIso = (row = {}) => {
+    const candidate =
+        row?.matchDate ||
+        row?.eventDate ||
+        row?.selections?.[0]?.eventDate ||
+        row?.selections?.[0]?.raw?.eventDate ||
+        row?.raw?.selections?.[0]?.eventDate ||
+        row?.date ||
+        null;
+
+    const date = candidate ? new Date(candidate) : null;
+    return date && Number.isFinite(date.getTime()) ? date.toISOString() : null;
+};
+
+const resolveOpTicketId = (row = {}) => {
+    return (
+        row?.providerBetId ||
+        row?.realPlacement?.providerBetId ||
+        row?.realPlacement?.response?.bets?.[0]?.id ||
+        null
+    );
+};
+
+const resolveOpBetTimeIso = (row = {}, fallbackRow = null) => {
+    const candidate =
+        row?.placedAt ||
+        row?.createdAt ||
+        row?.confirmedAt ||
+        row?.updatedAt ||
+        row?.date ||
+        fallbackRow?.placedAt ||
+        fallbackRow?.createdAt ||
+        fallbackRow?.confirmedAt ||
+        fallbackRow?.updatedAt ||
+        fallbackRow?.date ||
+        null;
+
+    const date = candidate ? new Date(candidate) : null;
+    return date && Number.isFinite(date.getTime()) ? date.toISOString() : null;
+};
+
+const normalizeMarketLabel = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '1x2';
+
+    const normalized = raw
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (
+        normalized === 'match winner' ||
+        normalized === 'match result' ||
+        normalized === 'moneyline' ||
+        normalized === '1x2' ||
+        normalized === '1 x 2'
+    ) {
+        return '1x2';
+    }
+
+    return raw;
+};
+
+const resolveFinishedOpPnl = (op = {}) => {
+    if (op?.isBookyHistory) {
+        const outcome = resolveBookyOutcome(op);
+        return Number.isFinite(Number(outcome?.pnl)) ? Number(outcome.pnl) : 0;
+    }
+
+    const pnl = Number(op?.profit);
+    return Number.isFinite(pnl) ? pnl : 0;
+};
+
+function playAlert(kind = 'DEFAULT') {
   try {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) return;
     
     const ctx = new AudioContext();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
 
-    osc.connect(gain);
-    gain.connect(ctx.destination);
+        const playTone = ({
+            start,
+            duration,
+            fromFreq,
+            toFreq,
+            volume = 0.08,
+            type = 'sine'
+        }) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
 
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(500, ctx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(1000, ctx.currentTime + 0.1);
-    
-    gain.gain.setValueAtTime(0.1, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
 
-    osc.start();
-    osc.stop(ctx.currentTime + 0.5);
+            osc.type = type;
+            osc.frequency.setValueAtTime(fromFreq, ctx.currentTime + start);
+            osc.frequency.exponentialRampToValueAtTime(toFreq, ctx.currentTime + start + duration);
+
+            gain.gain.setValueAtTime(0.0001, ctx.currentTime + start);
+            gain.gain.exponentialRampToValueAtTime(volume, ctx.currentTime + start + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + start + duration);
+
+            osc.start(ctx.currentTime + start);
+            osc.stop(ctx.currentTime + start + duration + 0.02);
+        };
+
+        // Sonido estándar para LIVE_VALUE
+        if (kind === 'SNIPE') {
+            // Sonido más distintivo para LIVE_SNIPE (doble ping rápido y más agudo)
+            playTone({ start: 0, duration: 0.14, fromFreq: 780, toFreq: 1180, volume: 0.11, type: 'triangle' });
+            playTone({ start: 0.18, duration: 0.16, fromFreq: 980, toFreq: 1480, volume: 0.1, type: 'triangle' });
+        } else {
+            playTone({ start: 0, duration: 0.45, fromFreq: 500, toFreq: 1000, volume: 0.08, type: 'sine' });
+        }
+
+        // Cerrar contexto para evitar fugas
+        setTimeout(() => {
+            try { ctx.close(); } catch (_) {}
+        }, 900);
   } catch (e) {
     console.error("Audio play failed", e);
   }
@@ -50,6 +254,15 @@ function App() {
   const [liveOps, setLiveOps] = useState([]);
   const [prematchOps, setPrematchOps] = useState([]);
   const [portfolio, setPortfolio] = useState({ balance: 100, activeBets: [], history: [] });
+    const [bookyAccount, setBookyAccount] = useState({
+        profile: null,
+        integration: null,
+        balance: { amount: null, currency: 'PEN', stale: true },
+        history: [],
+        historyCount: 0,
+        fetchedAt: null
+    });
+    const [tokenHealth, setTokenHealth] = useState(null);
   
   const [loading, setLoading] = useState(false);
   
@@ -59,7 +272,7 @@ function App() {
 
   // Refs para control de notificaciones
   const isFirstLoad = useRef(true);
-  const prevLiveOpsLength = useRef(0);
+    const prevLiveOpsIdsRef = useRef(new Set());
   const prevOddsRef = useRef({}); // [NEW] Cache para detectar tendencias de cuotas
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
@@ -76,11 +289,31 @@ function App() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [liveRes, prematchRes, portfolioRes] = await Promise.all([
-        axios.get('/api/opportunities/live'),
-        axios.get('/api/opportunities/prematch'),
-        axios.get('/api/portfolio')
-      ]);
+            const [liveReq, prematchReq, portfolioReq, bookyReq] = await Promise.allSettled([
+                axios.get('/api/opportunities/live'),
+                axios.get('/api/opportunities/prematch'),
+                axios.get('/api/portfolio'),
+                axios.get('/api/booky/account?historyLimit=120')
+            ]);
+
+            if (bookyReq.status === 'fulfilled' && bookyReq.value?.data?.success) {
+                    setBookyAccount(bookyReq.value.data);
+            }
+
+            if (liveReq.status !== 'fulfilled' || prematchReq.status !== 'fulfilled' || portfolioReq.status !== 'fulfilled') {
+                    throw new Error('No se pudieron cargar los datos principales del dashboard.');
+            }
+
+            const liveRes = liveReq.value;
+            const prematchRes = prematchReq.value;
+            const portfolioRes = portfolioReq.value;
+
+            try {
+                    const tokenRes = await axios.get('/api/booky/token-health');
+                    if (tokenRes?.data?.success) setTokenHealth(tokenRes.data.token);
+            } catch (_) {
+                    setTokenHealth(null);
+            }
 
       // 1. First capture server active bets to use in filtering
       // Crear Set de IDs con formato único (eventId_selection) para filtrado granular
@@ -89,8 +322,7 @@ function App() {
           serverActiveBetIds = new Set(
               portfolioRes.data.activeBets.map(b => {
                   const eventId = String(b.eventId);
-                  const selection = b.selection || b.pick || '';
-                  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+                  return `${eventId}_${normalizePick(b)}`;
               })
           );
       }
@@ -163,8 +395,7 @@ function App() {
           const serverIds = new Set(
               serverActiveBets.map(b => {
                   const eventId = String(b.eventId);
-                  const selection = b.selection || b.pick || '';
-                  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+                  return `${eventId}_${normalizePick(b)}`;
               })
           );
           
@@ -237,22 +468,96 @@ function App() {
   useEffect(() => {
     if (isFirstLoad.current) {
         isFirstLoad.current = false;
-        prevLiveOpsLength.current = liveOps.length;
+        prevLiveOpsIdsRef.current = new Set(liveOps.map(op => getOpportunityId(op)));
         return;
     }
 
-    // Si hay más oportunidades que antes, sonó la campana
-    if (liveOps.length > prevLiveOpsLength.current) {
-        console.log("🔔 Nueva Oportunidad Detectada - Reproduciendo sonido...");
-        playAlert();
+    const currentIds = new Set(liveOps.map(op => getOpportunityId(op)));
+    const newOps = liveOps.filter(op => !prevLiveOpsIdsRef.current.has(getOpportunityId(op)));
+
+    if (newOps.length > 0) {
+        const hasSnipe = newOps.some(op => op.type === 'LIVE_SNIPE' || op.strategy === 'LIVE_SNIPE');
+        console.log(`🔔 ${newOps.length} Nueva(s) Oportunidad(es) Detectada(s) - Sonido: ${hasSnipe ? 'SNIPE' : 'DEFAULT'}`);
+        playAlert(hasSnipe ? 'SNIPE' : 'DEFAULT');
     }
 
-    prevLiveOpsLength.current = liveOps.length;
+    prevLiveOpsIdsRef.current = currentIds;
   }, [liveOps]);
 
-  const initialCapital = portfolio.initialCapital || 1000;
-  const totalProfit = portfolio.balance - initialCapital;
-  const profitClass = totalProfit >= 0 ? 'text-emerald-400' : 'text-red-400';
+    const realBalanceAmount = Number(bookyAccount?.balance?.amount);
+    const realBalanceCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
+    const activeBookyLabel = String(bookyAccount?.profile || bookyAccount?.integration || 'booky').toUpperCase();
+    const settledStatuses = new Set([1, 2, 4, 8, 18]);
+    const realBookyPnL = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : []).reduce((acc, row) => {
+        const status = Number(row?.status);
+        if (!Number.isFinite(status) || !settledStatuses.has(status)) return acc;
+
+        const stake = Number(row?.stake);
+        const payout = Number(row?.payout);
+        const potentialReturn = Number(row?.potentialReturn);
+
+        const safeStake = Number.isFinite(stake) ? stake : 0;
+        let returnAmount = 0;
+
+        if (Number.isFinite(payout) && payout > 0) {
+            returnAmount = payout;
+        } else if (Number.isFinite(potentialReturn) && potentialReturn > 0) {
+            returnAmount = potentialReturn;
+        } else if (status === 4 || status === 18) {
+            returnAmount = safeStake;
+        }
+
+        return acc + (returnAmount - safeStake);
+    }, 0);
+    const realBookyPnLClass = realBookyPnL >= 0 ? 'text-emerald-400' : 'text-red-400';
+    const tokenRemainingMinutes = Number(tokenHealth?.remainingMinutes);
+    const tokenProfile = String(tokenHealth?.profile || tokenHealth?.integration || '').toLowerCase();
+    const tokenRenewCommand = tokenProfile === 'acity'
+            ? 'npm run token:booky:acity:wait-close'
+            : tokenProfile === 'doradobet'
+                    ? 'npm run token:booky:dorado:wait-close'
+                    : (tokenHealth?.renewalCommand || 'npm run token:booky:wait-close');
+    const tokenHealthy = Boolean(
+            tokenHealth?.exists &&
+            tokenHealth?.jwtValid &&
+            tokenHealth?.authenticated &&
+            !tokenHealth?.expired &&
+            Number.isFinite(tokenRemainingMinutes) &&
+            tokenRemainingMinutes >= Number(tokenHealth?.minRequiredMinutes || 2)
+    );
+
+  const handleTokenRenewGuide = async () => {
+      try {
+          const renewRes = await axios.post('/api/booky/token/renew');
+          if (renewRes?.data?.success && renewRes?.data?.started) {
+              alert(
+                  '🚀 Se abrió Chrome automáticamente para renovar token.\n\n' +
+                  '1) Inicia sesión en Altenar\n' +
+                  '2) Navega por sportsbook\n' +
+                  '3) Cierra Chrome para completar captura\n\n' +
+                  `Perfil detectado: ${renewRes?.data?.profile || tokenProfile || 'desconocido'}`
+              );
+              return;
+          }
+      } catch (_) {}
+
+      try {
+          await navigator.clipboard.writeText(tokenRenewCommand);
+          alert(
+              '📋 Comando copiado al portapapeles.\n\n' +
+              `Pégalo en tu terminal:\n${tokenRenewCommand}\n\n` +
+              `Perfil detectado: ${tokenProfile || 'desconocido'}\n\n` +
+              '1) Inicia sesión en Chrome\n' +
+              '2) Navega por sportsbook\n' +
+              '3) Cierra Chrome para completar captura'
+          );
+      } catch (_) {
+          alert(
+              'No se pudo copiar automáticamente.\n\n' +
+              `Ejecuta manualmente:\n${tokenRenewCommand}`
+          );
+      }
+  };
 
   // --- MANUAL PLACEMENT ---
   const [processingBets, setProcessingBets] = useState(new Set());
@@ -272,25 +577,110 @@ function App() {
     forceUpdate(); // Forzar re-render inmediato para ocultarlo de la lista
 
     try {
-        const res = await axios.post('http://localhost:3000/api/portfolio/place-bet', opportunity);
-        if (res.data.success) {
-            // Sonido éxito
-            const audio = new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YU..."); 
-            // Mock sound, just UI Feedback needed
+        const tokenRes = await axios.get('/api/booky/token-health');
+        const token = tokenRes?.data?.token;
+        if (!tokenRes?.data?.success || !token?.authenticated || token?.expired) {
+            const reason = token?.expired ? 'token vencido' : 'token no autenticado';
+            alert(`⚠️ No se puede apostar en Booky: ${reason}. Renueva token y reintenta.`);
+            localPlacedBetIdsRef.current.delete(id);
+            delete pendingBetDetailsRef.current[id];
+            forceUpdate();
+            return;
+        }
+
+        const prepRes = await axios.post('/api/booky/prepare', opportunity);
+        if (!prepRes.data?.success || !prepRes.data?.ticket) {
+            alert(`⚠️ No se pudo preparar ticket: ${prepRes.data?.message || 'Error desconocido'}`);
+            localPlacedBetIdsRef.current.delete(id);
+            delete pendingBetDetailsRef.current[id];
+            forceUpdate();
+            return;
+        }
+
+        const ticket = prepRes.data.ticket;
+        const odd = Number(ticket?.opportunity?.price || ticket?.opportunity?.odd || 0);
+        const stake = Number(ticket?.opportunity?.kellyStake || 0);
+        const tokenMins = Number(token?.remainingMinutes || 0);
+
+        const ok = window.confirm(
+            `Apuesta REAL Booky\n\n` +
+            `Partido: ${ticket?.opportunity?.match || '-'}\n` +
+            `Selección: ${ticket?.opportunity?.selection || '-'}\n` +
+            `Cuota: ${odd.toFixed(2)}\n` +
+            `Stake: S/. ${stake.toFixed(2)}\n` +
+            `Token restante: ${tokenMins.toFixed(1)} min\n\n` +
+            `¿Confirmar envío REAL a Booky?`
+        );
+
+        if (!ok) {
+            await axios.post(`/api/booky/cancel/${ticket.id}`);
+            localPlacedBetIdsRef.current.delete(id);
+            delete pendingBetDetailsRef.current[id];
+            forceUpdate();
+            return;
+        }
+
+        const confirmRes = await axios.post(`/api/booky/real/confirm-fast/${ticket.id}`);
+        if (confirmRes.data?.success) {
+            const acceptedStakeRaw =
+                Number(confirmRes?.data?.ticket?.realPlacement?.accepted?.acceptedStake) ||
+                Number(confirmRes?.data?.providerResponse?.bets?.[0]?.finalStake) ||
+                Number(confirmRes?.data?.providerResponse?.bets?.[0]?.totalStake);
+            const hasAcceptedStake = Number.isFinite(acceptedStakeRaw) && acceptedStakeRaw > 0;
+            const stakeDelta = hasAcceptedStake ? Math.abs(acceptedStakeRaw - stake) : 0;
+
+            if (hasAcceptedStake && stakeDelta >= 0.01) {
+                alert(
+                    '⚠️ Apuesta REAL confirmada con ajuste de stake por Booky.\n\n' +
+                    `Stake solicitado: S/. ${stake.toFixed(2)}\n` +
+                    `Stake aceptado: S/. ${acceptedStakeRaw.toFixed(2)}\n\n` +
+                    'La casa puede aplicar mínimo/múltiplos por mercado.'
+                );
+            } else {
+                alert('✅ Apuesta REAL enviada y confirmada en Booky.');
+            }
+            await fetchData();
         } else {
-            alert("⚠️ " + res.data.message);
-            // Si falló, lo quitamos de la lista local para que reaparezca
+            if (confirmRes.data?.code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') {
+                const diagnostic = confirmRes.data?.diagnostic;
+                const diagText = diagnostic
+                    ? `\n\nDiagnóstico:\n` +
+                      `providerStatus: ${diagnostic.providerStatus ?? 'n/a'}\n` +
+                      `providerCode: ${diagnostic.providerCode ?? 'n/a'}\n` +
+                      `requestId: ${diagnostic.requestId ?? 'n/a'}`
+                    : '';
+                alert(`⚠️ Estado incierto: la casa pudo aceptar la apuesta.\nVerifica Open Bets antes de reintentar.${diagText}`);
+                await fetchData();
+                return;
+            }
+            const msg = confirmRes.data?.message || 'Error desconocido';
+            alert(`⚠️ Confirmación real falló: ${msg}`);
             localPlacedBetIdsRef.current.delete(id);
             delete pendingBetDetailsRef.current[id];
             forceUpdate();
         }
     } catch (error) {
         console.error(error);
-        alert("Error al conectar con el servidor.");
-        // Si falló, lo quitamos de la lista local
-        localPlacedBetIdsRef.current.delete(id);
-        delete pendingBetDetailsRef.current[id];
-        forceUpdate();
+                const apiData = error?.response?.data;
+                const msg = apiData?.message || error?.message || 'Error de red';
+                const code = apiData?.code;
+                const diagnostic = apiData?.diagnostic;
+                const diagText = diagnostic
+                        ? `\n\nDiagnóstico:\n` +
+                            `providerStatus: ${diagnostic.providerStatus ?? 'n/a'}\n` +
+                            `providerCode: ${diagnostic.providerCode ?? 'n/a'}\n` +
+                            `requestId: ${diagnostic.requestId ?? 'n/a'}`
+                        : '';
+                if (code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') {
+                    alert(`⚠️ Estado incierto: la casa pudo aceptar la apuesta.\nVerifica Open Bets antes de reintentar.${diagText}`);
+                    await fetchData();
+                } else {
+                    alert(`❌ Error de apuesta real: ${msg}${diagText}`);
+                    // Si falló de forma definitiva, lo quitamos de la lista local
+                    localPlacedBetIdsRef.current.delete(id);
+                    delete pendingBetDetailsRef.current[id];
+                    forceUpdate();
+                }
     } finally {
         setTimeout(() => {
              setProcessingBets(prev => {
@@ -376,6 +766,64 @@ function App() {
       setDateFilter(newDate);
   };
 
+  const getFinishedDataForSelectedDate = () => {
+        const settledBookyHistory = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
+            .filter(h => BOOKY_SETTLED_STATUSES.has(Number(h?.status)));
+
+        const bookyHistoryData = settledBookyHistory.map((h, idx) => ({
+            ...h,
+            id: h.ticketId || `booky_${idx}`,
+            date: h.placedAt || new Date().toISOString(),
+            isFinished: true,
+            isBookyHistory: true,
+            type: 'BOOKY_REAL',
+            finalScore: resolveBookyFinalScore(h),
+            liveTime: resolveBookyGameTime(h)
+        }));
+
+        if (bookyHistoryData.length > 0) {
+            return bookyHistoryData
+                .sort((a,b) => new Date(b.date) - new Date(a.date))
+                .filter(op => isSameDay(new Date(op.date), dateFilter));
+        }
+
+        const historyData = portfolio.history.map(h => ({
+            ...h,
+            date: h.matchDate || h.createdAt || h.date || h.closedAt,
+            isFinished: true
+        }));
+
+        const pendingFinishData = (portfolio.activeBets || []).filter(b => {
+             if (b.liveTime === 'Final' || b.liveTime === 'FT') return true;
+
+             const betTime = new Date(b.createdAt).getTime();
+             const minutesSinceBet = (Date.now() - betTime) / 60000;
+
+             if (b.liveTime) {
+                 const lastKnownMinute = parseInt(b.liveTime) || 0;
+                 const lastUpdate = new Date(b.lastUpdate || b.createdAt).getTime();
+                 const minutesSinceUpdate = (Date.now() - lastUpdate) / 60000;
+
+                 const estimatedCurrentMinute = lastKnownMinute + minutesSinceUpdate;
+                 if (estimatedCurrentMinute > 115) return true;
+                 if (lastKnownMinute > 85 && minutesSinceUpdate > 15) return true;
+             } else {
+                const eventStartTime = new Date(b.matchDate || b.createdAt).getTime();
+                const minutesSinceStart = (Date.now() - eventStartTime) / 60000;
+                if (minutesSinceStart > 140) return true;
+             }
+
+             return false;
+        }).map(b => ({
+            ...b,
+            date: b.createdAt,
+            manualStatus: 'WAIT_RES'
+        }));
+
+        const allFinished = [...pendingFinishData, ...historyData].sort((a,b) => new Date(b.date) - new Date(a.date));
+        return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
+  };
+
   const getFilteredData = () => {
     let data = [];
     
@@ -433,63 +881,7 @@ function App() {
         });
 
     } else if (activeTab === 'FINISHED') {
-        // 1. Historial Real (Ya liquidadas)
-        const historyData = portfolio.history.map(h => ({
-            ...h,
-            // [FIX] Priorizar fecha de creación/evento real sobre fecha de cierre/liquidación
-            // Para evitar que eventos viejos aparezcan en "Hoy" solo por haberse liquidado hoy.
-            date: h.matchDate || h.createdAt || h.date || h.closedAt, 
-            isFinished: true
-        }));
-
-        // 2. Activas "Maduras" (Probablemente finalizadas pero esperando API Results)
-        // Criterio Mejorado: Usar liveTime y lastUpdate para ser más agresivos moviendo a "Finalizados"
-        const pendingFinishData = (portfolio.activeBets || []).filter(b => {
-             // Si el estado es explícitamente finalizado, mover
-             if (b.liveTime === 'Final' || b.liveTime === 'FT') return true;
-
-             const betTime = new Date(b.createdAt).getTime();
-             const minutesSinceBet = (Date.now() - betTime) / 60000;
-             
-             // Si tiene liveTime (ej: "82'")
-             if (b.liveTime) {
-                 const lastKnownMinute = parseInt(b.liveTime) || 0;
-                 // Tiempo desde la última actualización (feed vivo)
-                 const lastUpdate = new Date(b.lastUpdate || b.createdAt).getTime();
-                 const minutesSinceUpdate = (Date.now() - lastUpdate) / 60000;
-
-                 // Si la última vez que lo vimos iba por el 15', 30'... es ACTIVE, no Finished.
-                 // Solo mover a Finished si:
-                 // A. Calculamos que ya pasó el minuto 105
-                 const estimatedCurrentMinute = lastKnownMinute + minutesSinceUpdate;
-                 // [FIX] Aumentar tolerancia para evitar mover partidos 90+ a finished prematuramente
-                 if (estimatedCurrentMinute > 115) return true;
-                 
-                 // B. Estaba en min 80+ y hace más de 12 min no actualiza (se acabó feed)
-                 // [FIX] Aumentar tolerancia de "feed perdido"
-                 if (lastKnownMinute > 85 && minutesSinceUpdate > 15) return true;
-             } else {
-                // Fallback para PreMatch o Snipes sin tiempo capturado
-                const eventStartTime = new Date(b.matchDate || b.createdAt).getTime();
-                const minutesSinceStart = (Date.now() - eventStartTime) / 60000;
-             
-                // Si pasaron más de 140 minutos desde el inicio
-                if (minutesSinceStart > 140) return true;
-             }
-
-             return false;
-        }).map(b => ({
-            ...b,
-            date: b.createdAt,
-            // Flag especial para que la tabla sepa renderizarlo diferente
-            manualStatus: 'WAIT_RES' 
-        }));
-
-        // Ordenar por fecha reciente
-        const allFinished = [...pendingFinishData, ...historyData].sort((a,b) => new Date(b.date) - new Date(a.date));
-        
-        // Filtro por fecha (solicitado por user)
-        return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
+        return getFinishedDataForSelectedDate();
     } else if (activeTab === 'MATCHER' || activeTab === 'MONITOR') {
         // Tab especial Manual Matcher / Monitor: No usamos filteredData, renderizaremos componente dedicado
         return [];
@@ -551,7 +943,12 @@ function App() {
     }
   };
 
-  const filteredOps = getFilteredData();
+    const filteredOps = getFilteredData();
+    const finishedTabCount = getFinishedDataForSelectedDate().length;
+
+    const finishedSubtotal = activeTab === 'FINISHED'
+        ? filteredOps.reduce((acc, op) => acc + resolveFinishedOpPnl(op), 0)
+        : 0;
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 p-6 font-sans text-sm">
@@ -567,44 +964,78 @@ function App() {
                 </div>
             </div>
 
-            <div className="flex gap-4 items-center bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-xl">
-                <div className="text-right border-r border-slate-700 pr-4">
-                    <p className="text-[10px] text-slate-500 uppercase font-bold">Capital Actual</p>
-                    <p className="text-2xl font-mono font-bold text-white flex items-center justify-end">
-                        <span className="text-base text-slate-500 mr-1">PEN</span>
-                        {portfolio.balance.toFixed(2)}
-                    </p>
+            <div className="flex flex-col gap-2">
+                <div className="flex gap-4 items-center bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-xl">
+                    <div className="text-right border-r border-slate-700 pr-4">
+                        <p className="text-[10px] text-slate-500 uppercase font-bold">Capital Actual</p>
+                        <p className="text-2xl font-mono font-bold text-white flex items-center justify-end">
+                            <span className="text-base text-slate-500 mr-1">{realBalanceCurrency}</span>
+                            {Number.isFinite(realBalanceAmount) ? realBalanceAmount.toFixed(2) : '--'}
+                        </p>
+                    </div>
+                    <div className="text-left pl-2">
+                        <p className="text-[10px] text-slate-500 uppercase font-bold">PnL Real ({activeBookyLabel})</p>
+                        <p className={`text-lg font-mono font-bold flex items-center ${realBookyPnLClass}`}>
+                            {realBookyPnL >= 0 ? '+' : ''}{realBookyPnL.toFixed(2)}
+                            <TrendingUp className="w-4 h-4 ml-1" />
+                        </p>
+                    </div>
+                    
+                    <div className="flex gap-1 ml-2 pl-4 border-l border-slate-700">
+                         <button 
+                            onClick={playAlert} 
+                            className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-amber-400 transition-colors"
+                            title="Probar Sonido"
+                        >
+                            <Volume2 className="w-4 h-4" />
+                        </button>
+                        <button 
+                            onClick={fetchData} 
+                            className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors relative"
+                            title="Actualizar Datos"
+                        >
+                            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-emerald-400' : ''}`} />
+                        </button>
+                        <button 
+                            onClick={resetPortfolio}
+                            className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-red-400 transition-colors"
+                            title="Resetear Simulación"
+                        >
+                            <RotateCcw className="w-4 h-4" />
+                        </button>
+                    </div>
                 </div>
-                <div className="text-left pl-2">
-                    <p className="text-[10px] text-slate-500 uppercase font-bold">PnL Total</p>
-                    <p className={`text-lg font-mono font-bold flex items-center ${profitClass}`}>
-                        {totalProfit >= 0 ? '+' : ''}{totalProfit.toFixed(2)}
-                        <TrendingUp className="w-4 h-4 ml-1" />
-                    </p>
-                </div>
-                
-                <div className="flex gap-1 ml-2 pl-4 border-l border-slate-700">
-                     <button 
-                        onClick={playAlert} 
-                        className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-amber-400 transition-colors"
-                        title="Probar Sonido"
-                    >
-                        <Volume2 className="w-4 h-4" />
-                    </button>
-                    <button 
-                        onClick={fetchData} 
-                        className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors relative"
-                        title="Actualizar Datos"
-                    >
-                        <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-emerald-400' : ''}`} />
-                    </button>
-                    <button 
-                        onClick={resetPortfolio}
-                        className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-red-400 transition-colors"
-                        title="Resetear Simulación"
-                    >
-                        <RotateCcw className="w-4 h-4" />
-                    </button>
+
+                <div className={`flex items-center justify-between px-3 py-2 rounded-lg border ${tokenHealthy ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                    <div className="flex items-center gap-2">
+                        <span className={`inline-block w-2 h-2 rounded-full ${tokenHealthy ? 'bg-emerald-400' : 'bg-amber-400'}`}></span>
+                        <span className="text-[11px] font-bold uppercase tracking-wide text-slate-200">Booky Token</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                        {!tokenHealthy && (
+                            <button
+                                onClick={handleTokenRenewGuide}
+                                className="px-2 py-1 rounded border border-amber-400/50 text-amber-300 hover:bg-amber-500/20 text-[10px] font-bold uppercase tracking-wide transition-colors"
+                                title="Copiar comando de renovación"
+                            >
+                                Renovar Token
+                            </button>
+                        )}
+                        <div className="text-right">
+                        <p className={`text-xs font-bold ${tokenHealthy ? 'text-emerald-300' : 'text-amber-300'}`}>
+                            {tokenHealthy ? 'Listo para apostar' : 'Renovar token'}
+                        </p>
+                        <p className="text-[10px] text-slate-500 uppercase tracking-wide">
+                            Perfil:{' '}
+                            <span className={`font-bold ${tokenProfile === 'acity' ? 'text-blue-300' : tokenProfile === 'doradobet' ? 'text-emerald-300' : 'text-slate-300'}`}>
+                                {tokenProfile ? tokenProfile.toUpperCase() : 'N/A'}
+                            </span>
+                        </p>
+                        <p className="text-[10px] text-slate-400 font-mono">
+                            {Number.isFinite(tokenRemainingMinutes) ? `${tokenRemainingMinutes.toFixed(1)} min` : 'sin datos'}
+                        </p>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -621,7 +1052,8 @@ function App() {
                     onClick={() => setActiveTab('ALL')}
                     className={`flex-1 py-4 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors ${activeTab === 'ALL' ? 'bg-slate-700 text-white border-b-2 border-emerald-500' : 'text-slate-500 hover:text-slate-300 hover:bg-slate-750'}`}
                 >
-                    <Layers className="w-4 h-4" /> Todos
+                    <Layers className="w-4 h-4" />
+                    Todos <span className="text-[10px] bg-slate-900 px-1.5 rounded-full text-slate-400" title="Oportunidades Pre-Match">{prematchOps.length}</span>
                 </button>
                 <button 
                     onClick={() => setActiveTab('LIVE')}
@@ -634,7 +1066,8 @@ function App() {
                     onClick={() => setActiveTab('FINISHED')}
                     className={`flex-1 py-4 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors ${activeTab === 'FINISHED' ? 'bg-slate-700 text-emerald-400 border-b-2 border-emerald-500' : 'text-slate-500 hover:text-emerald-300 hover:bg-slate-750'}`}
                 >
-                    <Archive className="w-4 h-4" /> Finalizados
+                    <Archive className="w-4 h-4" />
+                    Finalizados <span className="text-[10px] bg-slate-900 px-1.5 rounded-full text-slate-400">{finishedTabCount}</span>
                 </button>
                 <button 
                     onClick={() => setActiveTab('MATCHER')}
@@ -725,8 +1158,12 @@ function App() {
                                     const historyMatch = portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
                                     const activeMatch = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
                                     
-                                    const executionStatus = historyMatch ? 'FINISHED' : (activeMatch ? 'ACTIVE' : 'PENDING');
-                                    const betData = historyMatch || activeMatch || op; 
+                                    const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : (activeMatch ? 'ACTIVE' : 'PENDING'));
+                                    const betData = op.isBookyHistory ? op : (historyMatch || activeMatch || op);
+                                    const eventStartIso = op.isBookyHistory ? (resolveBookyEventStartIso(op) || resolveOpEventStartIso(op)) : resolveOpEventStartIso(op);
+                                    const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
+                                    const betTimeIso = resolveOpBetTimeIso(betData, op);
+                                    const marketLabel = normalizeMarketLabel(op.market);
 
                                     // Display Logic Fixes: Include Explicit Finish here
                                     const showFinished = executionStatus === 'FINISHED' || op.isFinished || isExplicitlyFinished;
@@ -748,6 +1185,9 @@ function App() {
                                                     <span className="font-mono font-bold text-white text-xs pl-0.5">
                                                         {op.lastKnownScore || op.pinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
                                                     </span>
+                                                    <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
+                                                        {new Date(eventStartIso || op.matchDate || op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                    </span>
                                                 </div>
                                             ) : showFinished ? (
                                                 <div className="flex flex-col gap-1">
@@ -760,7 +1200,7 @@ function App() {
                                                      </span>
                                                      {/* DATE BELOW SCORE */}
                                                      <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
-                                                        {new Date(op.matchDate || op.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                                                          {new Date(op.isBookyHistory ? (resolveBookyEventStartIso(op) || op.matchDate || op.date) : (op.matchDate || op.date)).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
                                                      </span>
                                                 </div>
                                             ) : (op.manualStatus === 'WAIT_RES' || minutesElapsed > 150) ? (
@@ -793,7 +1233,11 @@ function App() {
                                             {/* STRATEGY BADGE */}
                                             {(isLive || showFinished || executionStatus === 'FINISHED') && (
                                                 <div className="mb-1">
-                                                    {op.type === 'LIVE_VALUE' ? (
+                                                    {op.isBookyHistory ? (
+                                                        <span className="text-[9px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                            BOOKY
+                                                        </span>
+                                                    ) : op.type === 'LIVE_VALUE' ? (
                                                         <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
                                                             VALUE BET
                                                         </span>
@@ -809,11 +1253,27 @@ function App() {
                                                 </div>
                                             )}
                                             <div className="text-slate-200 font-bold text-sm text-wrap max-w-[200px] md:max-w-none">{op.match}</div>
-                                            <div className="text-slate-500 text-[10px] flex gap-2">
-                                                <span>{op.league}</span>
-                                                <span className="text-slate-600">|</span>
-                                                <span>{op.market || '1x2'}</span>
-                                            </div>
+                                            {(op.isBookyHistory || activeTab === 'LIVE' || ticketIdForRow) ? (
+                                                <div className="text-slate-500 text-[10px] flex gap-2 flex-wrap items-center">
+                                                    <span>{op.league || '-'}</span>
+                                                    <span className="text-slate-600">|</span>
+                                                    <span>{new Date(betTimeIso || op.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                                    {ticketIdForRow && (
+                                                        <>
+                                                            <span className="text-slate-600">|</span>
+                                                            <span>Ticket {ticketIdForRow}</span>
+                                                        </>
+                                                    )}
+                                                    <span className="text-slate-600">|</span>
+                                                    <span>{marketLabel}</span>
+                                                </div>
+                                            ) : (
+                                                <div className="text-slate-500 text-[10px] flex gap-2">
+                                                    <span>{op.league}</span>
+                                                    <span className="text-slate-600">|</span>
+                                                    <span>{marketLabel}</span>
+                                                </div>
+                                            )}
 
                                             {/* PRE-MATCH CONTEXT BADGES */}
                                             {(op.pinnacleInfo?.prematchContext) && (
@@ -953,7 +1413,7 @@ function App() {
                                                     <button 
                                                         onClick={(e) => { e.stopPropagation(); handlePlaceBet(op); }}
                                                         className="flex items-center gap-2 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/50 hover:border-emerald-400 text-emerald-100 rounded px-3 py-1.5 w-full justify-between transition-all group cursor-pointer shadow-[0_0_10px_rgba(16,185,129,0.1)] hover:shadow-[0_0_15px_rgba(16,185,129,0.3)] active:scale-95"
-                                                        title="Apostar ahora"
+                                                        title="Enviar apuesta real a Booky"
                                                     >
                                                         <span className="font-bold text-[10px] group-hover:text-white">APOSTAR</span>
                                                         <span className="font-mono font-bold text-sm">S/. {(op.kellyStake || 0).toFixed(2)}</span>
@@ -1001,23 +1461,50 @@ function App() {
                                                 </div>
                                             ) : (executionStatus === 'FINISHED' || op.isFinished) ? (
                                                 <div className="flex flex-col items-center justify-center p-1 rounded bg-slate-800/50 group relative">
-                                                    <span className={`font-bold text-xs ${betData.status === 'WON' ? 'text-emerald-400' : 'text-red-400'}`}>
-                                                        {betData.status === 'WON' ? 'GANADA' : 'PERDIDA'}
+                                                    <span className={`text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border mb-1 ${
+                                                        op.isBookyHistory
+                                                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                                            : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+                                                    }`}>
+                                                        {op.isBookyHistory ? 'BOOKY' : 'API'}
                                                     </span>
-                                                    <span className={`font-mono font-bold text-sm ${betData.profit > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                                                        {betData.profit > 0 ? '+' : ''}{betData.profit?.toFixed(2)}
-                                                    </span>
+                                                    {op.isBookyHistory ? (
+                                                        (() => {
+                                                            const outcome = resolveBookyOutcome(betData);
+                                                            return (
+                                                                <>
+                                                                    <span className={`font-bold text-xs ${outcome.colorClass}`}>
+                                                                        {outcome.label}
+                                                                    </span>
+                                                                    <span className={`font-mono font-bold text-sm ${outcome.colorClass}`}>
+                                                                        {outcome.pnl > 0 ? '+' : ''}{outcome.pnl.toFixed(2)}
+                                                                    </span>
+                                                                </>
+                                                            );
+                                                        })()
+                                                    ) : (
+                                                        <>
+                                                            <span className={`font-bold text-xs ${betData.status === 'WON' ? 'text-emerald-400' : 'text-red-400'}`}>
+                                                                {betData.status === 'WON' ? 'GANADA' : 'PERDIDA'}
+                                                            </span>
+                                                            <span className={`font-mono font-bold text-sm ${betData.profit > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                                                {betData.profit > 0 ? '+' : ''}{betData.profit?.toFixed(2)}
+                                                            </span>
+                                                        </>
+                                                    )}
 
                                                     {/* BOTONES DE CORRECCIÓN (HOVER) */}
-                                                    <div className="hidden group-hover:flex absolute inset-0 bg-slate-900/95 items-center justify-center gap-1 rounded z-10 border border-slate-700">
-                                                         <button 
-                                                            onClick={(e) => { e.stopPropagation(); requestSettle(betData.id, 'MANUAL'); }}
-                                                            className="p-1 hover:bg-amber-500/20 text-amber-400 rounded"
-                                                            title="Corregir Resultado"
-                                                         >
-                                                            <Edit className="w-3 h-3" />
-                                                         </button>
-                                                    </div>
+                                                    {!op.isBookyHistory && (
+                                                        <div className="hidden group-hover:flex absolute inset-0 bg-slate-900/95 items-center justify-center gap-1 rounded z-10 border border-slate-700">
+                                                             <button 
+                                                                onClick={(e) => { e.stopPropagation(); requestSettle(betData.id, 'MANUAL'); }}
+                                                                className="p-1 hover:bg-amber-500/20 text-amber-400 rounded"
+                                                                title="Corregir Resultado"
+                                                             >
+                                                                <Edit className="w-3 h-3" />
+                                                             </button>
+                                                        </div>
+                                                    )}
                                                 </div>
                                             ) : executionStatus === 'ACTIVE' ? (
                                                 <span className="text-[10px] text-amber-400 animate-pulse font-bold">EN JUEGO</span>
@@ -1052,7 +1539,13 @@ function App() {
                                         </div>
                                     </td>
                                     <td className="p-3 text-center text-xs text-slate-500">
-                                        {filteredOps.length} Ops
+                                        {activeTab === 'FINISHED' ? (
+                                            <div className={`font-mono font-bold px-2 py-1 rounded border w-fit mx-auto ${finishedSubtotal >= 0 ? 'bg-emerald-900/10 text-emerald-400 border-emerald-500/20' : 'bg-red-900/10 text-red-400 border-red-500/20'}`}>
+                                                S/. {finishedSubtotal >= 0 ? '+' : ''}{finishedSubtotal.toFixed(2)}
+                                            </div>
+                                        ) : (
+                                            `${filteredOps.length} Ops`
+                                        )}
                                     </td>
                                 </tr>
                             </tfoot>

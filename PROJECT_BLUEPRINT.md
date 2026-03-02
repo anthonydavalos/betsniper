@@ -1772,13 +1772,117 @@ Implementar funciones puras en `mathUtils.js` basadas en "Simultaneous Kelly Bet
 * **FASE 4:** Implementar cálculo de Kelly y EV en el backend.
 * **FASE 5:** Construir el Frontend en React que consuma `GET /api/opportunities`.
 ## 8. ACTUALIZACIONES V3.1 (Live-Trading V2)
-- **Extracción de Ligas (Altenar):** Implementado mapeo relacional de  y  para obtener nombres reales.
-- **Matching Estricto:** Se valida  para distinguir Femenino/Reservas.
-- **Snapshot de Cuotas:** Persistencia de  en el momento de la apuesta.
-- **Arcadia WS:** Integración de WebSockets/Puppeteer documentada como estándar para PULL de datos Pinnacle.
-
-## 8. ACTUALIZACIONES V3.1 (Live-Trading V2)
 - **Extracción de Ligas (Altenar):** Implementado mapeo relacional de `champs` y `categories` para obtener nombres reales.
 - **Matching Estricto:** Se valida `League Name` para distinguir Femenino/Reservas.
 - **Snapshot de Cuotas:** Persistencia de `pinnaclePrice` en el momento de la apuesta.
 - **Arcadia WS:** Integración de WebSockets/Puppeteer documentada como estándar para PULL de datos Pinnacle.
+
+---
+
+## 9. ACTUALIZACIONES V3.2 (Sprint: Booky Real + Matcher Diagnostics)
+
+### 9.1 MÓDULO: Booky Real Placement (Semi-Auto → Real Controlado)
+
+**Archivos:** `src/routes/booky.js`, `src/services/bookySemiAutoService.js`, `src/services/bookyAccountService.js`
+
+**Flujo de Operación:**
+1. Seleccionar perfil: `npm run book:dorado` o `npm run book:acity` (escribe vars en `.env`).
+2. Extraer JWT real: `npm run token:booky:wait-close` (Puppeteer captura token desde sesión autenticada).
+3. Preparar ticket: `POST /api/booky/prepare` (genera draft desde oportunidad).
+4. Verificar payload: `POST /api/booky/real/dryrun/:id` (construye `placeWidget` sin enviar).
+5. Confirmar apuesta: `POST /api/booky/real/confirm/:id` o `confirm-fast/:id` (con guardas activas).
+
+**Guardas de Seguridad (`enforceValueGuardsOrThrow`):**
+- JWT con vida restante ≥ `BOOKY_TOKEN_MIN_REMAINING_MINUTES` (default: 2 min).
+- EV del ticket ≥ `BOOKY_MIN_EV_PERCENT` (default: 2%).
+- Drop de cuota desde snapshot ≤ `BOOKY_MAX_ODD_DROP` (default: 20%).
+- `BOOKY_REAL_PLACEMENT_ENABLED=true` requerido (default: `false`).
+
+**Estado Incierto:** Si `placeWidget` devuelve timeout sin confirmación → `archiveUncertainRealPlacement()`. Verificar via `GET /api/booky/account?refresh=1` antes de reintentar.
+
+**Base de Bankroll Kelly (3 niveles de fallback):**
+```
+getKellyBankrollBase() → booky-real (balance real Altenar)
+                       → portfolio (paper trading NAV)
+                       → config.bankroll (valor estático)
+```
+
+**Estructura DB (`booky` en `db.json`):**
+```json
+{
+  "booky": {
+    "tickets": [],
+    "captures": [],
+    "byProfile": {
+      "doradobet": { "balance": null, "history": [], "lastSync": null },
+      "acity":     { "balance": null, "history": [], "lastSync": null }
+    }
+  }
+}
+```
+
+---
+
+### 9.2 MÓDULO: Scheduler Adaptativo Altenar Prematch
+
+**Archivo:** `src/services/altenarPrematchScheduler.js`
+
+**Objetivo:** Mantener datos prematch de Altenar actualizados sin saturar la API, priorizando eventos con mayor urgencia temporal o ya enlazados con Pinnacle.
+
+**Lógica de Prioridad:**
+- Score = `(1 / horasAlInicio) × factorEnlace × factorEV`
+- Eventos con inicio < 6h o ya enlazados con Pinnacle tienen frecuencia de refresco más alta.
+- Concurrencia máxima configurable (usa `p-limit`).
+- Backoff exponencial por errores de red (3 intentos, luego skip hasta próximo ciclo).
+
+**Integración en `server.js`:**
+```javascript
+import { startAltenarPrematchAdaptiveScheduler } from './src/services/altenarPrematchScheduler.js';
+// Al boot:
+startAltenarPrematchAdaptiveScheduler();
+```
+
+---
+
+### 9.3 MÓDULO: Matcher — Hot-Reload + Diagnósticos
+
+**Archivo:** `src/utils/teamMatcher.js`
+
+**Hot-Reload de Aliases (`src/utils/dynamicAliases.json`):**
+```json
+{
+  "Man City": "Manchester City",
+  "Liverpool Montevideo": "Liverpool FC"
+}
+```
+- Polling de `mtime` cada 30 segundos. Recarga sin reiniciar proceso.
+- Permite correcciones de nombre en producción sin downtime.
+
+**API de Diagnóstico (`diagnoseNoMatch`):**
+```javascript
+const diag = diagnoseNoMatch(teamName, startDate, candidates, league);
+// diag.probableReason: 'time_window_5m' | 'category_mismatch' | 'similarity_below_threshold' | ...
+// diag.bestScore: 0.0 - 1.0
+// diag.inWindow5: boolean (¿está dentro de ±5 min?)
+// diag.aliasApplied: string | null
+```
+
+**Razones de No-Match (codificadas):**
+| Razón | Descripción | Acción |
+|-------|-------------|--------|
+| `time_window_5m` | Candidatos existen pero fuera de ±5 min | Aumentar `MATCH_TIME_TOLERANCE_MINUTES` |
+| `time_window_exceeded` | Ningún candidato en ventana extendida | Verificar timezone o evento cancelado |
+| `category_mismatch` | Token de categoría incompatible (U21, (F), Res.) | Normal — rechazo válido |
+| `similarity_below_threshold` | Score fuzzy < umbral mínimo | Añadir alias en `dynamicAliases.json` |
+| `no_candidates` | Altenar no tiene el deporte/liga | Sin acción |
+
+**Variables de Entorno del Matcher:**
+```env
+MATCH_DIAGNOSTIC_LOG=1               # 0=off, 1=resumen ciclo, 2=verbose por evento
+MATCH_FUZZY_THRESHOLD=0.77           # Levenshtein similarity mínima [0.5–0.99]
+MATCH_MIN_ACCEPT_SCORE=0.60          # Score compuesto mínimo para aceptar match [0.4–0.9]
+MATCH_TIME_TOLERANCE_MINUTES=5       # Ventana primaria ±min [1–60]
+MATCH_TIME_EXTENDED_TOLERANCE_MINUTES=30  # Ventana secundaria ±min [10–120]
+```
+
+**Plantilla de Experimento A/B:** Ver `MATCH_DIAG_TEMPLATE.md` en la raíz del proyecto para protocolo de ajuste sistemático.

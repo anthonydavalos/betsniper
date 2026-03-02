@@ -7,10 +7,37 @@ const router = express.Router();
 
 // Helper: Generar ID único por oportunidad (eventId + selection)
 // Debe coincidir con la función del frontend
+function normalizePick(obj = {}) {
+  if (obj.pick) return String(obj.pick).toLowerCase();
+
+  const actionStr = (obj.action || '').toUpperCase();
+  const selectionStr = (obj.selection || '').toUpperCase();
+  const marketStr = (obj.market || '').toUpperCase();
+  const combined = `${selectionStr} ${actionStr} ${marketStr}`;
+
+  if (selectionStr === 'HOME' || actionStr.includes('LOCAL')) return 'home';
+  if (selectionStr === 'AWAY' || actionStr.includes('VISITA')) return 'away';
+  if (selectionStr === 'DRAW' || actionStr.includes('EMPATE')) return 'draw';
+
+  if (combined.includes('BTTS') && (combined.includes('YES') || combined.includes('SI') || combined.includes('SÍ'))) return 'btts_yes';
+  if (combined.includes('BTTS') && combined.includes('NO')) return 'btts_no';
+
+  if (combined.includes('OVER') || combined.includes('MÁS') || combined.includes('MAS')) {
+    const line = parseFloat((selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/) || [0])[0]);
+    return `over_${Number.isNaN(line) ? 0 : line}`;
+  }
+
+  if (combined.includes('UNDER') || combined.includes('MENOS')) {
+    const line = parseFloat((selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/) || [0])[0]);
+    return `under_${Number.isNaN(line) ? 0 : line}`;
+  }
+
+  return String(obj.selection || obj.action || obj.market || '').replace(/\s+/g, '_');
+}
+
 function getOpportunityId(op) {
   const eventId = String(op.eventId || op.id);
-  const selection = op.selection || op.action || op.market || '';
-  return `${eventId}_${selection.replace(/\s+/g, '_')}`;
+  return `${eventId}_${normalizePick(op)}`;
 }
 
 // POST /api/opportunities/discard

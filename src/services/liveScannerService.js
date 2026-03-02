@@ -1,8 +1,9 @@
 import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
-import { findMatch } from '../utils/teamMatcher.js'; // [NEW] Import Matcher
+import { findMatch, diagnoseNoMatch } from '../utils/teamMatcher.js'; // [NEW] Import Matcher
 import { getAllPinnacleLiveOdds } from './pinnacleService.js'; // [NEW] Static import for matcher fallback
+import { getKellyBankrollBase } from './bookyAccountService.js';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -11,6 +12,135 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Ajustamos path para que apunte a data/ en la RAIZ (../data desde src/services está mal, necesitamos ../../data)
 const STALE_TRIGGER_FILE = path.join(__dirname, '../../data/pinnacle_stale.trigger');
+
+const parseThresholdFromEnv = (rawValue, fallback, envName, sourceTag) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}="${rawValue}" no es numérico. Usando default ${fallback}.`);
+        return fallback;
+    }
+    if (parsed < 0) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}=${parsed} fuera de rango [0,1]. Se ajusta a 0.`);
+        return 0;
+    }
+    if (parsed > 1) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}=${parsed} fuera de rango [0,1]. Se ajusta a 1.`);
+        return 1;
+    }
+    return parsed;
+};
+
+const parseBooleanFromEnv = (rawValue, fallback = false, envName = 'ENV_FLAG', sourceTag = 'Config') => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const normalized = String(rawValue).trim().toLowerCase();
+    const truthy = new Set(['1', 'true', 'yes', 'on']);
+    const falsy = new Set(['0', 'false', 'no', 'off']);
+
+    if (truthy.has(normalized)) return true;
+    if (falsy.has(normalized)) return false;
+
+    console.warn(`⚠️ [${sourceTag}] ${envName}="${rawValue}" no es booleano válido. Usando default ${fallback}.`);
+    return fallback;
+};
+
+const ENABLE_MATCH_DIAGNOSTICS = parseBooleanFromEnv(
+    process.env.MATCH_DIAGNOSTIC_LOG,
+    false,
+    'MATCH_DIAGNOSTIC_LOG',
+    'LiveScanner'
+);
+const MATCHER_FUZZY_THRESHOLD = parseThresholdFromEnv(
+    process.env.MATCH_FUZZY_THRESHOLD,
+    0.77,
+    'MATCH_FUZZY_THRESHOLD',
+    'LiveScanner'
+);
+const MATCH_MIN_ACCEPT_SCORE = parseThresholdFromEnv(
+    process.env.MATCH_MIN_ACCEPT_SCORE,
+    0.6,
+    'MATCH_MIN_ACCEPT_SCORE',
+    'LiveScanner'
+);
+
+console.log(
+    `🔧 [MatcherConfig] diag=${ENABLE_MATCH_DIAGNOSTICS ? 1 : 0} ` +
+    `fuzzy=${MATCHER_FUZZY_THRESHOLD} minAccept=${MATCH_MIN_ACCEPT_SCORE}`
+);
+
+const normalizeMarketText = (value = '') => String(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+const tokenizeMarketText = (value = '') => normalizeMarketText(value).split(/\s+/).filter(Boolean);
+
+const extractLineFromText = (value = '') => {
+    const text = normalizeMarketText(value);
+    const match = text.match(/(\d+(?:\.\d+)?)/);
+    if (!match) return NaN;
+    const line = parseFloat(match[1]);
+    return Number.isFinite(line) ? line : NaN;
+};
+
+const flattenMarketOddIds = (market = {}) => {
+    if (Array.isArray(market.desktopOddIds)) return market.desktopOddIds.flat().filter(Boolean);
+    if (Array.isArray(market.oddIds)) return market.oddIds.filter(Boolean);
+    return [];
+};
+
+const isMatchTotalMarket = (market, eventName, oddsMap) => {
+    const n = normalizeMarketText(market?.name || '');
+    if (!n) return false;
+
+    const whitelist = ['total', 'over under', 'linea de gol', 'goals', 'goles'];
+    if (!whitelist.some(v => n.includes(v))) return false;
+
+    const forbidden = [
+        'corner', 'esquina', 'card', 'tarjeta', 'amarilla', 'roja', 'booking',
+        'half', 'mitad', 'tiempo', '1st', '2nd', '1er', '2do', 'primer', 'segundo',
+        'team', 'equipo', 'player', 'jugador', 'goleador', 'scorer',
+        'doble', 'chance', 'btts', 'both', 'ambos', 'marca',
+        'result', 'resultado', 'handicap', 'asian', 'asiatico', 'exact', 'range', 'rango',
+        'rest', 'odd even', 'par impar', 'winning', 'margin', 'margen',
+        '1x2', 'multi', 'escala', 'team total', 'total del equipo', 'total de equipo',
+        'goles del equipo', 'equipo total', 'equipo 1', 'equipo 2', 'home total', 'away total',
+        'local', 'visitante', 'home', 'away', 'casa', 'fuera', 'anota', 'score', 'porteria', 'arco'
+    ];
+    if (forbidden.some(word => n.includes(word))) return false;
+
+    const hasCompetitorBinding = Number.isFinite(Number(market?.competitorId)) ||
+        (Array.isArray(market?.competitorIds) && market.competitorIds.length > 0);
+    if (hasCompetitorBinding) return false;
+
+    const eventParts = String(eventName || '').split(/\s+vs\.?\s+/i);
+    const homeParts = tokenizeMarketText(eventParts[0] || '').filter(w => w.length >= 3);
+    const awayParts = tokenizeMarketText(eventParts[1] || '').filter(w => w.length >= 3);
+    const stopWords = new Set([
+        'fc', 'sc', 'cd', 'ca', 'club', 'de', 'la', 'el', 'los', 'al',
+        'united', 'city', 'real', 'sport', 'res', 'u21', 'u20', 'u19', 'women', 'femenino', 'b'
+    ]);
+    const teamTokens = [...new Set([...homeParts, ...awayParts].filter(t => !stopWords.has(t)))];
+
+    if (teamTokens.some(t => n.includes(t))) return false;
+
+    const oddTexts = flattenMarketOddIds(market)
+        .map(id => oddsMap.get(id))
+        .filter(Boolean)
+        .map(o => normalizeMarketText(o.name || ''));
+
+    if (oddTexts.some(txt => teamTokens.some(t => txt.includes(t)))) return false;
+
+    return true;
+};
 
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER"
@@ -116,7 +246,10 @@ export const getLiveOverview = async () => {
 export const getEventDetails = async (eventId) => {
     try {
         const { data } = await altenarClient.get('/GetEventDetails', {
-            params: { eventId }
+            params: {
+                eventId,
+                _: Date.now()
+            }
         });
         return data; // Retorna objeto completo con markets, odds, etc.
     } catch (error) {
@@ -223,6 +356,8 @@ const checkTurnaroundCondition = (liveEvent, pinnacleMatch) => {
  */
 export const scanLiveOpportunities = async (preFetchedEvents = null, options = { dryRun: false }) => {
     await initDB(); 
+    const bankrollBase = await getKellyBankrollBase();
+    const liveBankroll = bankrollBase.amount;
     const pinnacleDb = db.data.upcomingMatches || [];
     
     // ... (dryRun flag disponible para future usage si decidimos mover la lógica de apuesta aquí dentro) ...
@@ -235,6 +370,16 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
     // Usar eventos inyectados si existen, si no, buscar frescos
     const liveEvents = preFetchedEvents || await getLiveOverview();
     const opportunities = [];
+    const diagSummary = {
+        unmatched: 0,
+        awayFallbackMatches: 0,
+        reasons: new Map(),
+        bestScores: [],
+        nearThreshold: 0,
+        categoryMismatch: 0,
+        timeWindow5: 0,
+        strictAliasFlow: 0
+    };
 
     // [NEW] Cargar Pinnacle Live para Fallback (Matcher en caliente)
     let pinnacleLiveFeed = [];
@@ -253,19 +398,30 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
         // [FALLBACK] Intentar Match Dinámico si no hay link previo
         if (!pinMatch && pinnacleLiveFeed.length > 0) {
             const parts = (event.name || "").split(/ vs\.? /i);
-            const homeName = parts[0]; 
+            const homeName = (parts[0] || '').trim();
+            const awayName = (parts[1] || '').trim();
             
             if (homeName) {
                 // Usamos startDate del evento Altenar. Si es null, usamos ahora.
                 const targetDate = event.startDate || new Date().toISOString(); 
                 
                 // Buscamos coincidencia en el feed en vivo de Pinnacle
-                const matchResult = findMatch(homeName, targetDate, pinnacleLiveFeed, null, event.league); 
+                let matchResult = findMatch(homeName, targetDate, pinnacleLiveFeed, null, event.league);
+                let matchedWithAwayFallback = false;
 
-                if (matchResult && matchResult.score >= 0.6) { // Umbral razonable
-                     const m = matchResult.match;
-                     
-                     if (m && m.match) {
+                // Fallback inverso: si por home falla, intentamos con away.
+                if ((!matchResult || matchResult.score < MATCH_MIN_ACCEPT_SCORE) && awayName) {
+                    const reverseResult = findMatch(awayName, targetDate, pinnacleLiveFeed, null, event.league);
+                    if (reverseResult && reverseResult.score >= MATCH_MIN_ACCEPT_SCORE) {
+                        matchResult = reverseResult;
+                        matchedWithAwayFallback = true;
+                    }
+                }
+
+                if (matchResult && matchResult.score >= MATCH_MIN_ACCEPT_SCORE) { // Umbral razonable
+                    const m = matchResult.match;
+                    
+                    if (m && m.match) {
                         
                         // [FIX] Recuperación Inversa: Intentar buscar en DB (Prematch) usando el ID Dinámico
                         const dbMatch = pinnacleDb.find(pm => String(pm.id) === String(m.id));
@@ -284,7 +440,45 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                             };
                         }
                         // console.log(`   🔗 LIVE MATCHED: ${event.name} -> ${pinMatch.home} vs ${pinMatch.away}`);
-                     }
+                    }
+                }
+
+                if (pinMatch && matchedWithAwayFallback) {
+                    diagSummary.awayFallbackMatches++;
+                }
+
+                if (!pinMatch && ENABLE_MATCH_DIAGNOSTICS) {
+                    const homeDiag = diagnoseNoMatch(homeName, targetDate, pinnacleLiveFeed, event.league);
+                    const awayDiag = awayName
+                        ? diagnoseNoMatch(awayName, targetDate, pinnacleLiveFeed, event.league)
+                        : null;
+
+                    const bestDiag = awayDiag && (awayDiag.bestScore || 0) > (homeDiag.bestScore || 0)
+                        ? awayDiag
+                        : homeDiag;
+
+                    diagSummary.unmatched++;
+                    diagSummary.reasons.set(
+                        bestDiag.probableReason,
+                        (diagSummary.reasons.get(bestDiag.probableReason) || 0) + 1
+                    );
+                    if (typeof bestDiag.bestScore === 'number') {
+                        diagSummary.bestScores.push(bestDiag.bestScore);
+                        if (bestDiag.bestScore >= 0.70 && bestDiag.bestScore < MATCHER_FUZZY_THRESHOLD) {
+                            diagSummary.nearThreshold++;
+                        }
+                    }
+                    if (bestDiag.probableReason === 'category_mismatch') diagSummary.categoryMismatch++;
+                    if (String(bestDiag.probableReason || '').startsWith('time_window_')) diagSummary.timeWindow5++;
+                    if (bestDiag.probableReason === 'score_threshold_or_flow') diagSummary.strictAliasFlow++;
+
+                    console.log(
+                        `🧪 [MATCH_DIAG] ALT#${event.id} "${event.name}" -> reason=${bestDiag.probableReason} ` +
+                        `| in5=${bestDiag.inWindow5}/${bestDiag.totalCandidates} ` +
+                        `| catMismatch=${bestDiag.categoryMismatches5} ` +
+                        `| bestScore=${bestDiag.bestScore ?? 'n/a'} ` +
+                        `| bestCand="${bestDiag.bestCandidate?.name || 'n/a'}"`
+                    );
                 }
             }
         }
@@ -526,7 +720,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         const kellyResult = calculateKellyStake(
                             realProb, 
                             altenarOdd, 
-                            db.data.portfolio.balance || 100,
+                            liveBankroll || 100,
                             'LIVE_SNIPE'
                         );
                         
@@ -544,7 +738,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                                 time: pinMatch.time || event.liveTime, // [FIX] Prioritize Pin Time
                                 score: condition.currentScore,
                                 date: event.startDate, // Fecha de inicio real para la DB
-                                market: 'Match Winner', // [FIX] Explicit Market Name needed for oddsService
+                                market: '1x2', // Normalizado para consistencia de payload/API
                                 favorite: condition.favorite,
                                 selection: condition.side === 'home' ? 'Home' : 'Away',
                                 
@@ -608,11 +802,8 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         }
 
                         // Buscar mercado de Totales (Over/Under)
-                        // Altenar suele llamarlo "Total Goals", "Goals Over/Under", etc. typeId suele ser 2 o similar.
-                        const totalMarket = details.markets.find(m => 
-                            m.name.includes('Over/Under') || m.name.includes('Total Goals') || 
-                            m.name.includes('Total')
-                        );
+                        // [FIX] Filtrado Estricto para evitar Team Totals y Otros Props
+                        const totalMarket = details.markets.find(m => isMatchTotalMarket(m, event.name, oddsMap));
 
                         if (totalMarket) { // && totalMarket.odds REMOVED
                             // Relational Logic
@@ -621,10 +812,20 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                             // Filtrar por linea
                             // Muchos mercados están agrupados. Buscamos el odd que tenga line == goalValue.line
                             // Y que sea Over (Name match or typeId 12 approx)
-                            const overOdd = marketOddIds.map(id => oddsMap.get(id)).find(o => 
-                                o && Math.abs((o.line || totalMarket.line || 0) - goalValue.line) < 0.1 && 
-                                (o.name || "").toLowerCase().includes("over") 
-                            );
+                            const overOdd = marketOddIds
+                                .map(id => oddsMap.get(id))
+                                .filter(Boolean)
+                                .find(o => {
+                                    const oddName = normalizeMarketText(o.name || '');
+                                    const oddLine = Number.isFinite(Number(o.line))
+                                        ? Number(o.line)
+                                        : extractLineFromText(o.name || '');
+
+                                    if (!Number.isFinite(oddLine)) return false;
+
+                                    const isOverOdd = oddName.includes('over') || oddName.includes('mas');
+                                    return isOverOdd && Math.abs(oddLine - goalValue.line) < 0.1;
+                                });
 
                             if (overOdd) {
                                 realOdd = overOdd.price;
@@ -636,7 +837,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         const estimatedProb = 55; // Mantenemos prob fija por ahora (TODO: Calcular real based on Live Vig)
                         
                         // [FIX] Usar NAV (Net Asset Value) en lugar de Balance simple para evitar sub-inversión
-                        const currentNAV = (db.data.portfolio.balance || 0) + (db.data.portfolio.activeBets || []).reduce((acc, b) => acc + (b.stake || 0), 0);
+                        const currentNAV = liveBankroll || ((db.data.portfolio.balance || 0) + (db.data.portfolio.activeBets || []).reduce((acc, b) => acc + (b.stake || 0), 0));
                         
                         // [FIX] Pasar estrategia explícita 'LIVE_SNIPE' para usar el Risk Profile correcto (0.10)
                         const kRes = calculateKellyStake(
@@ -704,6 +905,57 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                 }
             }
         }
+    }
+
+    if (ENABLE_MATCH_DIAGNOSTICS && diagSummary.unmatched > 0) {
+        const scores = [...diagSummary.bestScores].sort((a, b) => a - b);
+        const getPercentile = (arr, p) => {
+            if (!arr.length) return null;
+            const idx = Math.min(arr.length - 1, Math.max(0, Math.floor((p / 100) * arr.length)));
+            return Number(arr[idx].toFixed(3));
+        };
+
+        const topReasons = [...diagSummary.reasons.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5)
+            .map(([reason, count]) => ({ reason, count }));
+
+        const nearThresholdRate = diagSummary.unmatched > 0
+            ? diagSummary.nearThreshold / diagSummary.unmatched
+            : 0;
+        const categoryMismatchRate = diagSummary.unmatched > 0
+            ? diagSummary.categoryMismatch / diagSummary.unmatched
+            : 0;
+
+        let recommendedFuzzyThreshold = MATCHER_FUZZY_THRESHOLD;
+        let recommendationReason = 'keep_current';
+
+        if (nearThresholdRate >= 0.45 && categoryMismatchRate < 0.40) {
+            recommendedFuzzyThreshold = 0.74;
+            recommendationReason = 'many_near_threshold_candidates';
+        } else if (nearThresholdRate >= 0.25 && categoryMismatchRate < 0.50) {
+            recommendedFuzzyThreshold = 0.75;
+            recommendationReason = 'moderate_near_threshold_candidates';
+        } else if (categoryMismatchRate >= 0.50) {
+            recommendationReason = 'category_mismatch_dominant';
+        }
+
+        console.log(`🧪 [MATCH_DIAG_SUMMARY] unmatched=${diagSummary.unmatched} | awayFallbackMatches=${diagSummary.awayFallbackMatches}`);
+        console.log(`🧪 [MATCH_DIAG_SUMMARY] topReasons=${JSON.stringify(topReasons)}`);
+        console.log(
+            `🧪 [MATCH_DIAG_SUMMARY] scoreStats=` +
+            JSON.stringify({
+                count: scores.length,
+                p50: getPercentile(scores, 50),
+                p75: getPercentile(scores, 75),
+                p90: getPercentile(scores, 90),
+                nearThresholdRate: Number((nearThresholdRate * 100).toFixed(1))
+            })
+        );
+        console.log(
+            `🧪 [MATCH_DIAG_RECOMMENDATION] fuzzyCurrent=${MATCHER_FUZZY_THRESHOLD} ` +
+            `fuzzySuggested=${recommendedFuzzyThreshold} reason=${recommendationReason}`
+        );
     }
     
     return opportunities;
