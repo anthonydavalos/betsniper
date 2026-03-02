@@ -25,6 +25,7 @@
 - [Interfaz de Usuario](#-interfaz-de-usuario-dashboard)
 - [API Endpoints](#-api-endpoints)
 - [Configuración Avanzada](#-configuración-avanzada)
+- [Guía de Scripts y Comandos](#-guía-de-scripts-y-comandos)
 - [Troubleshooting](#-troubleshooting)
 - [Roadmap](#-roadmap)
 
@@ -1265,7 +1266,311 @@ ops = ops.filter(op => op.kellyStake >= 1.00); // Cambiar a 0.50 para capturar m
 
 ---
 
-## 🚨 Troubleshooting
+## � Guía de Scripts y Comandos
+
+BetSniper incluye dos tipos de scripts: **comandos npm** (definidos en `package.json`, llamados con `npm run <nombre>`) y **scripts directos** (en `scripts/`, ejecutados con `node scripts/<archivo>.js`). Esta guía los organiza por función.
+
+---
+
+### 🧩 Comandos npm (package.json)
+
+#### Servidor Principal
+
+| Comando | Descripción |
+|---|---|
+| `npm start` | Arranca el servidor en modo producción (`node server.js`). Sin hot-reload. |
+| `npm run dev` | Arranca el servidor en modo desarrollo con **nodemon** (reinicia al guardar archivos). Recomendado para desarrollo. |
+
+---
+
+#### Gestión de Perfil Booky
+
+| Comando | Descripción |
+|---|---|
+| `npm run book:dorado` | Cambia el perfil activo a **DoradoBet** en `.env` (`BOOK_PROFILE`, `ALTENAR_INTEGRATION`, `ALTENAR_ORIGIN`, `ALTENAR_REFERER`). Sin reinicio de servidor. |
+| `npm run book:acity` | Cambia el perfil activo a **ACity** (Casino Atlantic City) en `.env`. Sin reinicio de servidor. |
+
+> Ejecutar siempre **antes** de capturar un token o hacer capture/spy, para que Puppeteer use el perfil correcto.
+
+---
+
+#### Extracción de Token JWT (Autenticación Booky)
+
+| Comando | Modo | Descripción |
+|---|---|---|
+| `npm run token:booky` | Headed + timeout auto | Abre Chrome con sesión visual. Captura JWT automáticamente tras detectar login. Cierra sol en timeout. |
+| `npm run token:booky:wait-close` | Headed + espera manual | Abre Chrome, captura JWT y **espera a que el usuario cierre la ventana** manualmente. Útil si el login requiere 2FA o captcha. |
+| `npm run token:booky:dorado` | DoradoBet + headed | Igual que `token:booky` pero fuerza perfil DoradoBet aunque `.env` diga otra cosa. |
+| `npm run token:booky:dorado:wait-close` | DoradoBet + manual | Combinación: perfil DoradoBet + espera manual de cierre. |
+| `npm run token:booky:acity` | ACity + headed | Fuerza perfil ACity. |
+| `npm run token:booky:acity:wait-close` | ACity + manual | ACity + espera manual. |
+
+**¿Qué hace internamente?**
+1. Lee `ALTENAR_BOOKY_URL`, `ALTENAR_LOGIN_USERNAME`, `ALTENAR_LOGIN_PASSWORD` del `.env`.
+2. Abre Puppeteer, navega al bookie, inicia sesión automáticamente.
+3. Intercepta la respuesta del servidor que contiene el JWT.
+4. Valida que sea un token de usuario autenticado (no guest).
+5. Escribe `ALTENAR_BOOKY_AUTH_TOKEN=Bearer eyJ...` en tu `.env`.
+
+**Output esperado:**
+```
+✅ Login detectado. Capturando JWT...
+🔑 JWT válido: usuario antho@ejemplo.com | Expira: 2026-03-03T14:22:00Z
+💾 Token escrito en .env
+```
+
+---
+
+#### Captura de Payload placeWidget
+
+Necesario para entender qué envía el bookie cuando colocas una apuesta real (para construir el payload del `confirmRealPlacement`).
+
+| Comando | Modo | Descripción |
+|---|---|---|
+| `npm run capture:booky` | Headed + perfil actual | Abre Chrome, navega al bookie, captura el payload `placeWidget`/betslip al hacer click en una apuesta. |
+| `npm run capture:booky:headless` | Headless | Igual pero sin ventana visible. |
+| `npm run capture:booky:dorado` | DoradoBet headed | ForZa perfil DoradoBet. |
+| `npm run capture:booky:dorado:headless` | DoradoBet headless | Fuerza DoradoBet sin ventana. |
+| `npm run capture:booky:acity` | ACity headed | Fuerza perfil ACity. |
+| `npm run capture:booky:acity:headless` | ACity headless | ACity sin ventana. |
+
+El payload capturado se guarda en `data/booky/capture-*.json` y queda disponible en `GET /api/booky/capture/latest`.
+
+---
+
+#### Spy de Historial y Perfil
+
+| Comando | Descripción |
+|---|---|
+| `npm run spy:altenar` | Auto-detecta parámetros de integración del bookie (integration, countryCode, baseUrl) interceptando tráfico real. Útil si el bookie cambia su configuración. Guarda en `data/altenar-profile-*.json`. |
+| `npm run spy:booky:history` | Abre Chrome (headed), navega al historial del bookie y captura las respuestas completas de los endpoints de balance e historial. Guarda en `data/booky/spy-history-*.json`. |
+| `npm run spy:booky:history:headless` | Igual que el anterior pero headless con timeout de 120 segundos. |
+
+---
+
+#### Smoke Test del Flujo Booky
+
+| Comando | Descripción |
+|---|---|
+| `npm run smoke:booky` | Ejecuta el flujo E2E completo en modo **seguro**: `token-health` → `account snapshot` → `prepare ticket` → `confirm-fast`. **No envía ninguna apuesta real** aunque `BOOKY_REAL_PLACEMENT_ENABLED=true`. |
+| `npm run smoke:booky:live` | Igual pero pasa por el path de placement real (requiere `BOOKY_REAL_PLACEMENT_ENABLED=true` y EV ≥ 0%). Usar solo para validar el flujo completo en ambiente controlado. |
+
+> **Recomendación:** ejecutar `npm run smoke:booky` después de cada renovación de token para confirmar que el sistema está operativo.
+
+---
+
+### 📥 Scripts de Ingesta Manual (`scripts/`)
+
+El servidor ejecuta estas ingestas automáticamente, pero puedes forzarlas manualmente:
+
+#### `node scripts/ingest-altenar.js`
+Actualiza el caché de eventos prematch de Altenar (DoradoBet) en `db.json`.
+- **Smart skip:** si los datos tienen menos de 100 minutos, omite la ingesta automáticamente.
+- **Forzar:** modifica la llamada internámente cambiando `force=true` o elimina `altenarLastUpdate` de `db.json`.
+- **Cuándo usarlo:** antes de una sesión de trading prematch para asegurar datos frescos.
+
+#### `node scripts/ingest-pinnacle.js`
+Descarga y normaliza eventos prematch de Pinnacle Arcadia (REST) en `db.json`.
+- Convierte cuotas americanas a decimales.
+- Calcula probabilidades Fair (sin vig).
+- **Cuándo usarlo:** una vez al día, o cada vez que quieras refrescar el caché prematch de Pinnacle.
+
+---
+
+### 🔍 Scripts de Scanner Manual
+
+#### `node scripts/scan_live.js [--dry-run]`
+Ejecuta el scanner live en modo standalone (fuera del servidor) con bucle de 60 segundos.
+- **`--dry-run` / `-d`:** modo observador — detecta oportunidades pero **no registra apuestas**. Usar siempre si el servidor ya está corriendo.
+- Sin `--dry-run`: registra apuestas en `db.json` (usar solo si el servidor está detenido).
+
+```bash
+# Modo observador (recomendado con servidor activo)
+node scripts/scan_live.js --dry-run
+
+# Modo activo (solo si el servidor está detenido)
+node scripts/scan_live.js
+```
+
+#### `node scripts/run_linker.js`
+Ejecuta el scanner prematch en modo standalone.
+- Lee `db.json` (cache de Pinnacle y Altenar).
+- Cruza eventos y muestra oportunidades prematch detectadas.
+- No registra apuestas. Solo diagnóstico.
+
+```bash
+node scripts/run_linker.js
+```
+
+---
+
+### 🦵 Scripts de Diagnóstico de Base de Datos
+
+#### `node scripts/check_db.js`
+Muestra un resumen rápido del estado de `db.json`: cantidad de registros en cada colección (pinnacle, matches, scanned_prematch, etc.).
+
+```bash
+node scripts/check_db.js
+# Output: Keys: ['config','upcomingMatches','portfolio',...]
+# Pinnacle Count: 142
+```
+
+#### `node scripts/find_match_in_db.js <termino>`
+Busca un equipo o partido en `db.json` y en `data/pinnacle_live.json` de forma recursiva.
+
+```bash
+node scripts/find_match_in_db.js "Liverpool"
+node scripts/find_match_in_db.js "Tigres"
+```
+
+#### `node scripts/find_live_match.js`
+Busca un partido específico en el feed live actual de Pinnacle (`data/pinnacle_live.json`).
+
+#### `node scripts/check_linked_status.js`
+Verifica el estado de linking de registros específicos en `db.json` (orientado a depurar por qué un partido concreto no se enlazó).
+
+#### `node scripts/check_odds.js`
+Muestra las cuotas almacenadas para un partido concreto, cruzando datos de Pinnacle y Altenar.
+
+#### `node scripts/check_mapping.js`
+Muestra entradas del diccionario `mappedTeams` en `db.json` para verificar alias guardados.
+
+#### `node scripts/generate_full_report.cjs`
+Genera un CSV completo (`reporte_completo_partidos.csv`) con todos los partidos de Pinnacle y Altenar, mostrando si están enlazados o no. Útil para auditar la calidad del matcher.
+
+```bash
+node scripts/generate_full_report.cjs
+# Crea: reporte_completo_partidos.csv
+```
+
+---
+
+### 🧹 Scripts de Mantenimiento de Portfolio
+
+#### `node scripts/reset_database.js`
+Restablece `db.json` a los valores por defecto (bankroll 100, historial vacío).
+> ⚠️ **Destructivo:** borra todo el historial y apuestas activas. Úsa solo en desarrollo o para empezar desde cero.
+
+```bash
+node scripts/reset_database.js
+```
+
+#### `node scripts/force_settle_bets.js`
+Liquida forzadamente apuestas activas que están atascadas en estado `PENDING`.
+- Consulta la API de resultados de Altenar (`GetEventResults`) para obtener el score final.
+- Aplica la lógica de ganancia/pérdida para cada tipo de pick (home, away, draw, over, under).
+- Útil cuando el Zombie Protocol no pudo liquidar automáticamente.
+
+```bash
+node scripts/force_settle_bets.js
+```
+
+#### `node scripts/purge_invalid_bets.cjs`
+Elimina manualmente apuestas con IDs de evento inválidos o corruptos de `db.json`.
+- Los IDs a purgar están listados en el propio script (`TARGET_IDS`).
+- Editar el array para añadir IDs si encuentras nuevas apuestas corruptas.
+
+```bash
+node scripts/purge_invalid_bets.cjs
+```
+
+#### `node scripts/fix_under_2_bets.cjs`
+Repara apuestas Under con línea `under_0` (línea mal parseada). Extrae la línea real del campo `market` y corrige el `pick`.
+
+```bash
+node scripts/fix_under_2_bets.cjs
+```
+
+#### `node scripts/migrate_bankroll.js`
+Escala el bankroll de `db.json` a un nuevo valor (por ejemplo de 1,000 a 10,000), aplicando el mismo factor a balance e historial proporcional.
+- Editar el valor `newCapital` dentro del script antes de ejecutar.
+
+```bash
+node scripts/migrate_bankroll.js
+```
+
+---
+
+### 🧪 Scripts de Testing y Mock
+
+#### `node scripts/mock_pinnacle.js`
+Genera un archivo `data/pinnacle_live.json` con datos ficticios (partidos de prueba como Man City vs Liverpool). Permite desarrollar y probar el scanner sin conexión real a Pinnacle.
+
+```bash
+node scripts/mock_pinnacle.js
+# Crea datos de prueba en data/pinnacle_live.json
+```
+
+#### `node scripts/tmp-run-booky-confirm.mjs`
+Ejecución directa de una confirmación de ticket booky para testing en caliente. Requiere editar el `ticketId` dentro del archivo antes de ejecutar.
+
+```bash
+node scripts/tmp-run-booky-confirm.mjs
+```
+
+---
+
+### 🐞 Scripts de Debug (Herramientas de Desarrollo)
+
+Scripts de diagnóstico genéricos. No forman parte del flujo normal de operación pero son útiles para investigar problemas en vivo:
+
+| Script | ¿Cuándo usarlo? |
+|---|---|
+| `debug_live.js` | Ver estructura cruda del feed Altenar live (`GetLivenow`) |
+| `debug_live_event.js` | Inspeccionar un evento live concreto con todos sus detalles |
+| `debug_live_markets.js` | Ver mercados disponibles (abiertos/cerrados) en un evento live |
+| `debug_live_names.js` | Ver nombres de equipos crudos tal como los devuelve Altenar |
+| `debug_live_odds.js` | Comparar cuotas Altenar vs Pinnacle en un evento live |
+| `debug_live_structure_v3.js` | Explorar la estructura JSON completa del endpoint live (versión actual) |
+| `debug_matching.js` | Depurar por qué un par de equipos concretos no se está vinculando |
+| `debug_matcher_specific.js` | Probar `findMatch()` con el cache de Pinnacle actual (`data/pinnacle_live.json`) |
+| `debug_full_scan.js` | Ejecutar un scan completo de oportunidades con logging máximo |
+| `debug_monitor_link.js` | Diagnosticar por qué el monitor no muestra cuotas de Arcadia (cuenta `linked` y `pinnacleFound`) |
+| `debug_pinnacle_structure.js` | Ver estructura cruda de la respuesta de Pinnacle Arcadia |
+| `debug_pinnacle_raw.js` | Ver respuesta HTTP raw de Pinnacle sin transformar |
+| `debug_pinnacle_endpoints.js` | Probar diferentes endpoints de Pinnacle (matchups, odds, etc.) |
+| `debug_pinnacle_markets.cjs` | Inspeccionar mercados disponibles en un evento de Pinnacle |
+| `debug_pinnacle_match_info.cjs` | Ver información completa (teams, odds, status) de un partido Pinnacle |
+| `debug_altenar_markets.js` | Inspeccionar los mercados (1X2, Totales, BTTS) de un evento Altenar |
+| `debug_totals_structure.js` | Ver estructura de mercados Over/Under para verificar la normalización |
+| `debug_scanner_v2.js` | Analizar el output del scanner paso a paso (versión actual) |
+| `audit_date.js` | **Auditoría histórica del portfolio:** consulta `GetEventResults`, compara el score final real con el registrado en `db.json`, corrige estados WON/LOST erróneos y ajusta el balance. Acepta fecha como argumento. |
+
+```bash
+# Diagnóstico de matching:
+node scripts/debug_matching.js
+node scripts/debug_matcher_specific.js
+
+# Diagnóstico de monitor/linking:
+node scripts/debug_monitor_link.js
+node scripts/debug_full_scan.js
+
+# Auditoría histórica del portfolio (corrige scores/estados):
+node scripts/audit_date.js 2026-03-01
+```
+
+---
+
+### 📊 Resumen rápido: ¿qué ejecutar en cada situación?
+
+| Situación | Comandos |
+|---|---|
+| **Arranque diario normal** | Terminal 1: `npm run dev` \| Terminal 2: `node services/pinnacleLight.js` \| Terminal 3: `cd client && npm run dev` |
+| **Cambiar de bookie** | `npm run book:acity` o `npm run book:dorado` |
+| **Renovar token JWT** | `npm run book:dorado` → `npm run token:booky:wait-close` |
+| **Verificar que todo funciona** | `npm run smoke:booky` |
+| **Ver oportunidades sin servidor activo** | `node scripts/scan_live.js --dry-run` |
+| **Forzar actualización datos prematch** | `node scripts/ingest-altenar.js` + `node scripts/ingest-pinnacle.js` |
+| **Apuesta atascada en PENDING** | `node scripts/force_settle_bets.js` |
+| **Matcher no vincula un equipo** | `node scripts/debug_matching.js` o `node scripts/debug_matcher_specific.js` → añadir alias en `dynamicAliases.json` |
+| **Score/resultado de apuesta incorrecto** | `node scripts/audit_date.js YYYY-MM-DD` (corrige estados en `db.json`) |
+| **Auditar calidad del matcher** | `node scripts/generate_full_report.cjs` |
+| **Reiniciar base de datos** | `node scripts/reset_database.js` |
+| **Testear sin Pinnacle real** | `node scripts/mock_pinnacle.js` → `npm run dev` |
+
+---
+
+## �🚨 Troubleshooting
 
 ### Problema: "Chromium no se cierra"
 
