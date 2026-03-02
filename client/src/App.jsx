@@ -1223,7 +1223,7 @@ function App() {
             )}
 
             {/* 3. CONTENIDO PRINCIPAL */}
-            <section className="bg-slate-800 rounded-b-xl border border-slate-700 border-t-0 overflow-hidden shadow-lg min-h-[400px]">
+            <section className="bg-slate-800 rounded-b-xl border border-slate-700 border-t-0 overflow-hidden shadow-lg min-h-100">
                 
                 {/* SI ESTAMOS EN MATCHER, RENDERIZAR COMPONENTE ESPECIAL */}
                 {activeTab === 'MATCHER' ? (
@@ -1381,7 +1381,7 @@ function App() {
                                                     ) : null}
                                                 </div>
                                             )}
-                                            <div className="text-slate-200 font-bold text-sm text-wrap max-w-[200px] md:max-w-none">{op.match}</div>
+                                            <div className="text-slate-200 font-bold text-sm text-wrap max-w-50 md:max-w-none">{op.match}</div>
                                             {(op.isBookyHistory || activeTab === 'LIVE' || ticketIdForRow) ? (
                                                 <div className="text-slate-500 text-[10px] flex gap-2 flex-wrap items-center">
                                                     <span>{op.league || '-'}</span>
@@ -1478,7 +1478,7 @@ function App() {
                                                         </div>
                                                     ) : (
                                                         // Si no hay cuota live, mostrar placeholder "OFF" discreto para mantener alineación
-                                                        <div className="px-2 py-1 rounded bg-slate-800/30 border border-slate-700/30 min-w-[60px] flex justify-center opacity-50">
+                                                        <div className="px-2 py-1 rounded bg-slate-800/30 border border-slate-700/30 min-w-15 flex justify-center opacity-50">
                                                             <span className="text-[8px] text-slate-600 font-bold">PIN OFF</span>
                                                         </div>
                                                     )}
