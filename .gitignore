@@ -13,6 +13,11 @@ yarn-error.log
 # Database
 db.json
 
+# Archivos con credenciales / runtime que nunca deben subirse
+data.txt
+src/config/pinnacle-creds.json
+src/config/pinnacle-creds.*.json
+
 # Runtime Data (Pinnacle WebSocket, Tokens, Stale Triggers)
 data/
 
