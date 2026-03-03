@@ -230,6 +230,103 @@ const normalizeMarketLabel = (value) => {
     return raw;
 };
 
+const resolveSelectionLabel = (row = {}) => {
+    const source = String(row?.selection || row?.action || '').trim();
+    let clean = source
+        .replace(/^BET\s+/i, '')
+        .replace(/^APOSTAR\s+A(L|\s+LA)?\s+/i, '')
+        .split('@')[0]
+        .trim();
+
+    const upper = clean.toUpperCase();
+    const actionUpper = String(row?.action || '').toUpperCase();
+
+    if (upper === 'HOME' || upper === 'LOCAL' || actionUpper.includes('LOCAL')) return 'LOCAL';
+    if (upper === 'AWAY' || upper === 'VISITA' || actionUpper.includes('VISITA')) return 'VISITA';
+    if (upper === 'DRAW' || upper === 'EMPATE' || actionUpper.includes('EMPATE')) return 'EMPATE';
+
+    if ((upper === 'OVER' || upper === 'UNDER') && String(row?.market || '').toUpperCase().includes('TOTAL')) {
+        const line = String(row?.market || '').match(/(\d+\.?\d*)/)?.[0];
+        if (line) clean = `${upper} ${line}`;
+        else clean = upper;
+    }
+
+    return clean || '-';
+};
+
+const resolveCanonicalSelectionLabel = (row = {}) => {
+    const marketLabel = normalizeMarketLabel(row?.market || '');
+    const marketNorm = String(marketLabel || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .trim();
+    const isOneXTwo = marketNorm === '1x2';
+
+    const rawSelection = String(resolveBookySelectionText(row) || row?.selection || '').trim();
+    const rawSelectionNorm = rawSelection
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .trim();
+
+    if (isOneXTwo && rawSelectionNorm) {
+        if (rawSelectionNorm.includes('draw') || rawSelectionNorm.includes('empate') || rawSelectionNorm === 'x') {
+            return 'EMPATE';
+        }
+
+        const matchText = String(row?.match || '').trim();
+        const teams = matchText.split(/\s+vs\.?\s+|\s+v\s+/i).map(t => t.trim()).filter(Boolean);
+        if (teams.length >= 2) {
+            const homeNorm = teams[0].toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+            const awayNorm = teams[1].toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+
+            if (rawSelectionNorm === homeNorm || rawSelectionNorm.includes(homeNorm)) return 'LOCAL';
+            if (rawSelectionNorm === awayNorm || rawSelectionNorm.includes(awayNorm)) return 'VISITA';
+        }
+
+        const selectionTypeId = Number(
+            row?.selectionTypeId ??
+            row?.selections?.[0]?.selectionTypeId ??
+            row?.raw?.selections?.[0]?.selectionTypeId
+        );
+
+        if (Number.isFinite(selectionTypeId)) {
+            if (selectionTypeId === 1) return 'LOCAL';
+            if (selectionTypeId === 2) return 'EMPATE';
+            if (selectionTypeId === 3) return 'VISITA';
+        }
+    }
+
+    const pick = String(normalizePick(row) || '').toLowerCase();
+
+    if (pick === 'home') return 'LOCAL';
+    if (pick === 'away') return 'VISITA';
+    if (pick === 'draw') return 'EMPATE';
+    if (pick === 'btts_yes') return 'BTTS SI';
+    if (pick === 'btts_no') return 'BTTS NO';
+
+    if (pick.startsWith('over_')) {
+        const line = pick.split('_')[1];
+        return line ? `OVER ${line}` : 'OVER';
+    }
+
+    if (pick.startsWith('under_')) {
+        const line = pick.split('_')[1];
+        return line ? `UNDER ${line}` : 'UNDER';
+    }
+
+    return resolveSelectionLabel(row);
+};
+
+const resolveBookySelectionText = (row = {}) => {
+    const rawSelection = row?.selections?.[0]?.name;
+    const directSelection = row?.selection;
+    const text = String(rawSelection || directSelection || '').trim();
+    if (!text) return null;
+    return text.replace(/^BET\s+/i, '').split('@')[0].trim();
+};
+
 const resolveFinishedOpPnl = (op = {}) => {
     if (op?.isBookyHistory) {
         const outcome = resolveBookyOutcome(op);
@@ -1340,6 +1437,15 @@ function App() {
                                     const showPrematchBadge =
                                         effectiveType === 'PREMATCH_VALUE' ||
                                         (typeUnknown && !hasLiveSignal);
+                                    const selectionCanonical = resolveCanonicalSelectionLabel(betData || op);
+                                    const selectionBookyRaw = op.isBookyHistory ? resolveBookySelectionText(betData || op) : null;
+                                    const selectionPrimary = selectionBookyRaw || selectionCanonical;
+                                    const showSelectionCanonicalHint = Boolean(
+                                        op.isBookyHistory &&
+                                        selectionBookyRaw &&
+                                        selectionCanonical &&
+                                        selectionBookyRaw.toUpperCase() !== selectionCanonical.toUpperCase()
+                                    );
                                     const displayOdd = Number(
                                         executionStatus === 'PENDING'
                                             ? (op?.price || op?.odd || 0)
@@ -1489,21 +1595,20 @@ function App() {
                                             )}
                                         </td>
                                         <td className="p-3 text-center">
-                                            <span className={`font-bold px-2 py-1 rounded border text-[10px] whitespace-nowrap ${
-                                                op.selection?.includes('Home') || op.action?.includes('LOCAL') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 
-                                                op.selection?.includes('Away') || op.action?.includes('VISITA') ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 
-                                                'bg-slate-700 text-slate-300 border-slate-600'
-                                            }`}>
-                                                {(() => {
-                                                    let sel = op.selection?.replace(/^BET\s+/i, '').split('@')[0].trim();
-                                                    // [MOD] Agregar línea de gol si es mercado Over/Under y falta en la selección
-                                                    if ((sel === 'Over' || sel === 'Under') && op.market?.includes('Total')) {
-                                                        const line = op.market.match(/(\d+\.?\d*)/)?.[0];
-                                                        if (line) sel += ` ${line}`;
-                                                    }
-                                                    return sel;
-                                                })()}
-                                            </span>
+                                            <div className="flex flex-col items-center gap-1">
+                                                <span className={`font-bold px-2 py-1 rounded border text-[10px] whitespace-nowrap ${
+                                                    selectionCanonical === 'LOCAL' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+                                                    selectionCanonical === 'VISITA' ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
+                                                    'bg-slate-700 text-slate-300 border-slate-600'
+                                                }`}>
+                                                    {selectionPrimary}
+                                                </span>
+                                                {showSelectionCanonicalHint && (
+                                                    <span className="text-[9px] text-slate-500 uppercase tracking-wide">
+                                                        {selectionCanonical}
+                                                    </span>
+                                                )}
+                                            </div>
                                         </td>
                                         <td className="p-3 text-center">
                                             <div className="flex flex-col gap-1.5 items-center justify-center">
