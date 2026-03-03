@@ -112,9 +112,12 @@ BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
 - **`src/services/pinnacleService.js`** — Agrega `getAllPinnaclePrematchOdds()` con cache-first y fallback a API.
 - **`services/pinnacleLight.js`** — Canal prematch separado guarda en `data/pinnacle_prematch.json`.
 - **`src/services/prematchScannerService.js`** — Upsert a DB con retry anti-lock (`EPERM/EBUSY`). Filtro consistente para excluir mercados de corners/cards/bookings/8-games. Ventana temporal PE (noche extendida hasta 06:00 del día siguiente).
+- **`src/services/prematchScannerService.js`** — Hardening de enlace prematch: ruptura de enlaces huérfanos, validación estricta de par home/away y persistencia robusta del `altenarId` sobre el registro canónico en `upcomingMatches`.
 - **`src/utils/teamMatcher.js`** — Tolerancia temporal migrada de hardcoded (20 min) a env var `MATCH_TIME_TOLERANCE_MINUTES` (default 5 min). Categoría mismatch ahora reconoce tokens `II`, `III`, `IV`, `Sub-17`, `Sub-20`.
+- **`src/utils/teamMatcher.js`** — Matching contextual reforzado por liga/país y normalización de categorías Women con variantes `fem.`, `femenino`, `femenina` para reducir `category_mismatch` falsos.
 - **`.env.example`** — Totalmente actualizado con todas las variables nuevas documentadas.
 - **`server.js`** — Boot integra `startAltenarPrematchAdaptiveScheduler()` y monta router `bookyRouter` en `/api/booky`.
+- **`client/src/components/ManualMatcher.jsx`** — Señal visual `SWAPPED RISK` para candidatos con local/visita invertidos.
 
 ### 🐛 Fixed
 
@@ -123,6 +126,7 @@ BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
 - Estabilidad del boot: umbrales del matcher con valor fuera de rango no generan error silencioso (ahora se loggea y hace clamp).
 - Frontend `Finalizados` de Booky: ahora usa estado liquidado del proveedor (`1,2,4,8,18`) como criterio principal, evitando ocultar tickets cerrados que llegan sin `liveTime`/`score`.
 - Botón de actualizar dashboard: forzado de sync remoto de Booky con `refresh=1` para reflejar liquidaciones inmediatamente en UI.
+- Auto-link prematch: bloqueado en escenarios `swapped` (home/away invertidos) para evitar enlaces peligrosos en mercados 1x2.
 
 ---
 
