@@ -477,14 +477,18 @@ function App() {
 
   // --- API CALLS ---
 
-  const fetchData = async () => {
+    const fetchData = async ({ forceBookyRefresh = false } = {}) => {
     setLoading(true);
     try {
+                        const bookyAccountUrl = forceBookyRefresh
+                                ? '/api/booky/account?refresh=1&historyLimit=120'
+                                : '/api/booky/account?historyLimit=120';
+
             const [liveReq, prematchReq, portfolioReq, bookyReq] = await Promise.allSettled([
                 axios.get('/api/opportunities/live'),
                 axios.get('/api/opportunities/prematch'),
                 axios.get('/api/portfolio'),
-                axios.get('/api/booky/account?historyLimit=120')
+                                axios.get(bookyAccountUrl)
             ]);
 
             if (bookyReq.status === 'fulfilled' && bookyReq.value?.data?.success) {
@@ -1021,8 +1025,7 @@ function App() {
 
   const getFinishedDataForSelectedDate = () => {
         const settledBookyHistory = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
-            .filter(h => BOOKY_SETTLED_STATUSES.has(Number(h?.status)))
-            .filter(h => isBookyMatchFinished(h));
+            .filter(h => BOOKY_SETTLED_STATUSES.has(Number(h?.status)));
 
         const bookyHistoryData = settledBookyHistory.map((h, idx) => ({
             ...h,
@@ -1244,7 +1247,7 @@ function App() {
                             <Volume2 className="w-4 h-4" />
                         </button>
                         <button 
-                            onClick={fetchData} 
+                            onClick={() => fetchData({ forceBookyRefresh: true })} 
                             className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors relative"
                             title="Actualizar Datos"
                         >
