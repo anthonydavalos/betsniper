@@ -167,14 +167,21 @@ export const ingestAltenarPrematch = async (force = false) => {
     const endOfToday = new Date();
     endOfToday.setHours(23, 59, 59, 999);
 
+    const nowMs = Date.now();
+    const NEAR_LIVE_GRACE_MS = 10 * 60 * 1000;
+
     const keptEvents = existingEvents.filter(oldEv => {
-        const oldDate = new Date(oldEv.startDate);
-        
-        // Criterio: Es de HOY y no ha sido reemplazado por la nueva data
-        const isToday = oldDate >= startOfToday && oldDate <= endOfToday;
-        const isReplaced = cleanEvents.some(newEv => newEv.id === oldEv.id);
-        
-        return isToday && !isReplaced;
+      const oldDate = new Date(oldEv.startDate);
+      const oldTs = oldDate.getTime();
+
+      // Criterio revisado:
+      // - Solo conservar eventos de HOY que YA iniciaron o están por iniciar en <= 10 min
+      // - Evitar mantener partidos futuros removidos por GetUpcoming (ghost prematch)
+      const isToday = oldDate >= startOfToday && oldDate <= endOfToday;
+      const isReplaced = cleanEvents.some(newEv => newEv.id === oldEv.id);
+      const isNearLiveOrPast = Number.isFinite(oldTs) && oldTs <= (nowMs + NEAR_LIVE_GRACE_MS);
+
+      return isToday && isNearLiveOrPast && !isReplaced;
     });
 
     console.log(`   ♻️  Preservando ${keptEvents.length} eventos Altenar previos (pasaron a Live/Recientes).`);

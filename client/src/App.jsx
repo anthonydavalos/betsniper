@@ -762,12 +762,14 @@ function App() {
 
   // --- MANUAL PLACEMENT ---
   const [processingBets, setProcessingBets] = useState(new Set());
+    const processingBetsRef = useRef(new Set());
 
   const handlePlaceBet = async (opportunity) => {
     const id = getOpportunityId(opportunity); // ID único por selección (eventId + selection)
     
-    // Evitar doble clic
-    if (processingBets.has(id)) return;
+        // Evitar doble clic (lock inmediato con ref para evitar race de setState)
+        if (processingBetsRef.current.has(id)) return;
+        processingBetsRef.current.add(id);
     
     // UI Optimista: Añadir a procesando
     setProcessingBets(prev => new Set(prev).add(id));
@@ -932,7 +934,13 @@ function App() {
                     alert(`⚠️ Estado incierto: la casa pudo aceptar la apuesta.\nVerifica Open Bets antes de reintentar.${diagText}`);
                     await fetchData();
                 } else {
+                    const normalizedMsg = String(msg || '').toLowerCase();
+                    if (normalizedMsg.includes('ticket no encontrado')) {
+                        alert('⚠️ El ticket ya no existe (posible doble clic o desincronización temporal).\nActualiza datos y vuelve a intentar con la oportunidad vigente.');
+                        await fetchData({ forceBookyRefresh: true });
+                    } else {
                     alert(`❌ Error de apuesta real: ${msg}${diagText}`);
+                    }
                     // Si falló de forma definitiva, lo quitamos de la lista local
                     localPlacedBetIdsRef.current.delete(id);
                     delete pendingBetDetailsRef.current[id];
@@ -940,6 +948,7 @@ function App() {
                 }
     } finally {
         setTimeout(() => {
+             processingBetsRef.current.delete(id);
              setProcessingBets(prev => {
                  const next = new Set(prev);
                  next.delete(id);
