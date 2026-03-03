@@ -15,6 +15,7 @@ const DEFAULT_BOOKY_CURRENCY = 'PEN';
 const DEFAULT_HISTORY_RETENTION_DAYS = 30;
 const DEFAULT_PROFILE_HISTORY_MAX_ITEMS = 500;
 const LEAGUE_MISS_LOG_THROTTLE_MS = 5 * 60 * 1000;
+const BOOKY_SETTLED_PROVIDER_STATUSES = new Set([1, 2, 4, 8, 18]);
 
 const memoryBalanceCacheByProfile = new Map();
 const memoryHistoryCacheByProfile = new Map();
@@ -361,6 +362,106 @@ const normalizeLeagueValue = (value) => {
     return value.name.trim();
   }
   return null;
+};
+
+const selectionTypeIdToPick = (selectionTypeId) => {
+  const id = Number(selectionTypeId);
+  if (!Number.isFinite(id)) return null;
+  if (id === 1) return 'home';
+  if (id === 2) return 'draw';
+  if (id === 3) return 'away';
+  return null;
+};
+
+const reconcilePortfolioActiveBetsFromRemote = (remoteRows = []) => {
+  const rows = Array.isArray(remoteRows) ? remoteRows : [];
+  const activeBets = Array.isArray(db.data?.portfolio?.activeBets) ? db.data.portfolio.activeBets : [];
+  if (rows.length === 0 || activeBets.length === 0) return 0;
+
+  const byProviderBetId = new Map();
+  const byEventPick = new Map();
+
+  for (const row of rows) {
+    const status = Number(row?.status);
+    if (BOOKY_SETTLED_PROVIDER_STATUSES.has(status)) continue;
+
+    const providerBetId = row?.providerBetId;
+    if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
+      byProviderBetId.set(String(providerBetId), row);
+    }
+
+    const eventId = Number(row?.eventId);
+    const firstSelection = Array.isArray(row?.selections) ? row.selections[0] : null;
+    const pick = selectionTypeIdToPick(firstSelection?.selectionTypeId);
+    if (Number.isFinite(eventId) && pick) {
+      byEventPick.set(`${eventId}_${pick}`, row);
+    }
+  }
+
+  if (byProviderBetId.size === 0 && byEventPick.size === 0) return 0;
+
+  let updates = 0;
+  for (const bet of activeBets) {
+    if (!bet || typeof bet !== 'object') continue;
+
+    const localProviderBetId = bet?.providerBetId;
+    const providerKey = (localProviderBetId !== null && localProviderBetId !== undefined && localProviderBetId !== '')
+      ? String(localProviderBetId)
+      : null;
+
+    let remote = providerKey ? byProviderBetId.get(providerKey) : null;
+    if (!remote) {
+      const eventId = Number(bet?.eventId);
+      const pick = String(bet?.pick || '').toLowerCase().trim();
+      if (Number.isFinite(eventId) && pick) {
+        remote = byEventPick.get(`${eventId}_${pick}`) || null;
+      }
+    }
+
+    if (!remote) continue;
+
+    const remoteOdd = Number(remote?.odd);
+    const remoteStake = Number(remote?.stake);
+    const remoteProviderBetId = remote?.providerBetId;
+
+    let changed = false;
+
+    if (Number.isFinite(remoteOdd) && remoteOdd > 1) {
+      if (Number(bet.odd) !== remoteOdd) {
+        bet.odd = remoteOdd;
+        changed = true;
+      }
+      if (Number(bet.price) !== remoteOdd) {
+        bet.price = remoteOdd;
+        changed = true;
+      }
+    }
+
+    if (Number.isFinite(remoteStake) && remoteStake > 0) {
+      if (Number(bet.stake) !== remoteStake) {
+        bet.stake = remoteStake;
+        changed = true;
+      }
+      if (Number(bet.kellyStake) !== remoteStake) {
+        bet.kellyStake = remoteStake;
+        changed = true;
+      }
+    }
+
+    if (remoteProviderBetId !== null && remoteProviderBetId !== undefined && remoteProviderBetId !== '') {
+      if (String(bet.providerBetId || '') !== String(remoteProviderBetId)) {
+        bet.providerBetId = remoteProviderBetId;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      bet.providerSyncedAt = nowIso();
+      updates += 1;
+    }
+  }
+
+  return updates;
 };
 
 const resolveLeagueNameFromCaches = ({ eventId, champId = null, catId = null, fallbackLeague = null } = {}) => {
@@ -976,6 +1077,11 @@ export const getBookyHistory = async (limit = 60) => {
 
   const remote = await syncRemoteBookyHistory({ forceRefresh: false, limit: max * 2, profileKey: ctx.key });
   const remoteRows = Array.isArray(remote?.items) ? remote.items : [];
+
+  const reconciledActiveBetsCount = reconcilePortfolioActiveBetsFromRemote(remoteRows);
+  if (reconciledActiveBetsCount > 0) {
+    await db.write();
+  }
 
   if (remoteRows.length === 0) {
     return localRows;
