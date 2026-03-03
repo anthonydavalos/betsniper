@@ -121,6 +121,8 @@ BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
 - Normalización de mercado `1x2` en payloads de oportunidades live (nombre normalizado vs display name causaba fallos de match de mercado).
 - Retry anti-lock de LowDB al escribir `pinnacle_prematch.json` en Windows (EPERM en escritura simultánea).
 - Estabilidad del boot: umbrales del matcher con valor fuera de rango no generan error silencioso (ahora se loggea y hace clamp).
+- Frontend `Finalizados` de Booky: ahora usa estado liquidado del proveedor (`1,2,4,8,18`) como criterio principal, evitando ocultar tickets cerrados que llegan sin `liveTime`/`score`.
+- Botón de actualizar dashboard: forzado de sync remoto de Booky con `refresh=1` para reflejar liquidaciones inmediatamente en UI.
 
 ---
 
