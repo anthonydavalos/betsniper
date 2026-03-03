@@ -327,6 +327,73 @@ const resolveBookySelectionText = (row = {}) => {
     return text.replace(/^BET\s+/i, '').split('@')[0].trim();
 };
 
+const normalizeLooseKey = (value) => {
+    return String(value || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+};
+
+const resolveBookyRowEventId = (row = {}) => {
+    const rawEventId =
+        row?.eventId ??
+        row?.selections?.[0]?.eventId ??
+        row?.selections?.[0]?.raw?.eventId ??
+        row?.raw?.eventId ??
+        row?.raw?.selections?.[0]?.eventId;
+
+    const value = Number(rawEventId);
+    return Number.isFinite(value) ? value : null;
+};
+
+const resolveBookyLiveMirrorForBet = (bet = {}, history = []) => {
+    if (!Array.isArray(history) || history.length === 0) return null;
+
+    const targetProviderBetId = String(
+        bet?.providerBetId ||
+        bet?.realPlacement?.providerBetId ||
+        ''
+    ).trim();
+
+    const targetEventId = Number(bet?.eventId);
+    const targetMatchKey = normalizeLooseKey(bet?.match || '');
+    const targetSelection = String(resolveCanonicalSelectionLabel(bet) || '').toUpperCase();
+
+    let best = null;
+    let bestScore = -1;
+
+    history.forEach(row => {
+        const status = Number(row?.status);
+        if (BOOKY_SETTLED_STATUSES.has(status)) return;
+
+        const rowProviderBetId = String(row?.providerBetId || row?.ticketId || '').trim();
+        if (targetProviderBetId && rowProviderBetId && targetProviderBetId === rowProviderBetId) {
+            best = row;
+            bestScore = 999;
+            return;
+        }
+        if (bestScore === 999) return;
+
+        const rowEventId = resolveBookyRowEventId(row);
+        const rowMatchKey = normalizeLooseKey(row?.match || row?.raw?.eventName || row?.selections?.[0]?.eventName || '');
+        const rowSelection = String(resolveCanonicalSelectionLabel(row) || '').toUpperCase();
+
+        let score = 0;
+        if (Number.isFinite(targetEventId) && Number.isFinite(rowEventId) && targetEventId === rowEventId) score += 6;
+        if (targetMatchKey && rowMatchKey && targetMatchKey === rowMatchKey) score += 4;
+        if (targetSelection && rowSelection && targetSelection === rowSelection) score += 3;
+
+        if (score > bestScore) {
+            bestScore = score;
+            best = row;
+        }
+    });
+
+    return bestScore >= 7 ? best : null;
+};
+
 const resolveFinishedOpPnl = (op = {}) => {
     if (op?.isBookyHistory) {
         const outcome = resolveBookyOutcome(op);
@@ -1449,7 +1516,21 @@ function App() {
                                     const activeMatch = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
                                     
                                     const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : (activeMatch ? 'ACTIVE' : 'PENDING'));
-                                    const betData = op.isBookyHistory ? op : (historyMatch || activeMatch || op);
+                                    const rawBetData = op.isBookyHistory ? op : (historyMatch || activeMatch || op);
+                                    const bookyLiveMirror = (!op.isBookyHistory && executionStatus === 'ACTIVE')
+                                        ? resolveBookyLiveMirrorForBet(rawBetData, bookyAccount?.history || [])
+                                        : null;
+                                    const mirrorStake = Number(bookyLiveMirror?.stake);
+                                    const mirrorOdd = Number(bookyLiveMirror?.odd || bookyLiveMirror?.price);
+                                    const betData = bookyLiveMirror
+                                        ? {
+                                            ...rawBetData,
+                                            stake: Number.isFinite(mirrorStake) && mirrorStake > 0 ? mirrorStake : rawBetData?.stake,
+                                            odd: Number.isFinite(mirrorOdd) && mirrorOdd > 1 ? mirrorOdd : rawBetData?.odd,
+                                            price: Number.isFinite(mirrorOdd) && mirrorOdd > 1 ? mirrorOdd : (rawBetData?.price || rawBetData?.odd),
+                                            providerBetId: bookyLiveMirror?.providerBetId || rawBetData?.providerBetId || null
+                                        }
+                                        : rawBetData;
                                     const eventStartIso = op.isBookyHistory ? (resolveBookyEventStartIso(op) || resolveOpEventStartIso(op)) : resolveOpEventStartIso(op);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
                                     const betTimeIso = resolveOpBetTimeIso(betData, op);
