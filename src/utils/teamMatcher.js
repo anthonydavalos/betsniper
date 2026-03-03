@@ -482,6 +482,38 @@ const extractCandidateHomeName = (raw = '') => {
     return raw.trim();
 };
 
+const escapeRegex = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const normalizeContextWithAliases = (value = '') => {
+    const base = normalizeName(value);
+    if (!base) return '';
+
+    let resolved = TEAM_ALIASES[base] || base;
+
+    const entries = Object.entries(TEAM_ALIASES)
+        .filter(([from, to]) => from && to && from !== to)
+        .sort((a, b) => b[0].length - a[0].length);
+
+    for (const [from, to] of entries) {
+        if (!from || !to) continue;
+        const regex = new RegExp(`(^|\\s)${escapeRegex(from)}($|\\s)`, 'g');
+        resolved = resolved.replace(regex, (m, p1, p2) => `${p1}${to}${p2}`);
+    }
+
+    return normalizeName(resolved);
+};
+
+const getContextSimilarityScore = (targetContext = '', candidateContext = '') => {
+    const t = normalizeContextWithAliases(targetContext);
+    const c = normalizeContextWithAliases(candidateContext);
+
+    if (!t || !c) return null;
+
+    const token = getTokenSimilarity(t, c);
+    const fuzzy = getSimilarity(t, c);
+    return Math.max(token, fuzzy);
+};
+
 const getTimeDiffMinutes = (dateStr1, dateStr2) => {
     const d1 = new Date(dateStr1).getTime();
     const d2 = new Date(dateStr2).getTime();
@@ -652,7 +684,7 @@ export const getTokenSimilarity = (name1, name2) => {
       // Lista de tokens peligrosos (sin espacios, validaremos con boundaries)
       // Separation: Tokens that can appear in League Name vs Tokens that must be in Team Name Only
       
-      const FULL_CONTEXT_TOKENS = ['u20', 'u19', 'u21', 'u23', 'reserve', 'reserves', 'res.', 'women', '(f)', 'fem', 'femenil'];
+    const FULL_CONTEXT_TOKENS = ['u20', 'u19', 'u21', 'u23', 'reserve', 'reserves', 'res.', 'women', '(f)', 'fem', 'fem.', 'femenil', 'femenino', 'femenina'];
       const TEAM_ONLY_TOKENS = ['ii', 'iii', 'b', '(a)']; // 'b' in league name is dangerous (Serie B)
 
       const allTokens = [...FULL_CONTEXT_TOKENS, ...TEAM_ONLY_TOKENS];
@@ -673,9 +705,18 @@ export const getTokenSimilarity = (name1, name2) => {
           
           if (tHas !== cHas) {
               // Excepción: Si uno es "Women" y el otro "(F)" se considera igual.
-              const isWomenVar = (token === 'women' || token === '(f)' || token === 'fem' || token === 'w' || token === 'femenil');
+              const isWomenVar = (
+                  token === 'women' ||
+                  token === '(f)' ||
+                  token === 'fem' ||
+                  token === 'fem.' ||
+                  token === 'femenil' ||
+                  token === 'femenino' ||
+                  token === 'femenina' ||
+                  token === 'w'
+              );
               if (isWomenVar) {
-                   const rWomen = /(^|\s|\()(women|femenil|\(f\)|fem|w)($|\s|\))/i;
+                   const rWomen = /(^|\s|\()(women|femenil|femenino|femenina|\(f\)|fem\.?|w)($|\s|\)|\.)/i;
                    // Re-evaluate with broad regex including League context for Target IF checkLeague is true (it is for women)
                    const tIsFem = rWomen.test(t) || rWomen.test(l);
                    const cIsFem = rWomen.test(c) || rWomen.test(lc);
@@ -761,6 +802,7 @@ export const getTokenSimilarity = (name1, name2) => {
     );
   
     const normTarget = normalizeName(targetTeamName);
+    const targetContextRaw = String(targetLeague || '');
     const aliasTarget = TEAM_ALIASES[normTarget]; 
     
     let bestMatch = null;
@@ -795,6 +837,12 @@ export const getTokenSimilarity = (name1, name2) => {
              continue;
         }
 
+        const candidateContextRaw = `${candidateLeagueRaw || ''} ${candidate.country || candidate.catName || ''}`.trim();
+        const contextScore = getContextSimilarityScore(targetContextRaw, candidateContextRaw);
+        const contextBonus = (contextScore === null)
+            ? 0
+            : Math.max(0, contextScore - 0.35) * 0.20;
+
         const normCandidate = normalizeName(candidateNameRaw);
         
         // A. Match Exacto (Resolución Completa de Aliases)
@@ -802,6 +850,9 @@ export const getTokenSimilarity = (name1, name2) => {
         const strictCand = TEAM_ALIASES[normCandidate] || normCandidate;
 
         if (strictTarget === strictCand) {
+            // Si ambos tienen contexto (liga/país), exigimos una similitud mínima contextual
+            // para evitar falsos positivos de nombres parecidos en países distintos.
+            if (contextScore !== null && contextScore < 0.12) continue;
             return { match: candidate, score: 1.0, method: 'alias_strict_resolved' };
         }
 
@@ -825,17 +876,19 @@ export const getTokenSimilarity = (name1, name2) => {
              // Si target es corto (1 palabra), requiere 100% de esa palabra (exactitud)
              // "Leon" vs "Leones" -> tokenScore bajo si no matchea plural.
              
-             if (tokenScore > highestScore) {
-                 highestScore = tokenScore;
-                 bestMatch = { match: candidate, score: tokenScore, method: 'token_match' };
+             const tokenFinalScore = Math.min(1, tokenScore + contextBonus);
+             if (tokenFinalScore > highestScore) {
+                 highestScore = tokenFinalScore;
+                 bestMatch = { match: candidate, score: tokenFinalScore, method: 'token_match' };
              }
         }
   
         // C. Levenshtein
         const score = getSimilarity(normTarget, normCandidate);
-        if (score > highestScore) {
-            highestScore = score;
-            bestMatch = { match: candidate, score: score, method: 'fuzzy' };
+        const fuzzyFinalScore = Math.min(1, score + contextBonus);
+        if (fuzzyFinalScore > highestScore) {
+            highestScore = fuzzyFinalScore;
+            bestMatch = { match: candidate, score: fuzzyFinalScore, method: 'fuzzy' };
         }
     }
   
@@ -870,6 +923,8 @@ export const getTokenSimilarity = (name1, name2) => {
              const cLeague = candidate.league || ""; 
              if (isCategoryMismatch(targetTeamName, cName, targetLeague, cLeague)) continue;
              const nCand = normalizeName(cName);
+             const cContext = `${cLeague || ''} ${candidate.country || candidate.catName || ''}`.trim();
+             const extContextScore = getContextSimilarityScore(targetContextRaw, cContext);
              
              // RESOLUCIÓN DE ALIAS DOBLE (Extended Window)
              const rTarget = TEAM_ALIASES[normTarget] || normTarget;
@@ -877,6 +932,7 @@ export const getTokenSimilarity = (name1, name2) => {
 
              // A. Match Exacto (Nombre Normalizado o Alias)
              if (rTarget === rCand) {
+                 if (extContextScore !== null && extContextScore < 0.12) continue;
                  return { match: candidate, score: 0.99, method: 'exact_extended_resolved' };
              }
         }

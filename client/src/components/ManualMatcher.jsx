@@ -2,6 +2,38 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { Search, Link, Unlink, RefreshCw, CheckCircle, AlertCircle, Clock } from 'lucide-react';
 
+const splitSides = (value = '') => {
+    const parts = String(value || '').split(/\s+vs\.?\s+/i);
+    return {
+        home: String(parts[0] || '').trim(),
+        away: String(parts[1] || '').trim()
+    };
+};
+
+const normalizeText = (value = '') => String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\(f\)|\(res\.?\)|\bu\d{2}\b|\bres\b|\breserves\b/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const isSwappedRisk = (pin = {}, alt = {}) => {
+    const pinHome = normalizeText(pin?.home || splitSides(pin?.match || '').home);
+    const pinAway = normalizeText(pin?.away || splitSides(pin?.match || '').away);
+    const altSides = splitSides(alt?.name || `${alt?.home || ''} vs ${alt?.away || ''}`);
+    const altHome = normalizeText(altSides.home);
+    const altAway = normalizeText(altSides.away);
+
+    if (!pinHome || !pinAway || !altHome || !altAway) return false;
+
+    const direct = pinHome === altHome && pinAway === altAway;
+    const swapped = pinHome === altAway && pinAway === altHome;
+
+    return swapped && !direct;
+};
+
 const ManualMatcher = () => {
     const [pinnacleData, setPinnacleData] = useState([]);
     const [altenarData, setAltenarData] = useState([]);
@@ -239,7 +271,14 @@ const ManualMatcher = () => {
                                         : 'bg-gray-700 border-gray-600 hover:bg-gray-600'
                                 }`}
                             >
-                                <div className="font-bold text-sm">{alt.name}</div>
+                                <div className="font-bold text-sm flex items-center gap-2">
+                                    <span>{alt.name}</span>
+                                    {selectedPin && isSwappedRisk(selectedPin, alt) && (
+                                        <span className="text-[10px] border border-amber-500 text-amber-300 bg-amber-500/10 px-1.5 py-0.5 rounded">
+                                            SWAPPED RISK
+                                        </span>
+                                    )}
+                                </div>
                                 <div className="text-xs text-gray-400 mt-1 flex justify-between">
                                     <span>{new Date(alt.date).toLocaleString()}</span>
                                     <span>{alt.league} {alt.country ? `(${alt.country})` : ''}</span>

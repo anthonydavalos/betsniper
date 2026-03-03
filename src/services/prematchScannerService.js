@@ -1,5 +1,5 @@
 import db from '../db/database.js';
-import { findMatch, isTimeMatch } from '../utils/teamMatcher.js';
+import { findMatch, isTimeMatch, normalizeName, getSimilarity, getTokenSimilarity, TEAM_ALIASES } from '../utils/teamMatcher.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { getAllPinnaclePrematchOdds } from './pinnacleService.js';
 import { getKellyBankrollBase } from './bookyAccountService.js';
@@ -73,6 +73,97 @@ const writeDbWithRetry = async (maxRetries = 12, waitMs = 300) => {
         }
     }
     return false;
+};
+
+const splitEventSides = (value = '') => {
+    const parts = String(value || '').split(/\s+vs\.?\s+/i);
+    return {
+        home: String(parts[0] || '').trim(),
+        away: String(parts[1] || '').trim()
+    };
+};
+
+const sideSimilarity = (a = '', b = '') => {
+    const naBase = normalizeName(a);
+    const nbBase = normalizeName(b);
+    const na = TEAM_ALIASES[naBase] || naBase;
+    const nb = TEAM_ALIASES[nbBase] || nbBase;
+    if (!na || !nb) return 0;
+    if (na === nb) return 1;
+    const token = getTokenSimilarity(na, nb);
+    const fuzzy = getSimilarity(na, nb);
+    return Math.max(token, fuzzy);
+};
+
+const analyzePairMatch = (pinMatch = {}, altenarEvent = {}) => {
+    const pinHome = pinMatch?.home || splitEventSides(pinMatch?.match || '').home;
+    const pinAway = pinMatch?.away || splitEventSides(pinMatch?.match || '').away;
+    const altSides = splitEventSides(altenarEvent?.name || '');
+
+    if (!pinHome || !pinAway || !altSides.home || !altSides.away) {
+        return {
+            valid: true,
+            orientation: 'unknown',
+            directScore: 0,
+            swappedScore: 0,
+            bestScore: 0
+        };
+    }
+
+    const directHome = sideSimilarity(pinHome, altSides.home);
+    const directAway = sideSimilarity(pinAway, altSides.away);
+    const swappedHome = sideSimilarity(pinHome, altSides.away);
+    const swappedAway = sideSimilarity(pinAway, altSides.home);
+
+    const directScore = Math.min(directHome, directAway);
+    const swappedScore = Math.min(swappedHome, swappedAway);
+    const bestPairScore = Math.max(directScore, swappedScore);
+
+    let orientation = 'none';
+    if (bestPairScore >= 0.72) {
+        orientation = swappedScore > directScore ? 'swapped' : 'direct';
+    }
+
+    return {
+        valid: bestPairScore >= 0.72,
+        orientation,
+        directScore,
+        swappedScore,
+        bestScore: bestPairScore
+    };
+};
+
+const buildCanonicalMatchKey = (home = '', away = '', date = '') => {
+    const nh = normalizeName(home);
+    const na = normalizeName(away);
+    const ts = new Date(date).getTime();
+    if (!nh || !na || !Number.isFinite(ts)) return null;
+    return `${nh}__${na}__${ts}`;
+};
+
+const applyLinkToDbMirror = (pinMatch = {}, altenarMatch = {}) => {
+    const rows = Array.isArray(db.data?.upcomingMatches) ? db.data.upcomingMatches : [];
+    if (!rows.length) return false;
+
+    const pinId = String(pinMatch?.id || '');
+    const targetKey = buildCanonicalMatchKey(pinMatch?.home, pinMatch?.away, pinMatch?.date);
+
+    let updated = false;
+    for (const row of rows) {
+        if (!row) continue;
+        const rowId = String(row?.id || '');
+        const rowKey = buildCanonicalMatchKey(row?.home, row?.away, row?.date);
+        const sameId = pinId && rowId && pinId === rowId;
+        const sameTuple = targetKey && rowKey && targetKey === rowKey;
+
+        if (sameId || sameTuple) {
+            row.altenarId = altenarMatch?.id ?? null;
+            row.altenarName = altenarMatch?.name || null;
+            updated = true;
+        }
+    }
+
+    return updated;
 };
 
 // =====================================================================
@@ -243,7 +334,7 @@ export const scanPrematchOpportunities = async () => {
         // Esto asegura que reportes y futuros análisis tengan la data cruzada.
         for (const pinMatch of pinnacleMatches) {
              let altenarEvent = null;
-               const dbMirror = dbPinnacleMatches.find(m => String(m.id) === String(pinMatch.id));
+                             const dbMirror = (db.data.upcomingMatches || []).find(m => String(m.id) === String(pinMatch.id));
 
              // RE-VALIDACIÓN ESTRICTA DE LINKS EXISTENTES 
              // (Crucial si cambiamos tolerancias de tiempo)
@@ -251,6 +342,21 @@ export const scanPrematchOpportunities = async () => {
                 altenarEvent = altenarCachedEvents.find(e => e.id === pinMatch.altenarId);
                 
                 if (altenarEvent) {
+                          const pairCheck = analyzePairMatch(pinMatch, altenarEvent);
+                          if (!pairCheck.valid || pairCheck.orientation === 'swapped') {
+                                 if (pairCheck.orientation === 'swapped') {
+                                     console.log(`   ⚠️ ENLACE OMITIDO (SWAPPED): ${pinMatch.home} vs ${pinMatch.away} <-> ${altenarEvent.name}`);
+                                 }
+                                 pinMatch.altenarId = null;
+                                 pinMatch.altenarName = null;
+                                 if (dbMirror) {
+                                     dbMirror.altenarId = null;
+                                     dbMirror.altenarName = null;
+                                 }
+                                 altenarEvent = null;
+                          }
+
+                          if (altenarEvent) {
                     // Si el evento existe, validamos que siga cumpliendo la tolerancia de tiempo actual (5 min)
                     // Si ya no cumple (ej. es un falso positivo de 6 horas), ROMPEMOS el enlace.
                     if (!isTimeMatch(pinMatch.date, altenarEvent.startDate || altenarEvent.date)) {
@@ -263,11 +369,16 @@ export const scanPrematchOpportunities = async () => {
                         }
                          altenarEvent = null;
                     }
+                          }
                 } else {
-                    // Si el evento enlazado ya no existe en el cache de Altenar, no podemos validarlo.
-                    // Lo dejamos (podria ser que Altenar borró el evento), o lo limpiamos?
-                    // Mejor mantenerlo si es solo que Altenar lo sacó del feed, pero para seguridad futura podriamos limpiarlo.
-                    // Por ahora: Mantener para no perder rastro de settled bets.
+                    // [FIX] Enlace huérfano: el evento Altenar ya no está en cache actual.
+                    // Rompemos el link para evitar ghost prematch y permitir relink limpio.
+                    pinMatch.altenarId = null;
+                    pinMatch.altenarName = null;
+                    if (dbMirror) {
+                        dbMirror.altenarId = null;
+                        dbMirror.altenarName = null;
+                    }
                 }
              }
 
@@ -276,14 +387,20 @@ export const scanPrematchOpportunities = async () => {
                 const leagueName = pinMatch.league ? pinMatch.league.name : '';
                 const matchResult = findMatch(pinMatch.home, pinMatch.date, altenarCachedEvents, pinMatch.homeId, leagueName);
                 if (matchResult) {
-                    pinMatch.altenarId = matchResult.match.id;  
-                    pinMatch.altenarName = matchResult.match.name; 
-                    if (dbMirror) {
-                        dbMirror.altenarId = matchResult.match.id;
-                        dbMirror.altenarName = matchResult.match.name;
+                    const pairCheck = analyzePairMatch(pinMatch, matchResult.match);
+                    if (pairCheck.valid && pairCheck.orientation === 'direct') {
+                        pinMatch.altenarId = matchResult.match.id;  
+                        pinMatch.altenarName = matchResult.match.name; 
+                        if (dbMirror) {
+                            dbMirror.altenarId = matchResult.match.id;
+                            dbMirror.altenarName = matchResult.match.name;
+                        }
+                        applyLinkToDbMirror(pinMatch, matchResult.match);
+                        newLinksCreated++;
+                        console.log(`   🔗 NUEVO ENLACE: ${pinMatch.home} (Pin) <--> ${matchResult.match.name} (Alt)`);
+                    } else if (pairCheck.valid && pairCheck.orientation === 'swapped') {
+                        console.log(`   ⚠️ NO LINK AUTO (SWAPPED): ${pinMatch.home} vs ${pinMatch.away} <-> ${matchResult.match.name}`);
                     }
-                    newLinksCreated++;
-                    console.log(`   🔗 NUEVO ENLACE: ${pinMatch.home} (Pin) <--> ${matchResult.match.name} (Alt)`);
                 }
              }
         }
