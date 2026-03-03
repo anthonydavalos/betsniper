@@ -453,6 +453,13 @@ function App() {
   // NAVEGACIÓN TIPO FLASHSCORE
   const [activeTab, setActiveTab] = useState('ALL'); // 'ALL', 'LIVE', 'FINISHED', 'MATCHER'
   const [dateFilter, setDateFilter] = useState(new Date());
+  const [finishedSelectionView, setFinishedSelectionView] = useState(() => {
+      try {
+          const stored = localStorage.getItem('finishedSelectionView');
+          if (stored === 'HYBRID' || stored === 'BOOKY' || stored === 'CANONICAL') return stored;
+      } catch (_) {}
+      return 'HYBRID';
+  }); // HYBRID | BOOKY | CANONICAL
 
   // Refs para control de notificaciones
   const isFirstLoad = useRef(true);
@@ -647,6 +654,12 @@ function App() {
     const interval = setInterval(fetchData, 2000); // UI Polling rapido (2s) para recibir data del backend
     return () => clearInterval(interval);
   }, []);
+
+    useEffect(() => {
+            try {
+                    localStorage.setItem('finishedSelectionView', finishedSelectionView);
+            } catch (_) {}
+    }, [finishedSelectionView]);
 
   // Effect para Notificaciones Sonoras (Nuevas Oportunidades Live)
   useEffect(() => {
@@ -1349,6 +1362,35 @@ function App() {
                 </div>
             )}
 
+            {activeTab === 'FINISHED' && (
+                <div className="bg-slate-800 border-b border-slate-700 px-3 py-2 flex items-center justify-end gap-2">
+                    <span className="text-[10px] uppercase tracking-wide text-slate-500 font-bold">Vista selección</span>
+                    <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
+                        <button
+                            onClick={() => setFinishedSelectionView('HYBRID')}
+                            className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors ${finishedSelectionView === 'HYBRID' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                            title="Texto Booky + hint canónico"
+                        >
+                            Híbrida
+                        </button>
+                        <button
+                            onClick={() => setFinishedSelectionView('BOOKY')}
+                            className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors border-l border-slate-700 ${finishedSelectionView === 'BOOKY' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                            title="Mostrar texto original de Booky"
+                        >
+                            Booky
+                        </button>
+                        <button
+                            onClick={() => setFinishedSelectionView('CANONICAL')}
+                            className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors border-l border-slate-700 ${finishedSelectionView === 'CANONICAL' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                            title="Mostrar selección normalizada"
+                        >
+                            Canónica
+                        </button>
+                    </div>
+                </div>
+            )}
+
             {/* 3. CONTENIDO PRINCIPAL */}
             <section className="bg-slate-800 rounded-b-xl border border-slate-700 border-t-0 overflow-hidden shadow-lg min-h-100">
                 
@@ -1439,13 +1481,23 @@ function App() {
                                         (typeUnknown && !hasLiveSignal);
                                     const selectionCanonical = resolveCanonicalSelectionLabel(betData || op);
                                     const selectionBookyRaw = op.isBookyHistory ? resolveBookySelectionText(betData || op) : null;
-                                    const selectionPrimary = selectionBookyRaw || selectionCanonical;
-                                    const showSelectionCanonicalHint = Boolean(
+                                    const selectionDiff = Boolean(
                                         op.isBookyHistory &&
                                         selectionBookyRaw &&
                                         selectionCanonical &&
                                         selectionBookyRaw.toUpperCase() !== selectionCanonical.toUpperCase()
                                     );
+                                    const isFinishedSelectionMode = activeTab === 'FINISHED' && op.isBookyHistory;
+                                    const selectionPrimary = isFinishedSelectionMode
+                                        ? (finishedSelectionView === 'BOOKY'
+                                            ? (selectionBookyRaw || selectionCanonical)
+                                            : finishedSelectionView === 'CANONICAL'
+                                                ? selectionCanonical
+                                                : (selectionBookyRaw || selectionCanonical))
+                                        : selectionCanonical;
+                                    const showSelectionCanonicalHint = isFinishedSelectionMode
+                                        ? (finishedSelectionView === 'HYBRID' && selectionDiff)
+                                        : false;
                                     const displayOdd = Number(
                                         executionStatus === 'PENDING'
                                             ? (op?.price || op?.odd || 0)
