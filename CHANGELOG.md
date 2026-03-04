@@ -132,7 +132,7 @@ BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
 
 ## [3.2.1] — UX Hardening: Latencia, Locks y Aliases
 
-> Commit: pendiente | Fecha: 2026-03-04
+> Commit: `23d7495` | Fecha: 2026-03-04
 
 ### 🐛 Fixed
 
