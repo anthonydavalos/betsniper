@@ -726,10 +726,23 @@ function App() {
             Number.isFinite(tokenRemainingMinutes) &&
             tokenRemainingMinutes >= Number(tokenHealth?.minRequiredMinutes || 2)
     );
+    const [tokenRenewing, setTokenRenewing] = useState(false);
+    const tokenRenewingRef = useRef(false);
 
   const handleTokenRenewGuide = async () => {
+      if (tokenRenewingRef.current) return;
+      tokenRenewingRef.current = true;
+      setTokenRenewing(true);
+
       try {
-          const renewRes = await axios.post('/api/booky/token/renew');
+          const renewRes = await axios.post('/api/booky/token/renew', undefined, { timeout: 3500 });
+          if (renewRes?.data?.busy) {
+              alert(
+                  '⏳ Ya hay una renovación iniciándose en segundo plano.\n\n' +
+                  'Si Chrome no aparece en ~10s, cierra ventanas de Chrome bloqueadas y reintenta.'
+              );
+              return;
+          }
           if (renewRes?.data?.success && renewRes?.data?.started) {
               alert(
                   '🚀 Se abrió Chrome automáticamente para renovar token.\n\n' +
@@ -757,6 +770,9 @@ function App() {
               'No se pudo copiar automáticamente.\n\n' +
               `Ejecuta manualmente:\n${tokenRenewCommand}`
           );
+      } finally {
+          tokenRenewingRef.current = false;
+          setTokenRenewing(false);
       }
   };
 
@@ -780,18 +796,13 @@ function App() {
     forceUpdate(); // Forzar re-render inmediato para ocultarlo de la lista
 
     try {
-        const tokenRes = await axios.get('/api/booky/token-health');
-        const token = tokenRes?.data?.token;
-        if (!tokenRes?.data?.success || !token?.authenticated || token?.expired) {
-            const reason = token?.expired ? 'token vencido' : 'token no autenticado';
-            alert(`⚠️ No se puede apostar en Booky: ${reason}. Renueva token y reintenta.`);
-            localPlacedBetIdsRef.current.delete(id);
-            delete pendingBetDetailsRef.current[id];
-            forceUpdate();
-            return;
-        }
+        // Optimización UX: no bloquear el flujo por token-health lento.
+        // El backend vuelve a validar token en confirmación real.
+        const tokenHealthPromise = axios
+            .get('/api/booky/token-health', { timeout: 3500 })
+            .catch(() => null);
 
-        const prepRes = await axios.post('/api/booky/prepare', opportunity);
+        const prepRes = await axios.post('/api/booky/prepare', opportunity, { timeout: 12000 });
         if (!prepRes.data?.success || !prepRes.data?.ticket) {
             alert(`⚠️ No se pudo preparar ticket: ${prepRes.data?.message || 'Error desconocido'}`);
             localPlacedBetIdsRef.current.delete(id);
@@ -801,6 +812,20 @@ function App() {
         }
 
         const ticket = prepRes.data.ticket;
+        const tokenRes = await tokenHealthPromise;
+        const token = tokenRes?.data?.token;
+        const tokenCheckAvailable = Boolean(tokenRes?.data?.success);
+
+        if (tokenCheckAvailable && (!token?.authenticated || token?.expired)) {
+            const reason = token?.expired ? 'token vencido' : 'token no autenticado';
+            await axios.post(`/api/booky/cancel/${ticket.id}`).catch(() => {});
+            alert(`⚠️ No se puede apostar en Booky: ${reason}. Renueva token y reintenta.`);
+            localPlacedBetIdsRef.current.delete(id);
+            delete pendingBetDetailsRef.current[id];
+            forceUpdate();
+            return;
+        }
+
         pendingBetDetailsRef.current[id] = {
             ...opportunity,
             ...(ticket?.opportunity || {})
@@ -810,6 +835,9 @@ function App() {
         const odd = Number(ticket?.opportunity?.price || ticket?.opportunity?.odd || 0);
         const stake = Number(ticket?.opportunity?.kellyStake || 0);
         const tokenMins = Number(token?.remainingMinutes || 0);
+        const tokenLine = tokenCheckAvailable
+            ? `Token restante: ${tokenMins.toFixed(1)} min\n\n`
+            : 'Token: verificación rápida no disponible (se validará al confirmar)\n\n';
 
         const ok = window.confirm(
             `Apuesta REAL Booky\n\n` +
@@ -817,7 +845,7 @@ function App() {
             `Selección: ${ticket?.opportunity?.selection || '-'}\n` +
             `Cuota: ${odd.toFixed(2)}\n` +
             `Stake: S/. ${stake.toFixed(2)}\n` +
-            `Token restante: ${tokenMins.toFixed(1)} min\n\n` +
+            tokenLine +
             `¿Confirmar envío REAL a Booky?`
         );
 
@@ -831,7 +859,7 @@ function App() {
 
         const isLiveSnipe = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase() === 'LIVE_SNIPE';
         const confirmMode = isLiveSnipe ? 'confirm-fast' : 'confirm';
-        const confirmRes = await axios.post(`/api/booky/real/${confirmMode}/${ticket.id}`);
+        const confirmRes = await axios.post(`/api/booky/real/${confirmMode}/${ticket.id}`, undefined, { timeout: 30000 });
         if (confirmRes.data?.success) {
             const sentStakeRaw =
                 Number(confirmRes?.data?.ticket?.realPlacement?.requested?.stake) ||
@@ -1281,10 +1309,11 @@ function App() {
                         {!tokenHealthy && (
                             <button
                                 onClick={handleTokenRenewGuide}
-                                className="px-2 py-1 rounded border border-amber-400/50 text-amber-300 hover:bg-amber-500/20 text-[10px] font-bold uppercase tracking-wide transition-colors"
+                                disabled={tokenRenewing}
+                                className={`px-2 py-1 rounded border text-[10px] font-bold uppercase tracking-wide transition-colors ${tokenRenewing ? 'border-amber-400/20 text-amber-200/60 bg-amber-500/10 cursor-not-allowed' : 'border-amber-400/50 text-amber-300 hover:bg-amber-500/20'}`}
                                 title="Copiar comando de renovación"
                             >
-                                Renovar Token
+                                {tokenRenewing ? 'Abriendo...' : 'Renovar Token'}
                             </button>
                         )}
                         <div className="text-right">
