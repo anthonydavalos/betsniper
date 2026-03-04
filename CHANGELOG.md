@@ -130,6 +130,43 @@ BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
 
 ---
 
+## [3.2.1] — UX Hardening: Latencia, Locks y Aliases
+
+> Commit: pendiente | Fecha: 2026-03-04
+
+### 🐛 Fixed
+
+#### `client/src/App.jsx` — Botón "Renovar Token"
+- **Bug crítico:** El botón quedaba bloqueado permanentemente en estado `"Abriendo..."` tras lanzar Chrome. Causa: dos `return` dentro del bloque `try` de `handleTokenRenewGuide` hacían que el `finally` (que libera `setTokenRenewing(false)`) nunca se ejecutara.
+- **Fix:** Eliminados los `return` prematuros; reemplazados por flags booleanos `launched` / `handledBusy`. El bloque `finally` ahora siempre corre, garantizando que `tokenRenewingRef.current = false` y `setTokenRenewing(false)` se ejecuten en cualquier escenario (éxito, busy, error, fallback de clipboard).
+- **Polling post-renovación:** Tras lanzar Chrome exitosamente, arranca un loop asíncrono independiente (12 iteraciones × 1 500 ms = máx. 18 s) que consulta `/api/booky/token-health` cada 1,5 s. En cuanto el token queda sano, actualiza la UI y fuerza `fetchData({ forceBookyRefresh: true })` → el indicador verde aparece segundos después de cerrar Chrome, sin esperar el ciclo de polling normal.
+
+#### `client/src/App.jsx` — Botón "Apostar" (`handlePlaceBet`)
+- Timeout de `prepare` aumentado de 12 000 ms a **25 000 ms** para cubrir escenarios donde Altenar tarda en responder (eventos internacionales como Liga Croacia/Dinamo Zagreb).
+- **Retry automático en timeout:** Si `prepare` falla por `ECONNABORTED` o mensaje `timeout`, espera 700 ms y reintenta una vez automáticamente, sin intervención del usuario.
+- **Mensaje específico de timeout:** En el catch del endpoint `confirm`, si el error contiene `"timeout"`, muestra aviso claro: *"La preparación del ticket tardó más de lo esperado. La cuota puede seguir vigente: intenta nuevamente en 2-3 segundos."*
+
+#### `client/src/components/ManualMatcher.jsx` — Locks de acción
+- **Anti-doble-click en linkeado:** Estado `linking` (boolean) bloquea el botón `CONFIRM LINK` durante toda la operación. Botón deshabilitado + spinner `<RefreshCw animate-spin>` + texto `"LINKEANDO..."` como feedback visual.
+- **Anti-doble-click en desvinculación:** Set `unlinkingIds` rastrea qué filas Pinnacle están procesando unlink. El ícono `<Unlink>` muestra `animate-pulse` y se deshabilita individualmente por fila mientras procesa.
+- **Timeout explícito:** 15 000 ms en `handleLink`, 10 000 ms en `handleUnlink`.
+- **Retry en timeout para link:** En `handleLink`, si el error es timeout (`ECONNABORTED`), espera 700 ms y reintenta una vez antes de lanzar error.
+- **`finally` garantizado:** Ambos handlers limpian su estado de lock en el bloque `finally`, evitando locks permanentes ante errores inesperados.
+
+### 📝 Updated
+
+#### `src/utils/dynamicAliases.json` — +55 aliases nuevos
+Añadidos aliases para equipos frecuentes en ligas de Europa, América Latina y Asia que generaban `similarity_below_threshold`:
+- Clubes alemanes (Dynamo Makhachkala, Wehen Wiesbaden, Rot Weiss Erfurt, Hertha Zehlendorf, Meuselwitz, Erzgebirge Aue, SCR Altach, Köln, SSV Ulm, etc.)
+- Clubes albaneses/balcánicos (Bylis Ballsh, Teuta Durrës, Dinamo Tirana, Macva Šabac, Dinamo Zagreb)
+- Clubes portugueses sub-23 (Sporting CP, Benfica, Braga)
+- Clubes italianos (US Livorno, Saronno, Baranzatese, Legnano, Cazzago Bornato, Castellana)
+- Clubes centroamericanos/latinoamericanos (Municipal Pérez Zeledón, Sport Sebacó, Real Oruro, Deportes Recoleta, Operario Ferroviario, DAC 1904 Dunajská Streda, Universitatea Craiova, Fortaleza Ceif, América Mineiro)
+- Países en español (Filipinas → Philippines, Republic of Korea → South Korea)
+- Otros (OFI Crete, Fundació Esportiva Grama, Tirol, Universidad de Chile)
+
+---
+
 ## [3.1.0] — Live-Trading V2 + Matcher Mejorado
 
 > Commit base: `a895644`

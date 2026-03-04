@@ -46,6 +46,8 @@ const ManualMatcher = () => {
 
     const [selectedPin, setSelectedPin] = useState(null);
     const [selectedAlt, setSelectedAlt] = useState(null);
+    const [linking, setLinking] = useState(false);
+    const [unlinkingIds, setUnlinkingIds] = useState(new Set());
 
     const fetchData = async () => {
         setLoading(true);
@@ -115,14 +117,30 @@ const ManualMatcher = () => {
     }, [selectedPin]);
 
     const handleLink = async () => {
-        if (!selectedPin || !selectedAlt) return;
+        if (!selectedPin || !selectedAlt || linking) return;
+
+        setLinking(true);
 
         try {
-            await axios.post('http://localhost:3000/api/matcher/link', {
+            const payload = {
                 pinnacleId: selectedPin.id,
                 altenarId: selectedAlt.id,
                 altenarName: selectedAlt.name
-            });
+            };
+
+            const doLink = () => axios.post('http://localhost:3000/api/matcher/link', payload, { timeout: 15000 });
+
+            try {
+                await doLink();
+            } catch (linkError) {
+                const linkMsg = String(linkError?.response?.data?.error || linkError?.message || '').toLowerCase();
+                const isTimeout = linkError?.code === 'ECONNABORTED' || linkMsg.includes('timeout');
+                if (!isTimeout) throw linkError;
+
+                await new Promise(resolve => setTimeout(resolve, 700));
+                await doLink();
+            }
+
             // Update local state locally to reflect change instantly
             setPinnacleData(prev => prev.map(p => {
                 if (p.id === selectedPin.id) {
@@ -135,13 +153,23 @@ const ManualMatcher = () => {
             setFilterAlt('');
         } catch (e) {
             alert("Error linking: " + e.message);
+        } finally {
+            setLinking(false);
         }
     };
 
     const handleUnlink = async (pinId) => {
+        if (unlinkingIds.has(pinId)) return;
         if (!confirm("¿Romper enlace?")) return;
+
+        setUnlinkingIds(prev => {
+            const next = new Set(prev);
+            next.add(pinId);
+            return next;
+        });
+
         try {
-            await axios.post('http://localhost:3000/api/matcher/unlink', { pinnacleId: pinId });
+            await axios.post('http://localhost:3000/api/matcher/unlink', { pinnacleId: pinId }, { timeout: 10000 });
              setPinnacleData(prev => prev.map(p => {
                 if (p.id === pinId) {
                     return { ...p, altenarId: null, altenarName: null };
@@ -150,6 +178,12 @@ const ManualMatcher = () => {
             }));
         } catch (e) {
              alert("Error unlinking: " + e.message);
+        } finally {
+            setUnlinkingIds(prev => {
+                const next = new Set(prev);
+                next.delete(pinId);
+                return next;
+            });
         }
     };
 
@@ -207,9 +241,10 @@ const ManualMatcher = () => {
                                     {pin.altenarId && (
                                         <button 
                                             onClick={(e) => { e.stopPropagation(); handleUnlink(pin.id); }}
-                                            className="text-red-400 hover:text-red-300"
+                                            disabled={unlinkingIds.has(pin.id)}
+                                            className={`text-red-400 hover:text-red-300 ${unlinkingIds.has(pin.id) ? 'opacity-50 cursor-not-allowed' : ''}`}
                                         >
-                                            <Unlink size={14} />
+                                            <Unlink size={14} className={unlinkingIds.has(pin.id) ? 'animate-pulse' : ''} />
                                         </button>
                                     )}
                                 </div>
@@ -302,13 +337,13 @@ const ManualMatcher = () => {
                                 disabled={!selectedPin || !selectedAlt}
                                 onClick={handleLink}
                                 className={`flex-1 py-3 rounded font-bold flex items-center justify-center gap-2 transition-all ${
-                                    !selectedPin || !selectedAlt 
+                                    !selectedPin || !selectedAlt || linking
                                         ? 'bg-gray-700 text-gray-500 border border-gray-600 cursor-not-allowed' 
                                         : 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-900/50'
                                 }`}
                             >
-                                <Link size={20} />
-                                CONFIRM LINK
+                                {linking ? <RefreshCw size={20} className="animate-spin" /> : <Link size={20} />}
+                                {linking ? 'LINKEANDO...' : 'CONFIRM LINK'}
                             </button>
                         </div>
                     </div>

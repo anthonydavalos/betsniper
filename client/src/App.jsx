@@ -734,16 +734,21 @@ function App() {
       tokenRenewingRef.current = true;
       setTokenRenewing(true);
 
+      let launched = false;
+      let handledBusy = false;
+
       try {
           const renewRes = await axios.post('/api/booky/token/renew', undefined, { timeout: 3500 });
           if (renewRes?.data?.busy) {
+              handledBusy = true;
               alert(
                   '⏳ Ya hay una renovación iniciándose en segundo plano.\n\n' +
                   'Si Chrome no aparece en ~10s, cierra ventanas de Chrome bloqueadas y reintenta.'
               );
-              return;
           }
-          if (renewRes?.data?.success && renewRes?.data?.started) {
+
+          if (!handledBusy && renewRes?.data?.success && renewRes?.data?.started) {
+              launched = true;
               alert(
                   '🚀 Se abrió Chrome automáticamente para renovar token.\n\n' +
                   '1) Inicia sesión en Altenar\n' +
@@ -751,28 +756,58 @@ function App() {
                   '3) Cierra Chrome para completar captura\n\n' +
                   `Perfil detectado: ${renewRes?.data?.profile || tokenProfile || 'desconocido'}`
               );
-              return;
           }
       } catch (_) {}
 
       try {
-          await navigator.clipboard.writeText(tokenRenewCommand);
-          alert(
-              '📋 Comando copiado al portapapeles.\n\n' +
-              `Pégalo en tu terminal:\n${tokenRenewCommand}\n\n` +
-              `Perfil detectado: ${tokenProfile || 'desconocido'}\n\n` +
-              '1) Inicia sesión en Chrome\n' +
-              '2) Navega por sportsbook\n' +
-              '3) Cierra Chrome para completar captura'
-          );
+          if (!launched && !handledBusy) {
+              await navigator.clipboard.writeText(tokenRenewCommand);
+              alert(
+                  '📋 Comando copiado al portapapeles.\n\n' +
+                  `Pégalo en tu terminal:\n${tokenRenewCommand}\n\n` +
+                  `Perfil detectado: ${tokenProfile || 'desconocido'}\n\n` +
+                  '1) Inicia sesión en Chrome\n' +
+                  '2) Navega por sportsbook\n' +
+                  '3) Cierra Chrome para completar captura'
+              );
+          }
       } catch (_) {
-          alert(
-              'No se pudo copiar automáticamente.\n\n' +
-              `Ejecuta manualmente:\n${tokenRenewCommand}`
-          );
+          if (!launched && !handledBusy) {
+              alert(
+                  'No se pudo copiar automáticamente.\n\n' +
+                  `Ejecuta manualmente:\n${tokenRenewCommand}`
+              );
+          }
       } finally {
           tokenRenewingRef.current = false;
           setTokenRenewing(false);
+      }
+
+      if (launched) {
+          (async () => {
+              const isHealthyToken = (token = null) => Boolean(
+                  token?.exists &&
+                  token?.jwtValid &&
+                  token?.authenticated &&
+                  !token?.expired &&
+                  Number.isFinite(Number(token?.remainingMinutes)) &&
+                  Number(token?.remainingMinutes) >= Number(token?.minRequiredMinutes || 2)
+              );
+
+              for (let i = 0; i < 12; i += 1) {
+                  await new Promise(resolve => setTimeout(resolve, 1500));
+                  try {
+                      const tokenRes = await axios.get('/api/booky/token-health', { timeout: 3500 });
+                      if (tokenRes?.data?.success) {
+                          setTokenHealth(tokenRes.data.token);
+                          if (isHealthyToken(tokenRes.data.token)) {
+                              await fetchData({ forceBookyRefresh: true });
+                              break;
+                          }
+                      }
+                  } catch (_) {}
+              }
+          })();
       }
   };
 
@@ -802,7 +837,21 @@ function App() {
             .get('/api/booky/token-health', { timeout: 3500 })
             .catch(() => null);
 
-        const prepRes = await axios.post('/api/booky/prepare', opportunity, { timeout: 12000 });
+        const prepareTimeoutMs = 25000;
+        const doPrepare = () => axios.post('/api/booky/prepare', opportunity, { timeout: prepareTimeoutMs });
+
+        let prepRes;
+        try {
+            prepRes = await doPrepare();
+        } catch (prepError) {
+            const prepMsg = String(prepError?.response?.data?.message || prepError?.message || '').toLowerCase();
+            const isTimeout = prepError?.code === 'ECONNABORTED' || prepMsg.includes('timeout');
+            if (!isTimeout) throw prepError;
+
+            await new Promise(resolve => setTimeout(resolve, 700));
+            prepRes = await doPrepare();
+        }
+
         if (!prepRes.data?.success || !prepRes.data?.ticket) {
             alert(`⚠️ No se pudo preparar ticket: ${prepRes.data?.message || 'Error desconocido'}`);
             localPlacedBetIdsRef.current.delete(id);
@@ -966,6 +1015,8 @@ function App() {
                     if (normalizedMsg.includes('ticket no encontrado')) {
                         alert('⚠️ El ticket ya no existe (posible doble clic o desincronización temporal).\nActualiza datos y vuelve a intentar con la oportunidad vigente.');
                         await fetchData({ forceBookyRefresh: true });
+                    } else if (normalizedMsg.includes('timeout')) {
+                        alert('⏳ La preparación del ticket tardó más de lo esperado (timeout).\nLa cuota puede seguir vigente: intenta nuevamente en 2-3 segundos.');
                     } else {
                     alert(`❌ Error de apuesta real: ${msg}${diagText}`);
                     }
