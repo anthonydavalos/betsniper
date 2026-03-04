@@ -244,6 +244,9 @@ const getTokenHealth = () => {
   };
 };
 
+const TOKEN_RENEW_COOLDOWN_MS = 15000;
+let lastTokenRenewLaunchAt = 0;
+
 const triggerInteractiveTokenRenewal = () => {
   const profile = getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase();
   const scriptPath = path.join(projectRoot, 'scripts', 'extract-booky-auth-token.js');
@@ -276,9 +279,28 @@ const triggerInteractiveTokenRenewal = () => {
 export const requestBookyTokenRenewal = () => {
   const profile = getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase();
   const renewalCommand = `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${profile}`;
+  const now = Date.now();
+  const elapsed = now - lastTokenRenewLaunchAt;
+
+  if (lastTokenRenewLaunchAt > 0 && elapsed < TOKEN_RENEW_COOLDOWN_MS) {
+    const waitSeconds = Math.max(1, Math.ceil((TOKEN_RENEW_COOLDOWN_MS - elapsed) / 1000));
+    return {
+      started: false,
+      busy: true,
+      profile,
+      renewalCommand,
+      retryAfterSeconds: waitSeconds,
+      message: `Ya hay una renovación de token en curso o recién iniciada. Reintenta en ${waitSeconds}s.`
+    };
+  }
+
   const started = triggerInteractiveTokenRenewal();
+  if (started) {
+    lastTokenRenewLaunchAt = now;
+  }
   return {
     started,
+    busy: false,
     profile,
     renewalCommand,
     message: started
