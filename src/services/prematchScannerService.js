@@ -286,10 +286,30 @@ export const scanPrematchOpportunities = async () => {
                 }
 
                 const pruned = merged.filter(m => {
+                    // Conservar SIEMPRE registros con link manual, aunque salgan de la ventana temporal.
+                    // Esto evita que un reinicio o scan posterior borre el altenarId asignado manualmente.
+                    if (m.altenarId != null) return true;
                     if (!inWindow(m.date)) return false;
                     return !isExcludedMarketVariant({ home: m.home, away: m.away, league: m.league?.name });
                 });
                 if (changedCount > 0 || pruned.length !== dbPinnacleMatches.length) {
+                    // Re-leer altenarIds frescos para evitar race condition:
+                    // si el usuario linkeó manualmente entre nuestro db.read() inicial
+                    // y este punto, el snapshot que usamos para construir pruned
+                    // tiene altenarId=null. Recuperamos los links reales antes de escribir.
+                    await db.read();
+                    const freshAltenarMap = new Map(
+                        (db.data.upcomingMatches || [])
+                            .filter(m => m.altenarId != null)
+                            .map(m => [String(m.id), { altenarId: m.altenarId, altenarName: m.altenarName }])
+                    );
+                    for (const m of pruned) {
+                        const fresh = freshAltenarMap.get(String(m.id));
+                        if (fresh?.altenarId != null && m.altenarId == null) {
+                            m.altenarId = fresh.altenarId;
+                            m.altenarName = fresh.altenarName;
+                        }
+                    }
                     db.data.upcomingMatches = pruned;
                     dbPinnacleMatches = pruned;
                     dbWasUpdatedFromCache = true;
