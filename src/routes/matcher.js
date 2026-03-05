@@ -4,6 +4,14 @@ import { registerDynamicAlias } from '../utils/teamMatcher.js';
 
 const router = express.Router();
 
+const buildTupleKey = (row = {}) => {
+    const home = String(row?.home || '').trim().toLowerCase();
+    const away = String(row?.away || '').trim().toLowerCase();
+    const ts = new Date(row?.date || '').getTime();
+    if (!home || !away || !Number.isFinite(ts)) return null;
+    return `${home}__${away}__${ts}`;
+};
+
 // GET /api/matcher/data
 // Devuelve todos los partidos de Pinnacle y Altenar para el matcher manual
 router.get('/data', async (req, res) => {
@@ -59,8 +67,21 @@ router.post('/link', async (req, res) => {
             return res.status(404).json({ error: "Pinnacle Match not found in DB" });
         }
 
-        match.altenarId = altenarId;
-        match.altenarName = altenarName;
+        const targetKey = buildTupleKey(match);
+        const updatedAt = new Date().toISOString();
+        let appliedCount = 0;
+
+        for (const row of (db.data.upcomingMatches || [])) {
+            const sameId = String(row?.id || '') === String(pinnacleId);
+            const sameTuple = targetKey && buildTupleKey(row) === targetKey;
+            if (!sameId && !sameTuple) continue;
+
+            row.altenarId = altenarId;
+            row.altenarName = altenarName;
+            row.linkSource = 'manual';
+            row.linkUpdatedAt = updatedAt;
+            appliedCount += 1;
+        }
         
         // APRENDIZAJE: Guardar nuevos alias encontrados
         if (altenarMatch) {
@@ -80,6 +101,18 @@ router.post('/link', async (req, res) => {
         }
 
         await db.write();
+
+        // Verificación post-write (anti-carrera visible): confirmar que quedó persistido en disco.
+        await db.read();
+        const persisted = (db.data.upcomingMatches || []).find(m => String(m.id || '') === String(pinnacleId));
+        if (!persisted || String(persisted.altenarId || '') !== String(altenarId || '')) {
+            return res.status(409).json({
+                error: 'Link no persistido (posible condición de carrera). Reintenta en 1-2s.',
+                pinnacleId,
+                altenarId,
+                appliedCount
+            });
+        }
         console.log(`🔗 [Manual Linker] Linked Successfully: ${match.home} <-> ${altenarName}`);
         res.json({ success: true, match, learned: !!altenarMatch });
     } catch (e) {
@@ -95,12 +128,14 @@ router.post('/unlink', async (req, res) => {
     
     try {
         await db.read();
-        const match = db.data.upcomingMatches.find(m => m.id === pinnacleId);
+        const match = db.data.upcomingMatches.find(m => m.id == pinnacleId);
         
         if (match) {
             console.log(`✂️ [Manual Linker] Unlinked: ${match.home} (was ${match.altenarId})`);
             match.altenarId = null;
             match.altenarName = null;
+            match.linkSource = null;
+            match.linkUpdatedAt = new Date().toISOString();
             await db.write();
             res.json({ success: true, match });
         } else {

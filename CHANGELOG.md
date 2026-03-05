@@ -7,6 +7,97 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.3.0] — 2026-03-04 — Sprint: PnL Integrity + Live Render Fix + Pinnacle Auto-Close
+
+> Rama: `master` | Base commit: `1f36a63`
+
+### ✅ Fixed
+
+#### Booky — Historial Completo y Precisión PnL
+- **`src/services/bookyAccountService.js`**:
+  - `buildHistoryPayload` — ventana de lookback ahora configurable via `BOOKY_HISTORY_LOOKBACK_DAYS` (default 3650 días, antes hardcodeado a 45). Permite recuperar el historial completo desde el inicio.
+  - `requestRemoteBetHistory` — límite de páginas ahora configurable via `BOOKY_HISTORY_MAX_PAGES` (default 120, antes hardcodeado a 6); tamaño de página subido a 100; parámetro `fetchAll` para recuperación sin cap.
+  - `getCachedRemoteHistory` — `limit=0` retorna todos los ítems sin slice (antes siempre limitaba).
+  - `syncRemoteBookyHistory` — acepta flag `fetchAll`; caché en memoria y valor de retorno respetan `limit=0`.
+  - `mapBookyHistoryItem` — usa `entry.realPlacement.providerStatus` (numérico) como `status` en lugar de `entry.status` (era textual del flujo local, e.g. `REAL_CONFIRMED_FAST`). Elimina contaminación de estado.
+  - `computePnlBreakdown` — rows con `status` no-numérico se omiten con contador `rowsIgnored` en lugar de tratarse como apuestas abiertas (antes inflaban el open stake).
+  - `replaceProfileHistory()` — nueva función que **reemplaza** (no acumula) el historial de perfil con array limpio y deduplicado. Previene acumulación de rows locales obsoletos.
+  - `getBookyHistory` — llama `syncRemoteBookyHistory` con `fetchAll:true, limit:0`; usa `replaceProfileHistory` en lugar de `upsertProfileHistory`; filtra rows locales sin `providerBetId`.
+  - Resultado: DB acity pasó de 188 rows (PnL inflado +201.85) a 113 rows alineados con Booky remoto (PnL real: ~48.34).
+
+#### Frontend — PnL correcto y Oportunidades LIVE no bloqueadas
+- **`client/src/App.jsx`**:
+  - `pnlFromSnapshot` ahora lee `bookyAccount?.pnl?.netAfterOpenStake` (antes `pnl?.realized`). Cadena de fallback: `netAfterOpenStake` → `total` → `realized` → `0`.
+  - Eliminado el recálculo de PnL a partir del historial visible (60 rows) que devolvía un valor incorrecto (-40.23 vs real ~48).
+  - `isBookyOpenStatus = (value) => Number(value) === 0` — único criterio correcto para "apuesta abierta". Reemplaza `!BOOKY_SETTLED_STATUSES.has(Number(row?.status))` en los 4 puntos donde se filtraban rows abiertos. Corrige bug donde rows con `status=null/NaN` bloqueaban la renderización de oportunidades LIVE.
+  - Añadidos helpers de tipado seguro: `resolveBookySelectionTypePick`, `getBookyOpenBetKey`, `getBookyOpenEventId`.
+  - Añadido `hasLiveClockSignal` e `isLiveOriginOpportunity` para distinción precisa de oportunidades LIVE vs PREMATCH.
+  - `fetchInFlightRef` — guard de in-flight para evitar peticiones concurrentes de `fetchData`.
+  - `lastBookyAccountFetchAtRef` — throttle de fetch de cuenta Booky: máximo 1 petición cada 15s en ciclos normales (salvo `forceBookyRefresh`).
+  - Historial visible capped a 60 rows en la URL (`historyLimit=60`).
+
+#### Matcher — Link Manual Pegajoso (anti-race condition, anti-pruning)
+- **`src/services/prematchScannerService.js`**:
+  - `manualSticky` flag — si un match tiene `linkSource: 'manual'`, se preserva el link contra pruning temporal y contra fallo de verificación de par. Resuelve race condition al reiniciar scanner con link manual reciente.
+  - Merge de `dbPinnacleMatches` + `pinnacleMatches` deduplicado por `id` antes del loop de enlace. Garantiza que matches con link manual en DB no se pierdan si no vienen en la respuesta actual del feed.
+  - `findDirectPairFallback` — nueva función de fallback que busca par directo en ventana extendida (`MATCH_TIME_EXTENDED_TOLERANCE_MINUTES`) cuando el matcher principal falla.
+  - Al limpiar link (pruning), se resetea también `linkSource = null` y `linkUpdatedAt`.
+- **`scripts/ingest-pinnacle.js`**:
+  - `db.read()` al inicio para leer estado fresco antes de escribir (`existingById` map).
+  - Al reconstruir cada match se preservan `altenarId`, `altenarName`, `linkSource`, `linkUpdatedAt` del match existente en DB, para no perder enlaces al reiniciar el ingestor.
+- **`src/routes/matcher.js`**:
+  - `buildTupleKey(row)` — clave compuesta `(home, away, timestamp)` para aplicar link a **todos** los matches con el mismo par de equipos y fecha, no solo al que tiene ese `id`.
+  - `POST /link` — aplica link a N matches (por id O tuple) e incluye verificación post-write con `db.read()`. Devuelve HTTP 409 si el dato no persistió (race condition visible al cliente).
+  - `DELETE /link` — añade `linkSource: null` y `linkUpdatedAt` al desvincular.
+  - Coerción flexible `m.id == pinnacleId` (loose equality) en unlink para evitar mismatch numérico vs string.
+
+#### Odds Service — Parsing Robusto de Totales
+- **`src/services/oddsService.js`**:
+  - `extractFirstNumber` — extrae primer número válido de strings normalizados (reemplaza regex inline frágiles).
+  - `parseTotalsHint(marketName, selectionName)` — detecta `side` (over/under) y `line` desde nombre de mercado o selección. Maneja casos ambiguos (línea como sufijo numérico de selección vs mercado). `lineFrom` para trazabilidad.
+  - Detección de mercados Totales ampliada: acepta `typeId=18` **O** nombre contiene "total", sin necesidad de ambas condiciones.
+  - Fallback en lectura de oddIds: `desktopOddIds.flat()` con fallback a `oddIds` cuando la propiedad es un array simple (variación de estructura de API).
+
+### ✅ Added
+
+#### Pinnacle — Auto-close Chrome al detectar socket válido
+- **`services/pinnacleGateway.js`**:
+  - Constante `IS_STANDALONE` para detectar si el script corre como proceso hijo o standalone.
+  - Propiedades: `autoCloseEnabled` (env `PINNACLE_AUTO_CLOSE_ON_VALID_SOCKET`, default `true`), `autoCloseDelayMs` (env `PINNACLE_AUTO_CLOSE_DELAY_MS`, default 1800ms), más flags `autoCloseTriggered`, `socketDetected`, `sessionDetected`, `firstFrameReceived`.
+  - Método `maybeAutoClose(reason)` — se activa cuando **socket Arcadia** (`api.arcadia.pinnacle.com/ws`) **Y** cabecera `X-Session` han sido detectados. Llama `shutdown()` y `process.exit(0)` tras el delay configurable.
+  - Tres puntos de disparo: `webSocketCreated`, `x-session-captured` (captura de `X-Session`) y `first-websocket-frame`.
+  - Log informativo: `"🤖 Auto-close activo: la ventana se cerrará al detectar sesión+socket válido."`.
+- **`services/pinnacleLight.js`**:
+  - Mensaje de instrucción actualizado: "al detectar socket válido se cerrará automáticamente" (ya no indica cerrar manualmente).
+
+#### Scripts y Utilidades
+- **`scripts/migrate-booky-legacy-integration.mjs`** — Migración de historial Booky legado: normaliza `integration` e `origin` para perfiles que usaban valores incorrectos. Modos `--apply` y `--aggressive --apply`.
+- **`scripts/pnl_assign_audit.mjs`** — Auditoría de asignación PnL entre las 4 fuentes: Booky extended, Booky limited, DB acity y DB doradobet. Útil para validación de integridad post-sync.
+
+#### npm Scripts Nuevos
+```bash
+migrate:booky:legacy-integration              → migrate-booky-legacy-integration.mjs --apply
+migrate:booky:legacy-integration:aggressive   → migrate-booky-legacy-integration.mjs --aggressive --apply
+```
+
+#### Variables de Entorno Nuevas
+```env
+# Historial Booky
+BOOKY_HISTORY_LOOKBACK_DAYS=3650
+BOOKY_HISTORY_MAX_PAGES=120
+BOOKY_HISTORY_PAGE_SIZE=100
+BOOKY_HISTORY_MAX_REMOTE_ROWS=20000
+
+# Pinnacle Auto-Close
+PINNACLE_AUTO_CLOSE_ON_VALID_SOCKET=true
+PINNACLE_AUTO_CLOSE_DELAY_MS=1800
+
+# Matcher ventana extendida (ya existía, ahora también en prematchScanner)
+MATCH_TIME_EXTENDED_TOLERANCE_MINUTES=30
+```
+
+---
+
 ## [Unreleased] — Sprint: Booky Real Placement + Matcher Diagnostics
 
 > Rama: `feature/socket-spy` | Base commit: `a895644`

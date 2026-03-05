@@ -104,6 +104,10 @@ function processBTTS(markets, participants) {
 
 export const ingestPinnaclePrematch = async (force = false) => {
     await initDB();
+    await db.read();
+
+    const existingMatches = Array.isArray(db.data?.upcomingMatches) ? db.data.upcomingMatches : [];
+    const existingById = new Map(existingMatches.map(m => [String(m.id), m]));
 
     // --- SMART SKIP LOGIC ---
     if (!force && db.data.pinnacleLastUpdate) {
@@ -216,6 +220,7 @@ export const ingestPinnaclePrematch = async (force = false) => {
                     }
 
                     if (oddsML && oddsML.home && oddsML.away) {
+                        const existing = existingById.get(String(match.id)) || {};
                         refinedMatches.push({
                             id: match.id.toString(),
                             home: match.participants.find(p => p.alignment === 'home')?.name, 
@@ -229,7 +234,12 @@ export const ingestPinnaclePrematch = async (force = false) => {
                                 ...oddsML,         // home, draw, away
                                 totals: oddsTotals, // array of {line, over, under}
                                 btts: oddsBTTS      // {yes, no} or null
-                            }
+                            },
+                            // Preservar link metadata existente para no perder enlaces al reiniciar.
+                            altenarId: existing.altenarId ?? null,
+                            altenarName: existing.altenarName ?? null,
+                            linkSource: existing.linkSource ?? null,
+                            linkUpdatedAt: existing.linkUpdatedAt ?? null
                         });
                         console.log(`      ✅ Agregado: ${match.participants.find(p => p.alignment === 'home')?.name} vs ${match.participants.find(p => p.alignment === 'away')?.name}`);
                     } else {
@@ -268,14 +278,14 @@ export const ingestPinnaclePrematch = async (force = false) => {
 
     // --- LÓGICA DE FUSIÓN (MERGE) ---
     // 1. Cargar partidos existentes
-    const existingMatches = db.data.upcomingMatches || [];
+    const existingMatchesFinal = db.data.upcomingMatches || [];
     
     // 2. Definir ventana de preservación: DÍA CALENDARIO ACTUAL (PERÚ UTC-5)
     // Usamos 'en-CA' para obtener formato YYYY-MM-DD ajustado a la zona horaria
     const getPeruDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
     const todayStr = getPeruDate(new Date());
 
-    const keptMatches = existingMatches.filter(oldMatch => {
+    const keptMatches = existingMatchesFinal.filter(oldMatch => {
         // Extraer fecha base (YYYY-MM-DD) del partido según Perú
         const matchDateStr = getPeruDate(oldMatch.date);
         

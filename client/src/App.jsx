@@ -48,6 +48,7 @@ function getOpportunityId(op) {
 }
 
 const BOOKY_SETTLED_STATUSES = new Set([1, 2, 4, 8, 18]);
+const isBookyOpenStatus = (value) => Number(value) === 0;
 
 const resolveBookyOutcome = (row = {}) => {
     const status = Number(row?.status);
@@ -383,6 +384,52 @@ const resolveStakeSyncFlags = (row = {}, fallbackStake = null, fallbackOdd = nul
     return { recalcFromPrep, oddOnlyRecalc, providerAdjusted };
 };
 
+const resolveBookySelectionTypePick = (row = {}) => {
+    const typeId = Number(row?.selections?.[0]?.selectionTypeId ?? row?.raw?.selections?.[0]?.selectionTypeId);
+    if (typeId === 1) return 'home';
+    if (typeId === 2) return 'draw';
+    if (typeId === 3) return 'away';
+    return null;
+};
+
+const getBookyOpenBetKey = (row = {}) => {
+    const eventId = String(row?.eventId || row?.selections?.[0]?.eventId || row?.raw?.selections?.[0]?.eventId || '').trim();
+    if (!eventId) return null;
+
+    const pickByType = resolveBookySelectionTypePick(row);
+    const pick = pickByType || normalizePick(row);
+    if (!pick) return null;
+
+    return `${eventId}_${String(pick).toLowerCase()}`;
+};
+
+const getBookyOpenEventId = (row = {}) => {
+    const eventId = String(row?.eventId || row?.selections?.[0]?.eventId || row?.raw?.selections?.[0]?.eventId || '').trim();
+    return eventId || null;
+};
+
+const hasLiveClockSignal = (value = '') => {
+    const txt = String(value || '').trim().toUpperCase();
+    if (!txt) return false;
+    if (txt === 'HT' || txt === 'HALF TIME' || txt === 'FINAL' || txt === 'FT') return true;
+    return /\b\d{1,3}\s*'?\b/.test(txt);
+};
+
+const isLiveOriginOpportunity = (op = {}) => {
+    const type = String(op?.type || op?.strategy || '').toUpperCase();
+    if (type.includes('LIVE') || type === 'LA_VOLTEADA') return true;
+    if (op?.isLive === true) return true;
+
+    const liveSignal =
+        op?.liveTime ||
+        op?.time ||
+        op?.pinnacleInfo?.time ||
+        op?.raw?.selections?.[0]?.gameTime ||
+        '';
+
+    return hasLiveClockSignal(liveSignal);
+};
+
 function playAlert(kind = 'DEFAULT') {
   try {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -444,6 +491,8 @@ function App() {
         balance: { amount: null, currency: 'PEN', stale: true },
         history: [],
         historyCount: 0,
+        historyTotalCount: 0,
+        pnl: { realized: 0, source: null, rowsCount: 0 },
         fetchedAt: null
     });
     const [tokenHealth, setTokenHealth] = useState(null);
@@ -465,6 +514,8 @@ function App() {
   const isFirstLoad = useRef(true);
     const prevLiveOpsIdsRef = useRef(new Set());
   const prevOddsRef = useRef({}); // [NEW] Cache para detectar tendencias de cuotas
+    const fetchInFlightRef = useRef(false);
+    const lastBookyAccountFetchAtRef = useRef(0);
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
   const localDiscardedIdsRef = useRef(new Set());
@@ -478,21 +529,33 @@ function App() {
   // --- API CALLS ---
 
     const fetchData = async ({ forceBookyRefresh = false } = {}) => {
+    if (fetchInFlightRef.current) return;
+    fetchInFlightRef.current = true;
     setLoading(true);
     try {
+                        const nowMs = Date.now();
+                        const shouldFetchBooky = forceBookyRefresh || (nowMs - lastBookyAccountFetchAtRef.current) >= 15000;
                         const bookyAccountUrl = forceBookyRefresh
-                                ? '/api/booky/account?refresh=1&historyLimit=120'
-                                : '/api/booky/account?historyLimit=120';
+                            ? '/api/booky/account?refresh=1&historyLimit=60'
+                            : '/api/booky/account?historyLimit=60';
 
-            const [liveReq, prematchReq, portfolioReq, bookyReq] = await Promise.allSettled([
+            const baseRequests = [
                 axios.get('/api/opportunities/live'),
                 axios.get('/api/opportunities/prematch'),
-                axios.get('/api/portfolio'),
-                                axios.get(bookyAccountUrl)
-            ]);
+                axios.get('/api/portfolio')
+            ];
 
-            if (bookyReq.status === 'fulfilled' && bookyReq.value?.data?.success) {
+            const requests = shouldFetchBooky
+                ? [...baseRequests, axios.get(bookyAccountUrl, { timeout: forceBookyRefresh ? 30000 : 12000 })]
+                : baseRequests;
+
+            const settled = await Promise.allSettled(requests);
+            const [liveReq, prematchReq, portfolioReq] = settled;
+            const bookyReq = shouldFetchBooky ? settled[3] : null;
+
+            if (bookyReq?.status === 'fulfilled' && bookyReq.value?.data?.success) {
                     setBookyAccount(bookyReq.value.data);
+                    lastBookyAccountFetchAtRef.current = Date.now();
             }
 
             if (liveReq.status !== 'fulfilled' || prematchReq.status !== 'fulfilled' || portfolioReq.status !== 'fulfilled') {
@@ -522,6 +585,35 @@ function App() {
           );
       }
 
+      // [NEW] También bloquear oportunidades que ya están abiertas en Booky remoto
+      // para evitar que el botón "Apostar" aparezca en selecciones ya colocadas.
+      let remoteOpenBetIds = new Set();
+      let remoteOpenEventIds = new Set();
+      {
+          const remoteRows = Array.isArray(
+              bookyReq?.status === 'fulfilled' && bookyReq.value?.data?.success
+                  ? bookyReq.value.data?.history
+                  : bookyAccount?.history
+          )
+              ? (bookyReq?.status === 'fulfilled' && bookyReq.value?.data?.success
+                  ? bookyReq.value.data.history
+                  : bookyAccount?.history)
+              : [];
+          const openRows = remoteRows.filter(row => isBookyOpenStatus(row?.status));
+          remoteOpenBetIds = new Set(
+              openRows
+                  .map(getBookyOpenBetKey)
+                  .filter(Boolean)
+          );
+          remoteOpenEventIds = new Set(
+              openRows
+                  .map(getBookyOpenEventId)
+                  .filter(Boolean)
+          );
+    }
+
+      const blockedBetIds = new Set([...serverActiveBetIds, ...remoteOpenBetIds]);
+
       if (liveRes.data?.data) {
           // [FIX] Filtrar con blacklist local para evitar parpadeo
           // Si el servidor aun trae un evento que acabamos de descartar o apostar, lo ocultamos
@@ -537,7 +629,8 @@ function App() {
               
               // C. Si YA está en el portfolio del servidor (real)
               // Comparar ID completo (eventId + selection) para filtrado granular
-              if (serverActiveBetIds.has(id)) return false;
+              if (blockedBetIds.has(id)) return false;
+              if (remoteOpenEventIds.has(String(op?.eventId || '').trim())) return false;
 
               return true;
           });
@@ -572,11 +665,14 @@ function App() {
       if (prematchRes.data?.data) {
            const serverOps = prematchRes.data.data;
            const cleanOps = serverOps.filter(op => {
+              if (isLiveOriginOpportunity(op)) return false;
+
               const id = getOpportunityId(op); // ID único por selección
               
               if (localDiscardedIdsRef.current.has(id)) return false;
               if (localPlacedBetIdsRef.current.has(id)) return false;
-              if (serverActiveBetIds.has(id)) return false; // Comparar ID completo
+                    if (blockedBetIds.has(id)) return false; // Comparar ID completo
+                    if (remoteOpenEventIds.has(String(op?.eventId || '').trim())) return false;
               return true;
            });
            setPrematchOps(cleanOps);
@@ -639,6 +735,7 @@ function App() {
     } catch (err) {
       console.error("Error fetching data", err);
     } finally {
+            fetchInFlightRef.current = false;
       setLoading(false);
     }
   };
@@ -688,28 +785,12 @@ function App() {
     const realBalanceAmount = Number(bookyAccount?.balance?.amount);
     const realBalanceCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
     const activeBookyLabel = String(bookyAccount?.profile || bookyAccount?.integration || 'booky').toUpperCase();
-    const settledStatuses = new Set([1, 2, 4, 8, 18]);
-    const realBookyPnL = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : []).reduce((acc, row) => {
-        const status = Number(row?.status);
-        if (!Number.isFinite(status) || !settledStatuses.has(status)) return acc;
-
-        const stake = Number(row?.stake);
-        const payout = Number(row?.payout);
-        const potentialReturn = Number(row?.potentialReturn);
-
-        const safeStake = Number.isFinite(stake) ? stake : 0;
-        let returnAmount = 0;
-
-        if (Number.isFinite(payout) && payout > 0) {
-            returnAmount = payout;
-        } else if (Number.isFinite(potentialReturn) && potentialReturn > 0) {
-            returnAmount = potentialReturn;
-        } else if (status === 4 || status === 18) {
-            returnAmount = safeStake;
-        }
-
-        return acc + (returnAmount - safeStake);
-    }, 0);
+    const pnlFromSnapshot = Number(bookyAccount?.pnl?.netAfterOpenStake);
+    const pnlFromSnapshotTotal = Number(bookyAccount?.pnl?.total);
+    const pnlFromSnapshotRealized = Number(bookyAccount?.pnl?.realized);
+    const realBookyPnL = Number.isFinite(pnlFromSnapshot)
+        ? pnlFromSnapshot
+        : (Number.isFinite(pnlFromSnapshotTotal) ? pnlFromSnapshotTotal : (Number.isFinite(pnlFromSnapshotRealized) ? pnlFromSnapshotRealized : 0));
     const realBookyPnLClass = realBookyPnL >= 0 ? 'text-emerald-400' : 'text-red-400';
     const tokenRemainingMinutes = Number(tokenHealth?.remainingMinutes);
     const tokenProfile = String(tokenHealth?.profile || tokenHealth?.integration || '').toLowerCase();
@@ -1017,6 +1098,7 @@ function App() {
                         await fetchData({ forceBookyRefresh: true });
                     } else if (normalizedMsg.includes('timeout')) {
                         alert('⏳ La preparación del ticket tardó más de lo esperado (timeout).\nLa cuota puede seguir vigente: intenta nuevamente en 2-3 segundos.');
+                        await fetchData({ forceBookyRefresh: true });
                     } else {
                     alert(`❌ Error de apuesta real: ${msg}${diagText}`);
                     }
@@ -1169,6 +1251,42 @@ function App() {
         return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
   };
 
+  const getOpenBookyRemoteBets = () => {
+        const remoteRows = Array.isArray(bookyAccount?.history) ? bookyAccount.history : [];
+        return remoteRows
+            .filter(row => isBookyOpenStatus(row?.status))
+            .map((row, idx) => {
+                const rawSelection = row?.raw?.selections?.[0] || null;
+                const gameTime = rawSelection?.gameTime || null;
+                const eventScore = rawSelection?.eventScore || null;
+                const eventDate = row?.selections?.[0]?.eventDate || rawSelection?.eventDate || null;
+                const odd = Number(row?.odd);
+                const stake = Number(row?.stake);
+                return {
+                    id: row?.providerBetId ? `booky_open_${row.providerBetId}` : `booky_open_${idx}`,
+                    providerBetId: row?.providerBetId || null,
+                    eventId: row?.eventId || null,
+                    match: row?.match || '-',
+                    league: row?.league || '-',
+                    market: row?.market || '-',
+                    selection: row?.selection || '-',
+                    type: String(row?.type || row?.strategy || row?.opportunityType || 'BOOKY_REAL').toUpperCase(),
+                    odd: Number.isFinite(odd) ? odd : null,
+                    price: Number.isFinite(odd) ? odd : null,
+                    stake: Number.isFinite(stake) ? stake : null,
+                    kellyStake: Number.isFinite(stake) ? stake : null,
+                    date: row?.placedAt || eventDate || new Date().toISOString(),
+                    matchDate: eventDate || row?.placedAt || null,
+                    liveTime: gameTime,
+                    time: gameTime,
+                    score: eventScore,
+                    lastKnownScore: eventScore,
+                    isActiveBet: true,
+                    isBookyRemoteOpen: true
+                };
+            });
+  };
+
   const getFilteredData = () => {
     let data = [];
     
@@ -1218,7 +1336,20 @@ function App() {
             pinnacleInfo: bet.pinnacleInfo 
         }));
 
-        return [...ops, ...activePlayingBets].sort((a,b) => {
+        const openBookyLiveBets = getOpenBookyRemoteBets().filter(bet => {
+            const hasLiveTime = typeof bet.liveTime === 'string' && bet.liveTime.trim() && bet.liveTime !== 'Final';
+            const startDate = new Date(bet.matchDate || bet.date || Date.now());
+            const minutesSinceStart = (Date.now() - startDate.getTime()) / 60000;
+            const isLiveByTime = Number.isFinite(minutesSinceStart) && minutesSinceStart > 0 && minutesSinceStart < 130;
+            return hasLiveTime || isLiveByTime;
+        }).filter(bet => {
+            const byProvider = String(bet.providerBetId || '');
+            const duplicateInPortfolio = activePlayingBets.some(a => String(a.providerBetId || '') === byProvider && byProvider);
+            const duplicateInOps = ops.some(o => String(o.eventId || '') === String(bet.eventId || ''));
+            return !duplicateInPortfolio && !duplicateInOps;
+        });
+
+        return [...ops, ...activePlayingBets, ...openBookyLiveBets].sort((a,b) => {
              // Ordenar: primero los minutos más altos (final del partido) para ver desenlaces
              const timeA = parseInt((a.time || a.liveTime || "0").replace("'", "")) || 0;
              const timeB = parseInt((b.time || b.liveTime || "0").replace("'", "")) || 0;
@@ -1241,6 +1372,7 @@ function App() {
 
         // 2. Filtrar Pre-Match por fecha seleccionada Y eliminar duplicados que ya estén en Live
         const dayPrematch = prematchOps.filter(op => {
+               if (isLiveOriginOpportunity(op)) return false;
              if (!isSameDay(new Date(op.date), dateFilter)) return false;
              
              // Evitar que aparezca en "Todos" si ya está en "Live"
@@ -1279,7 +1411,19 @@ function App() {
             score: bet.lastKnownScore
         }));
 
-        data = [...data, ...dayPrematch, ...dayActiveBets];
+        const dayBookyOpenBets = getOpenBookyRemoteBets().filter(bet => {
+               if (isLiveOriginOpportunity(bet)) return false;
+             const baseDate = bet.matchDate || bet.date;
+             if (!baseDate) return false;
+             if (!isSameDay(new Date(baseDate), dateFilter)) return false;
+
+             const existsInLive = liveOps.some(op => String(op.eventId || '') === String(bet.eventId || ''));
+             const existsInPrematch = dayPrematch.some(op => String(op.eventId || '') === String(bet.eventId || ''));
+             const existsInActive = dayActiveBets.some(op => String(op.providerBetId || '') === String(bet.providerBetId || '') && bet.providerBetId);
+             return !existsInLive && !existsInPrematch && !existsInActive;
+        });
+
+        data = [...data, ...dayPrematch, ...dayActiveBets, ...dayBookyOpenBets];
         
         // Ordenar por hora
         data.sort((a,b) => new Date(a.date) - new Date(b.date));
@@ -1289,6 +1433,18 @@ function App() {
   };
 
     const filteredOps = getFilteredData();
+    const remoteOpenBookyIds = new Set(
+        (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
+            .filter(row => isBookyOpenStatus(row?.status))
+            .map(getBookyOpenBetKey)
+            .filter(Boolean)
+    );
+    const remoteOpenBookyEventIds = new Set(
+        (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
+            .filter(row => isBookyOpenStatus(row?.status))
+            .map(getBookyOpenEventId)
+            .filter(Boolean)
+    );
     const finishedTabCount = getFinishedDataForSelectedDate().length;
 
     const finishedSubtotal = activeTab === 'FINISHED'
@@ -1399,7 +1555,7 @@ function App() {
                     className={`flex-1 py-4 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors ${activeTab === 'ALL' ? 'bg-slate-700 text-white border-b-2 border-emerald-500' : 'text-slate-500 hover:text-slate-300 hover:bg-slate-750'}`}
                 >
                     <Layers className="w-4 h-4" />
-                    Todos <span className="text-[10px] bg-slate-900 px-1.5 rounded-full text-slate-400" title="Oportunidades Pre-Match">{prematchOps.length}</span>
+                    Prematch <span className="text-[10px] bg-slate-900 px-1.5 rounded-full text-slate-400" title="Oportunidades Pre-Match">{prematchOps.length}</span>
                 </button>
                 <button 
                     onClick={() => setActiveTab('LIVE')}
@@ -1540,7 +1696,10 @@ function App() {
                                     const historyMatch = portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
                                     const activeMatch = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
                                     
-                                    const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : (activeMatch ? 'ACTIVE' : 'PENDING'));
+                                    const opBetKey = getOpportunityId(op);
+                                    const activeInRemoteBooky = Boolean(opBetKey && remoteOpenBookyIds.has(opBetKey));
+                                    const activeInRemoteBookyEvent = remoteOpenBookyEventIds.has(String(op?.eventId || '').trim());
+                                    const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : ((activeMatch || activeInRemoteBooky || activeInRemoteBookyEvent) ? 'ACTIVE' : 'PENDING'));
                                     const betData = op.isBookyHistory ? op : (historyMatch || activeMatch || op);
                                     const eventStartIso = op.isBookyHistory ? (resolveBookyEventStartIso(op) || resolveOpEventStartIso(op)) : resolveOpEventStartIso(op);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);

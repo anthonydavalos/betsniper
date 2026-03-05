@@ -21,6 +21,42 @@ const is1x2MarketName = (value = '') => {
     );
 };
 
+const extractFirstNumber = (value = '') => {
+    const normalized = normalizeMarketText(String(value).replace(',', '.'));
+    const match = normalized.match(/(\d+(?:\.\d+)?)/);
+    if (!match) return NaN;
+    const parsed = Number(match[1]);
+    return Number.isFinite(parsed) ? parsed : NaN;
+};
+
+const parseTotalsHint = (marketName = '', selectionName = '') => {
+    const m = normalizeMarketText(marketName);
+    const s = normalizeMarketText(selectionName);
+    const combined = `${m} ${s}`;
+
+    const side = combined.includes('under') || combined.includes('menos')
+        ? 'under'
+        : (combined.includes('over') || combined.includes('mas') || combined.includes('más') ? 'over' : null);
+
+    const rawSelection = String(selectionName || '').trim();
+    const rawMarket = String(marketName || '').trim();
+    const hasAmbiguousSelectionLine = /\b\d+\.$/.test(rawSelection);
+
+    const lineFromSelection = hasAmbiguousSelectionLine ? NaN : extractFirstNumber(selectionName);
+    const lineFromMarket = extractFirstNumber(marketName);
+    const line = Number.isFinite(lineFromMarket)
+        ? lineFromMarket
+        : (Number.isFinite(lineFromSelection)
+        ? lineFromSelection
+        : NaN);
+
+    const lineFrom = Number.isFinite(lineFromMarket)
+        ? 'market'
+        : (Number.isFinite(lineFromSelection) ? 'selection' : (hasAmbiguousSelectionLine ? 'ambiguous' : 'none'));
+
+    return { side, line, lineFrom, rawSelection, rawMarket };
+};
+
 /**
  * Refresca la cuota de una oportunidad Live utilizando la API de Altenar en tiempo real.
  * @param {Object} opportunity - Objeto oportunidad original
@@ -41,6 +77,10 @@ export const refreshOpportunity = async (opportunity) => {
         let targetOdd = null;
         let marketName = opportunity.market || '1x2'; // Default consistente con payload API
         let selectionName = opportunity.selection;
+        const totalsHint = parseTotalsHint(marketName, selectionName);
+        const isTotalsCandidate = normalizeMarketText(marketName).includes('total') ||
+            totalsHint.side === 'over' ||
+            totalsHint.side === 'under';
 
         for (const market of details.markets) {
             // Mapeo básico de nombres de mercado
@@ -48,18 +88,14 @@ export const refreshOpportunity = async (opportunity) => {
             // [FIX] Soporte canonical + legacy para 1x2
             if (is1x2MarketName(marketName) && (market.typeId === 1 || market.name === 'Match Result' || market.name === '1x2')) isTargetMarket = true;
             else if (marketName === 'Double Chance' && market.typeId === 10) isTargetMarket = true;
-            else if (marketName.includes('Total Goals') && (market.typeId === 18 || market.name.includes('Total'))) {
-                 // Check line
-                 const lineMatch = marketName.match(/(\d+\.?\d*)/);
-                 if (lineMatch) {
-                     const targetLine = parseFloat(lineMatch[0]);
-                     const currentLine = parseFloat(market.activeLine || market.specialOddValue || market.sv || market.sn);
-                     if (Math.abs(targetLine - currentLine) < 0.1) isTargetMarket = true;
-                 }
+                else if (isTotalsCandidate && (market.typeId === 18 || normalizeMarketText(market.name).includes('total'))) {
+                      // En Altenar un mismo market typeId=18 puede contener múltiples líneas
+                      // (ej. 1.5, 2.5, 3.5) dentro de desktopOddIds. La línea se decide por odd, no por market.
+                      isTargetMarket = true;
             }
 
             if (isTargetMarket) {
-                const oddIds = (market.desktopOddIds || []).flat(); 
+                const oddIds = (Array.isArray(market.desktopOddIds) ? market.desktopOddIds.flat() : market.oddIds || []);
                 const oddsObjs = (details.odds || []).filter(o => oddIds.includes(o.id));
                 
                 // Buscar la selección correcta
@@ -83,10 +119,21 @@ export const refreshOpportunity = async (opportunity) => {
                     
                     targetOdd = oddsObjs.find(o => {
                         const oName = (o.name || "").toLowerCase();
-                        if (marketName.includes('Total')) {
-                            // "Over" vs "Más", "Under" vs "Menos"
-                            if (selectionName === 'Over' && (oName.includes('over') || oName.includes('más'))) return true;
-                            if (selectionName === 'Under' && (oName.includes('under') || oName.includes('menos'))) return true;
+                        if (isTotalsCandidate) {
+                            const oddLine = Number.isFinite(Number(o.line)) ? Number(o.line) : extractFirstNumber(o.name || '');
+                            const strictLine = totalsHint.lineFrom === 'market';
+                            const lineMatches = !strictLine || !Number.isFinite(totalsHint.line) || !Number.isFinite(oddLine)
+                                ? true
+                                : Math.abs(oddLine - totalsHint.line) < 0.11;
+
+                            if (!lineMatches) return false;
+
+                            if (totalsHint.side === 'over') {
+                                return Number(o.typeId) === 12 || oName.includes('over') || oName.includes('más') || oName.includes('mas');
+                            }
+                            if (totalsHint.side === 'under') {
+                                return Number(o.typeId) === 13 || oName.includes('under') || oName.includes('menos');
+                            }
                         }
                         if (marketName === 'Double Chance') {
                             if (selectionName === '1X' && (oName.includes('1x') || oName.includes(details.name.split(' vs ')[0]))) return true;

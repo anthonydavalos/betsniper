@@ -63,7 +63,10 @@ router.get('/account', async (req, res) => {
   try {
     const refresh = String(req.query?.refresh || '').toLowerCase();
     const forceRefresh = refresh === '1' || refresh === 'true' || refresh === 'yes';
-    const historyLimit = Number(req.query?.historyLimit || 60);
+    const historyLimitRaw = Number(req.query?.historyLimit || 60);
+    const historyLimit = Number.isFinite(historyLimitRaw)
+      ? Math.max(10, Math.min(60, historyLimitRaw))
+      : 60;
     const cleanup = String(req.query?.cleanup || '').toLowerCase();
     const cleanupOld = cleanup === '1' || cleanup === 'true' || cleanup === 'yes';
     const retentionDaysRaw = Number(req.query?.retentionDays);
