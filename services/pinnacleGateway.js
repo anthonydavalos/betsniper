@@ -13,6 +13,7 @@ const CHECK_STALE_FILE = path.join(__dirname, '../data/pinnacle_stale.trigger');
 
 const OUTPUT_FILE = path.join(__dirname, '../data/pinnacle_live.json');
 const TOKEN_FILE = path.join(__dirname, '../data/pinnacle_token.json');
+const IS_STANDALONE = process.argv[1] === fileURLToPath(import.meta.url);
 const BOOK_PROFILE = (process.env.BOOK_PROFILE || 'doradobet').toLowerCase();
 const DEFAULT_SHARED_BOOKY_PROFILE_DIR = path.join(projectRoot, 'data', 'booky', `chrome-profile-${BOOK_PROFILE}`);
 const PINNACLE_PROFILE_DIR = process.env.PINNACLE_CHROME_PROFILE_DIR
@@ -35,6 +36,33 @@ class PinnacleGateway {
             events: {}, // Map by ID
             lastUpdate: Date.now()
         };
+        this.autoCloseEnabled = (process.env.PINNACLE_AUTO_CLOSE_ON_VALID_SOCKET || 'true').toLowerCase() !== 'false';
+        this.autoCloseDelayMs = Math.max(500, Number(process.env.PINNACLE_AUTO_CLOSE_DELAY_MS || 1800));
+        this.autoCloseTriggered = false;
+        this.socketDetected = false;
+        this.sessionDetected = false;
+        this.firstFrameReceived = false;
+    }
+
+    maybeAutoClose(reason = 'valid-socket') {
+        if (!this.autoCloseEnabled) return;
+        if (this.autoCloseTriggered) return;
+        if (!this.socketDetected || !this.sessionDetected) return;
+
+        this.autoCloseTriggered = true;
+        console.log(`✅ Socket Arcadia válido detectado (${reason}). Cerrando Chrome automáticamente en ${this.autoCloseDelayMs}ms...`);
+
+        setTimeout(async () => {
+            try {
+                await this.shutdown();
+            } catch (_) {
+                // noop
+            }
+
+            if (IS_STANDALONE) {
+                process.exit(0);
+            }
+        }, this.autoCloseDelayMs);
     }
 
     async shutdown() {
@@ -103,6 +131,10 @@ class PinnacleGateway {
             console.log(`   🔗 URL: ${url}`);
             console.log(`   📂 Initiator: ${JSON.stringify(initiator || {}, null, 2)}`);
             this.socketUrl = url;
+            if (String(url || '').includes('api.arcadia.pinnacle.com/ws')) {
+                this.socketDetected = true;
+                this.maybeAutoClose('websocket-created');
+            }
             // Intentar obtener los headers extra de la solicitud original puede requerir 'Network.requestWillBeSent'
         });
 
@@ -125,9 +157,8 @@ class PinnacleGateway {
 
                     fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData, null, 2));
                     console.log("💾 Token actualizado en disco... (Sigue navegando/logueándote)");
-                    
-                    // YA NO CERRAMOS AUTOMÁTICAMENTE.
-                    // Esperamos a que el usuario cierre la ventana cuando haya terminado.
+                    this.sessionDetected = true;
+                    this.maybeAutoClose('x-session-captured');
                 }
             }
         });
@@ -151,6 +182,9 @@ class PinnacleGateway {
             });
             
             console.log("✅ Navigation Complete. Waiting for socket traffic...");
+            if (this.autoCloseEnabled) {
+                console.log("🤖 Auto-close activo: la ventana se cerrará al detectar sesión+socket válido.");
+            }
 
             // --- INICIAR BUCLE DE PERSISTENCIA ---
             console.log("💾 Iniciando Auto-Save (Cada 5s)...");
@@ -217,6 +251,10 @@ class PinnacleGateway {
             if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
                 const jsonStr = text.substring(firstBrace, lastBrace + 1);
                 const data = JSON.parse(jsonStr);
+                if (!this.firstFrameReceived) {
+                    this.firstFrameReceived = true;
+                    this.maybeAutoClose('first-websocket-frame');
+                }
                 
                 // DEBUG: Log everything to a raw dump file to analyze structure
                 const debugFile = path.join(this.baseDir, '../data/pinnacle_frames_dump.jsonl');

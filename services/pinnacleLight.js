@@ -195,7 +195,7 @@ class PinnacleLight {
         if (this.isRefreshing) return;
         this.isRefreshing = true;
         console.log("🔄 INICIANDO PROTOCOLO DE REFRESCO DE SESIÓN (PinnacleGateway)...");
-        console.log("⚠️ Se abrirá una ventana de Chrome. INICIA SESIÓN MANUALMENTE y luego cierra la ventana.");
+        console.log("⚠️ Se abrirá una ventana de Chrome. INICIA SESIÓN MANUALMENTE; al detectar socket válido se cerrará automáticamente.");
 
         // Ejecutar el Gateway en otro proceso
         const gatewayScript = path.join(__dirname, 'pinnacleGateway.js');

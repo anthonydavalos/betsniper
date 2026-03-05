@@ -6,6 +6,9 @@ import { getKellyBankrollBase } from './bookyAccountService.js';
 
 const NIGHT_MODE_START_HOUR_PE = 18;
 const NEXT_DAY_CUTOFF_HOUR_PE = 6;
+const PAIR_FALLBACK_TIME_WINDOW_MINUTES = Number.isFinite(Number(process.env.MATCH_TIME_EXTENDED_TOLERANCE_MINUTES))
+    ? Number(process.env.MATCH_TIME_EXTENDED_TOLERANCE_MINUTES)
+    : 30;
 const EXCLUDED_MATCH_TERMS = [
     'corners',
     'corner',
@@ -133,6 +136,31 @@ const analyzePairMatch = (pinMatch = {}, altenarEvent = {}) => {
     };
 };
 
+const findDirectPairFallback = (pinMatch = {}, altenarEvents = []) => {
+    if (!pinMatch?.home || !pinMatch?.away || !Array.isArray(altenarEvents) || altenarEvents.length === 0) {
+        return null;
+    }
+
+    let best = null;
+    let bestScore = 0;
+
+    for (const candidate of altenarEvents) {
+        if (!candidate) continue;
+        const candidateDate = candidate.startDate || candidate.date;
+        if (!isTimeMatch(pinMatch.date, candidateDate, PAIR_FALLBACK_TIME_WINDOW_MINUTES)) continue;
+
+        const pairCheck = analyzePairMatch(pinMatch, candidate);
+        if (!pairCheck.valid || pairCheck.orientation !== 'direct') continue;
+
+        if (pairCheck.bestScore > bestScore) {
+            bestScore = pairCheck.bestScore;
+            best = candidate;
+        }
+    }
+
+    return best;
+};
+
 const buildCanonicalMatchKey = (home = '', away = '', date = '') => {
     const nh = normalizeName(home);
     const na = normalizeName(away);
@@ -178,6 +206,9 @@ export const scanPrematchOpportunities = async () => {
         await db.read();
         
         let dbPinnacleMatches = db.data.upcomingMatches || [];
+        const dbPinnacleMatchesSnapshot = Array.isArray(dbPinnacleMatches)
+            ? [...dbPinnacleMatches]
+            : [];
         const altenarCachedEvents = db.data.altenarUpcoming || [];
         let dbWasUpdatedFromCache = false;
 
@@ -352,9 +383,18 @@ export const scanPrematchOpportunities = async () => {
 
         // --- FASE 1: LINKING GLOBAL (Linkear TODO, incluso pasados) ---
         // Esto asegura que reportes y futuros análisis tengan la data cruzada.
-        for (const pinMatch of pinnacleMatches) {
+        const matchesForLinking = Array.from(
+            new Map(
+                [...dbPinnacleMatchesSnapshot, ...pinnacleMatches]
+                    .filter(Boolean)
+                    .map(m => [String(m.id), m])
+            ).values()
+        );
+
+        for (const pinMatch of matchesForLinking) {
              let altenarEvent = null;
                              const dbMirror = (db.data.upcomingMatches || []).find(m => String(m.id) === String(pinMatch.id));
+               const manualSticky = String(pinMatch?.linkSource || dbMirror?.linkSource || '').toLowerCase() === 'manual';
 
              // RE-VALIDACIÓN ESTRICTA DE LINKS EXISTENTES 
              // (Crucial si cambiamos tolerancias de tiempo)
@@ -363,7 +403,7 @@ export const scanPrematchOpportunities = async () => {
                 
                 if (altenarEvent) {
                           const pairCheck = analyzePairMatch(pinMatch, altenarEvent);
-                          if (!pairCheck.valid || pairCheck.orientation === 'swapped') {
+                          if (!manualSticky && (!pairCheck.valid || pairCheck.orientation === 'swapped')) {
                                  if (pairCheck.orientation === 'swapped') {
                                      console.log(`   ⚠️ ENLACE OMITIDO (SWAPPED): ${pinMatch.home} vs ${pinMatch.away} <-> ${altenarEvent.name}`);
                                  }
@@ -379,13 +419,15 @@ export const scanPrematchOpportunities = async () => {
                           if (altenarEvent) {
                     // Si el evento existe, validamos que siga cumpliendo la tolerancia de tiempo actual (5 min)
                     // Si ya no cumple (ej. es un falso positivo de 6 horas), ROMPEMOS el enlace.
-                    if (!isTimeMatch(pinMatch.date, altenarEvent.startDate || altenarEvent.date)) {
+                    if (!manualSticky && !isTimeMatch(pinMatch.date, altenarEvent.startDate || altenarEvent.date)) {
                          console.log(`   ✂️ ROMPIENDO ENLACE INVÁLIDO (Tiempo): ${pinMatch.home} vs ${altenarEvent.name || altenarEvent.home}`);
                          pinMatch.altenarId = null;
                          pinMatch.altenarName = null;
+                         pinMatch.linkSource = null;
                         if (dbMirror) {
                            dbMirror.altenarId = null;
                            dbMirror.altenarName = null;
+                           dbMirror.linkSource = null;
                         }
                          altenarEvent = null;
                     }
@@ -393,11 +435,15 @@ export const scanPrematchOpportunities = async () => {
                 } else {
                     // [FIX] Enlace huérfano: el evento Altenar ya no está en cache actual.
                     // Rompemos el link para evitar ghost prematch y permitir relink limpio.
-                    pinMatch.altenarId = null;
-                    pinMatch.altenarName = null;
-                    if (dbMirror) {
-                        dbMirror.altenarId = null;
-                        dbMirror.altenarName = null;
+                    if (!manualSticky) {
+                        pinMatch.altenarId = null;
+                        pinMatch.altenarName = null;
+                        pinMatch.linkSource = null;
+                        if (dbMirror) {
+                            dbMirror.altenarId = null;
+                            dbMirror.altenarName = null;
+                            dbMirror.linkSource = null;
+                        }
                     }
                 }
              }
@@ -405,15 +451,27 @@ export const scanPrematchOpportunities = async () => {
              if (!pinMatch.altenarId) {
                 // Solo intentamos linkear si NO tienen ID.
                 const leagueName = pinMatch.league ? pinMatch.league.name : '';
-                const matchResult = findMatch(pinMatch.home, pinMatch.date, altenarCachedEvents, pinMatch.homeId, leagueName);
+                let matchResult = findMatch(pinMatch.home, pinMatch.date, altenarCachedEvents, pinMatch.homeId, leagueName);
+
+                // Fallback: matching por par home/away + tiempo para casos donde
+                // el home string llega ruidoso y findMatch(home) no alcanza score.
+                if (!matchResult) {
+                    const pairFallback = findDirectPairFallback(pinMatch, altenarCachedEvents);
+                    if (pairFallback) {
+                        matchResult = { match: pairFallback, score: 0.9, method: 'pair_fallback' };
+                    }
+                }
+
                 if (matchResult) {
                     const pairCheck = analyzePairMatch(pinMatch, matchResult.match);
                     if (pairCheck.valid && pairCheck.orientation === 'direct') {
                         pinMatch.altenarId = matchResult.match.id;  
                         pinMatch.altenarName = matchResult.match.name; 
+                        pinMatch.linkSource = 'auto';
                         if (dbMirror) {
                             dbMirror.altenarId = matchResult.match.id;
                             dbMirror.altenarName = matchResult.match.name;
+                            dbMirror.linkSource = 'auto';
                         }
                         applyLinkToDbMirror(pinMatch, matchResult.match);
                         newLinksCreated++;
@@ -425,7 +483,7 @@ export const scanPrematchOpportunities = async () => {
              }
         }
 
-        const totalLinked = pinnacleMatches.filter(m => m.altenarId).length;
+        const totalLinked = (db.data.upcomingMatches || []).filter(m => m.altenarId).length;
         console.log(`   📊 Estado del Linker: ${totalLinked} total enlazados (${newLinksCreated} nuevos en esta pasada).`);
 
         // Helper para calcular Probabilidad Real (Sin Vig) - 3 WAY (1x2)
@@ -521,6 +579,30 @@ export const scanPrematchOpportunities = async () => {
 
         // 3. PERSISTIR CAMBIOS (links + cache prematch)
         if (newLinksCreated > 0 || dbWasUpdatedFromCache) {
+            // Snapshot de trabajo (con cambios de este ciclo) antes de re-leer disco.
+            const workingRows = JSON.parse(JSON.stringify(Array.isArray(db.data?.upcomingMatches) ? db.data.upcomingMatches : []));
+
+            // Protección anti-race: si un enlace manual ocurrió mientras este ciclo corría,
+            // re-leemos la DB en disco y preservamos esos links manuales antes de escribir.
+            await db.read();
+            const freshRows = Array.isArray(db.data?.upcomingMatches) ? db.data.upcomingMatches : [];
+            const freshManualById = new Map(
+                freshRows
+                    .filter(row => row?.altenarId != null && String(row?.linkSource || '').toLowerCase() === 'manual')
+                    .map(row => [String(row.id), row])
+            );
+
+            for (const row of workingRows) {
+                const freshManual = freshManualById.get(String(row?.id));
+                if (!freshManual) continue;
+                row.altenarId = freshManual.altenarId;
+                row.altenarName = freshManual.altenarName;
+                row.linkSource = 'manual';
+                row.linkUpdatedAt = freshManual.linkUpdatedAt || row.linkUpdatedAt || new Date().toISOString();
+            }
+
+            db.data.upcomingMatches = workingRows;
+
             await writeDbWithRetry();
             if (newLinksCreated > 0) {
                 console.log(`   🔗 ${newLinksCreated} nuevos enlaces Pinnacle-Altenar guardados en DB.`);

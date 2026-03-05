@@ -265,7 +265,9 @@ const buildHistoryPayload = ({ limit = 60, pageNumber = 1, statuses = [] } = {})
   const defaults = buildRuntimeProviderParams();
   const pageSize = Math.max(10, Math.min(100, Number.isFinite(Number(limit)) ? Number(limit) : 60));
   const now = new Date();
-  const from = new Date(now.getTime() - (45 * 24 * 60 * 60 * 1000));
+  const lookbackDays = Number(getRuntimeEnvValue('BOOKY_HISTORY_LOOKBACK_DAYS', '3650'));
+  const safeLookbackDays = Number.isFinite(lookbackDays) && lookbackDays > 0 ? lookbackDays : 3650;
+  const from = new Date(now.getTime() - (safeLookbackDays * 24 * 60 * 60 * 1000));
   const normalizedStatuses = Array.isArray(statuses)
     ? statuses.filter(status => Number.isFinite(Number(status))).map(Number)
     : [];
@@ -518,7 +520,7 @@ const resolveLeagueNameFromCaches = ({ eventId, champId = null, catId = null, fa
   return null;
 };
 
-const mapRemoteHistoryItem = (entry = {}) => {
+const mapRemoteHistoryItem = (entry = {}, integrationKey = null) => {
   const selections = Array.isArray(entry?.selections) ? entry.selections : [];
   const firstSelection = selections[0] || null;
   const selectionMapped = firstSelection ? mapRemoteSelection(firstSelection) : null;
@@ -549,6 +551,7 @@ const mapRemoteHistoryItem = (entry = {}) => {
     currency: entry?.currency || null,
     eventId,
     pinnacleId: null,
+    integration: integrationKey ? normalizeBookProfile(integrationKey) : null,
     selections: selections.map(mapRemoteSelection),
     raw: entry
   };
@@ -560,10 +563,12 @@ const getCachedRemoteHistory = (limit = 60, profileKey = null) => {
   const cache = profileStore.remoteHistory || db.data?.booky?.remoteHistory || {};
   const items = Array.isArray(cache.items) ? cache.items : [];
   const updatedAt = cache.updatedAt || null;
-  const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 60;
+  const max = Number.isFinite(Number(limit))
+    ? (Number(limit) > 0 ? Math.max(1, Number(limit)) : null)
+    : 60;
 
   return {
-    items: items.slice(0, max),
+    items: max === null ? items : items.slice(0, max),
     updatedAt,
     source: cache.source || 'cache',
     stale: true,
@@ -585,6 +590,257 @@ const getEntryTimestampMs = (entry = {}) => {
   return Number.isFinite(ts) ? ts : 0;
 };
 
+const resolveRowPnl = (row = {}) => {
+  const status = Number(row?.status);
+  if (!Number.isFinite(status)) return 0;
+
+  const stake = Number(row?.stake);
+  const payout = Number(row?.payout);
+  const potentialReturn = Number(row?.potentialReturn);
+
+  const safeStake = Number.isFinite(stake) ? stake : 0;
+  if (status === 2) return -Math.abs(safeStake);
+  if (status === 4 || status === 18) return 0;
+
+  if (status === 8) {
+    if (Number.isFinite(payout) && payout >= 0) return payout - safeStake;
+    return 0;
+  }
+
+  // En este feed status=1 corresponde a apuesta liquidada ganadora
+  // con retorno informado en potentialReturn.
+  if (status === 1) {
+    if (Number.isFinite(payout) && payout > 0) return payout - safeStake;
+    if (Number.isFinite(potentialReturn) && potentialReturn > 0) return potentialReturn - safeStake;
+    return 0;
+  }
+
+  if (BOOKY_SETTLED_PROVIDER_STATUSES.has(status)) {
+    if (Number.isFinite(payout) && payout > 0) return payout - safeStake;
+    if (Number.isFinite(potentialReturn) && potentialReturn > 0 && safeStake > 0) return potentialReturn - safeStake;
+  }
+
+  return 0;
+};
+
+const computeRealizedPnl = (rows = [], { integration = null, allowedProviderBetIds = null } = {}) => {
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+  const normalizedIntegration = integration ? normalizeBookProfile(integration) : null;
+  const allowedIds = allowedProviderBetIds instanceof Set ? allowedProviderBetIds : null;
+
+  const buildCanonicalKey = (row = {}) => {
+    const providerBetId = row?.providerBetId;
+    if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
+      return `pb_${providerBetId}`;
+    }
+
+    const requestId = String(row?.requestId || '').trim();
+    if (requestId) return `rq_${requestId}`;
+
+    const match = String(row?.match || '').trim().toLowerCase();
+    const market = String(row?.market || '').trim().toLowerCase();
+    const selection = String(row?.selection || '').trim().toLowerCase();
+    const stake = Number.isFinite(Number(row?.stake)) ? Number(row.stake).toFixed(2) : '0.00';
+    const placedTs = Date.parse(row?.placedAt || row?.updatedAt || row?.createdAt || 0);
+    const minuteBucket = Number.isFinite(placedTs) ? Math.floor(placedTs / 60000) : 0;
+    return `fp_${match}|${market}|${selection}|${stake}|${minuteBucket}`;
+  };
+
+  const preferRow = (current = {}, incoming = {}) => {
+    const curRemote = String(current?.source || '').toLowerCase() === 'remote';
+    const incRemote = String(incoming?.source || '').toLowerCase() === 'remote';
+    if (curRemote !== incRemote) return incRemote ? incoming : current;
+
+    const curTs = getEntryTimestampMs(current);
+    const incTs = getEntryTimestampMs(incoming);
+    return incTs >= curTs ? incoming : current;
+  };
+
+  const eligibleRows = [];
+  for (const row of rows) {
+    if (normalizedIntegration) {
+      const raw = String(row?.integration || '').trim();
+      if (raw) {
+        const rowIntegration = normalizeBookProfile(raw);
+        if (rowIntegration !== normalizedIntegration) continue;
+      } else if (allowedIds) {
+        const providerBetId = row?.providerBetId;
+        const providerKey = (providerBetId === null || providerBetId === undefined || providerBetId === '')
+          ? null
+          : String(providerBetId);
+        if (!providerKey || !allowedIds.has(providerKey)) continue;
+      }
+    }
+    eligibleRows.push(row);
+  }
+
+  const dedupedMap = new Map();
+  for (const row of eligibleRows) {
+    const key = buildCanonicalKey(row);
+    const existing = dedupedMap.get(key);
+    dedupedMap.set(key, existing ? preferRow(existing, row) : row);
+  }
+
+  const dedupedRows = Array.from(dedupedMap.values());
+  return dedupedRows.reduce((acc, row) => {
+    return acc + resolveRowPnl(row);
+  }, 0);
+};
+
+const computePnlBreakdown = (rows = [], { integration = null, allowedProviderBetIds = null } = {}) => {
+  const summary = {
+    rowsEvaluated: 0,
+    rowsIgnored: 0,
+    open: { count: 0, stake: 0, potentialReturn: 0, unrealizedPnl: 0 },
+    won: { count: 0, pnl: 0, stake: 0 },
+    lost: { count: 0, pnl: 0, stake: 0 },
+    voided: { count: 0, pnl: 0, stake: 0 },
+    cashout: { count: 0, pnl: 0, stake: 0 },
+    otherSettled: { count: 0, pnl: 0, stake: 0 }
+  };
+
+  const normalizedIntegration = integration ? normalizeBookProfile(integration) : null;
+  const allowedIds = allowedProviderBetIds instanceof Set ? allowedProviderBetIds : null;
+
+  const buildCanonicalKey = (row = {}) => {
+    const providerBetId = row?.providerBetId;
+    if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
+      return `pb_${providerBetId}`;
+    }
+
+    const requestId = String(row?.requestId || '').trim();
+    if (requestId) return `rq_${requestId}`;
+
+    const match = String(row?.match || '').trim().toLowerCase();
+    const market = String(row?.market || '').trim().toLowerCase();
+    const selection = String(row?.selection || '').trim().toLowerCase();
+    const stake = Number.isFinite(Number(row?.stake)) ? Number(row.stake).toFixed(2) : '0.00';
+    const placedTs = Date.parse(row?.placedAt || row?.updatedAt || row?.createdAt || 0);
+    const minuteBucket = Number.isFinite(placedTs) ? Math.floor(placedTs / 60000) : 0;
+    return `fp_${match}|${market}|${selection}|${stake}|${minuteBucket}`;
+  };
+
+  const preferRow = (current = {}, incoming = {}) => {
+    const curRemote = String(current?.source || '').toLowerCase() === 'remote';
+    const incRemote = String(incoming?.source || '').toLowerCase() === 'remote';
+    if (curRemote !== incRemote) return incRemote ? incoming : current;
+
+    const curTs = getEntryTimestampMs(current);
+    const incTs = getEntryTimestampMs(incoming);
+    return incTs >= curTs ? incoming : current;
+  };
+
+  const eligible = (row) => {
+    if (!normalizedIntegration) return true;
+    const raw = String(row?.integration || '').trim();
+    if (raw) {
+      return normalizeBookProfile(raw) === normalizedIntegration;
+    }
+    if (allowedIds) {
+      const providerBetId = row?.providerBetId;
+      const providerKey = (providerBetId === null || providerBetId === undefined || providerBetId === '')
+        ? null
+        : String(providerBetId);
+      return Boolean(providerKey && allowedIds.has(providerKey));
+    }
+    return true;
+  };
+
+  const candidateRows = [];
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    if (!eligible(row)) continue;
+    candidateRows.push(row);
+  }
+
+  const dedupedMap = new Map();
+  for (const row of candidateRows) {
+    const key = buildCanonicalKey(row);
+    const existing = dedupedMap.get(key);
+    dedupedMap.set(key, existing ? preferRow(existing, row) : row);
+  }
+
+  for (const row of dedupedMap.values()) {
+
+    const status = Number(row?.status);
+    const stake = Number.isFinite(Number(row?.stake)) ? Number(row.stake) : 0;
+    if (!Number.isFinite(status)) {
+      summary.rowsIgnored += 1;
+      continue;
+    }
+
+    summary.rowsEvaluated += 1;
+
+    if (status === 0) {
+      summary.open.count += 1;
+      summary.open.stake += stake;
+      const potentialReturn = Number.isFinite(Number(row?.potentialReturn)) ? Number(row.potentialReturn) : 0;
+      summary.open.potentialReturn += potentialReturn;
+      summary.open.unrealizedPnl += (potentialReturn - stake);
+      continue;
+    }
+
+    const pnl = resolveRowPnl(row);
+
+    if (status === 1) {
+      summary.won.count += 1;
+      summary.won.pnl += pnl;
+      summary.won.stake += stake;
+      continue;
+    }
+
+    if (status === 2) {
+      summary.lost.count += 1;
+      summary.lost.pnl += pnl;
+      summary.lost.stake += stake;
+      continue;
+    }
+
+    if (status === 4 || status === 18) {
+      summary.voided.count += 1;
+      summary.voided.pnl += pnl;
+      summary.voided.stake += stake;
+      continue;
+    }
+
+    if (status === 8) {
+      summary.cashout.count += 1;
+      summary.cashout.pnl += pnl;
+      summary.cashout.stake += stake;
+      continue;
+    }
+
+    if (BOOKY_SETTLED_PROVIDER_STATUSES.has(status)) {
+      summary.otherSettled.count += 1;
+      summary.otherSettled.pnl += pnl;
+      summary.otherSettled.stake += stake;
+    }
+  }
+
+  for (const key of ['open', 'won', 'lost', 'voided', 'cashout', 'otherSettled']) {
+    summary[key].pnl = Number((summary[key].pnl || 0).toFixed(2));
+    summary[key].stake = Number((summary[key].stake || 0).toFixed(2));
+  }
+  summary.open.potentialReturn = Number((summary.open.potentialReturn || 0).toFixed(2));
+  summary.open.unrealizedPnl = Number((summary.open.unrealizedPnl || 0).toFixed(2));
+
+  return summary;
+};
+
+const isProviderStatusSettled = (status) => {
+  const code = Number(status);
+  if (!Number.isFinite(code)) return false;
+  return code !== 0;
+};
+
+const shouldPromoteHistoryRow = (existing = {}, incoming = {}) => {
+  const currentStatus = Number(existing?.status);
+  const nextStatus = Number(incoming?.status);
+  if (!Number.isFinite(nextStatus)) return false;
+
+  // Solo permitimos actualizar una fila existente si pasa de abierta a liquidada.
+  return !isProviderStatusSettled(currentStatus) && isProviderStatusSettled(nextStatus);
+};
+
 const upsertProfileHistory = (profileKey, rows = []) => {
   const key = normalizeBookProfile(profileKey || getActiveProfileContext().key);
   const profileStore = getProfileStore(key, true);
@@ -602,11 +858,46 @@ const upsertProfileHistory = (profileKey, rows = []) => {
     const rowKey = row.providerBetId
       ? `pb_${row.providerBetId}`
       : `${row.match || 'na'}_${row.placedAt || 'na'}_${row.stake || 0}`;
-    merged.set(rowKey, row);
+    const existing = merged.get(rowKey);
+    if (!existing) {
+      merged.set(rowKey, row);
+      continue;
+    }
+
+    if (shouldPromoteHistoryRow(existing, row)) {
+      merged.set(rowKey, { ...existing, ...row });
+    }
   }
 
   const maxItems = Math.max(100, Number(getRuntimeEnvValue('BOOKY_PROFILE_HISTORY_MAX_ITEMS', String(DEFAULT_PROFILE_HISTORY_MAX_ITEMS))) || DEFAULT_PROFILE_HISTORY_MAX_ITEMS);
   profileStore.history = Array.from(merged.values())
+    .sort((a, b) => getEntryTimestampMs(b) - getEntryTimestampMs(a))
+    .slice(0, maxItems);
+  profileStore.updatedAt = nowIso();
+};
+
+const replaceProfileHistory = (profileKey, rows = []) => {
+  const key = normalizeBookProfile(profileKey || getActiveProfileContext().key);
+  const profileStore = getProfileStore(key, true);
+  const dedup = new Map();
+
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    const rowKey = row.providerBetId
+      ? `pb_${row.providerBetId}`
+      : `${row.match || 'na'}_${row.placedAt || 'na'}_${row.stake || 0}`;
+    const current = dedup.get(rowKey);
+    if (!current) {
+      dedup.set(rowKey, row);
+      continue;
+    }
+
+    const curTs = getEntryTimestampMs(current);
+    const nextTs = getEntryTimestampMs(row);
+    dedup.set(rowKey, nextTs >= curTs ? row : current);
+  }
+
+  const maxItems = Math.max(100, Number(getRuntimeEnvValue('BOOKY_PROFILE_HISTORY_MAX_ITEMS', String(DEFAULT_PROFILE_HISTORY_MAX_ITEMS))) || DEFAULT_PROFILE_HISTORY_MAX_ITEMS);
+  profileStore.history = Array.from(dedup.values())
     .sort((a, b) => getEntryTimestampMs(b) - getEntryTimestampMs(a))
     .slice(0, maxItems);
   profileStore.updatedAt = nowIso();
@@ -666,10 +957,18 @@ const pruneRowsByRetention = (rows = [], retentionDays = DEFAULT_HISTORY_RETENTI
   return (Array.isArray(rows) ? rows : []).filter(item => getEntryTimestampMs(item) >= cutoffMs);
 };
 
-const requestRemoteBetHistory = async (auth, limit = 60) => {
+const requestRemoteBetHistory = async (auth, limit = 60, integrationKey = null, { fetchAll = false } = {}) => {
   const baseUrl = getBetHistoryBaseUrl();
   const headers = buildProviderHeaders(auth);
-  const target = Math.max(10, Math.min(300, Number.isFinite(Number(limit)) ? Number(limit) : 60));
+  const maxRows = Number(getRuntimeEnvValue('BOOKY_HISTORY_MAX_REMOTE_ROWS', '20000'));
+  const safeMaxRows = Number.isFinite(maxRows) && maxRows > 0 ? maxRows : 20000;
+  const requested = Number.isFinite(Number(limit)) ? Number(limit) : 60;
+  const target = fetchAll || requested <= 0
+    ? safeMaxRows
+    : Math.max(10, Math.min(safeMaxRows, requested));
+  const maxPages = Number(getRuntimeEnvValue('BOOKY_HISTORY_MAX_PAGES', '120'));
+  const safeMaxPages = Number.isFinite(maxPages) && maxPages > 0 ? maxPages : 120;
+  const pageSize = Math.min(100, Math.max(20, Number(getRuntimeEnvValue('BOOKY_HISTORY_PAGE_SIZE', '100')) || 100));
   const timeout = 20000;
   const endpoint = 'WidgetReports/widgetExpandedBetHistory';
   const url = `${baseUrl}${endpoint}`;
@@ -684,9 +983,9 @@ const requestRemoteBetHistory = async (auth, limit = 60) => {
   for (const statuses of statusGroups) {
     let pageNumber = 1;
 
-    while (pageNumber <= 6 && dedup.size < target) {
+    while (pageNumber <= safeMaxPages && dedup.size < target) {
       const payload = buildHistoryPayload({
-        limit: Math.min(50, target),
+        limit: Math.min(pageSize, target),
         pageNumber,
         statuses
       });
@@ -694,7 +993,7 @@ const requestRemoteBetHistory = async (auth, limit = 60) => {
       try {
         const postResp = await altenarClient.post(url, payload, { headers, timeout });
         const body = postResp?.data || {};
-        const rows = pickArrayCandidate(body).map(mapRemoteHistoryItem);
+        const rows = pickArrayCandidate(body).map(item => mapRemoteHistoryItem(item, integrationKey));
 
         for (const row of rows) {
           const key = row.providerBetId
@@ -751,7 +1050,7 @@ const requestRemoteOpenBetsCount = async (auth) => {
   }
 };
 
-export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60, profileKey = null } = {}) => {
+export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60, profileKey = null, fetchAll = false } = {}) => {
   await initDB();
   await db.read();
   ensureBookyStore();
@@ -764,8 +1063,14 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
   const memoryHistoryCache = memoryHistoryCacheByProfile.get(key) || null;
 
   if (!forceRefresh && memoryHistoryCache?.updatedAtMs && (now - memoryHistoryCache.updatedAtMs) < refreshMs) {
-    const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 60;
-    return { ...memoryHistoryCache.value, items: memoryHistoryCache.value.items.slice(0, max), stale: false };
+    const max = Number.isFinite(Number(limit))
+      ? (Number(limit) > 0 ? Math.max(1, Number(limit)) : null)
+      : 60;
+    return {
+      ...memoryHistoryCache.value,
+      items: max === null ? memoryHistoryCache.value.items : memoryHistoryCache.value.items.slice(0, max),
+      stale: false
+    };
   }
 
   const cached = getCachedRemoteHistory(limit, key);
@@ -790,7 +1095,7 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
   }
 
   try {
-    const remote = await requestRemoteBetHistory(auth, limit);
+    const remote = await requestRemoteBetHistory(auth, limit, key, { fetchAll });
     const dedup = new Map();
     for (const row of remote.rows) {
       const key = row.providerBetId ? `pb_${row.providerBetId}` : `${row.match || 'na'}_${row.placedAt || 'na'}_${row.stake || 0}`;
@@ -864,10 +1169,12 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
       value: normalized
     });
 
-    const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 60;
+    const max = Number.isFinite(Number(limit))
+      ? (Number(limit) > 0 ? Math.max(1, Number(limit)) : null)
+      : 60;
     return {
       ...normalized,
-      items: normalized.items.slice(0, max)
+      items: max === null ? normalized.items : normalized.items.slice(0, max)
     };
   } catch (error) {
     return {
@@ -1036,11 +1343,12 @@ const mapBookyHistoryItem = (entry = {}) => {
   const opportunity = entry.opportunity || {};
   const placedAt = entry.realPlacement?.placedAt || entry.confirmedAt || entry.updatedAt || entry.createdAt || null;
   const providerBetId = entry.realPlacement?.response?.bets?.[0]?.id || null;
+  const providerStatus = Number(entry?.realPlacement?.providerStatus);
   const integration = normalizeBookProfile(entry?.payload?.integration || entry?.opportunity?.integration || '');
 
   return {
     ticketId: entry.id || null,
-    status: entry.status || null,
+    status: Number.isFinite(providerStatus) ? providerStatus : null,
     placedAt,
     requestId: entry.realPlacement?.requestId || null,
     providerBetId,
@@ -1067,15 +1375,15 @@ export const getBookyHistory = async (limit = 60) => {
 
   const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 60;
   const history = Array.isArray(db.data.booky.history) ? db.data.booky.history : [];
-  const localRows = history
+  const localRowsAll = history
     .filter(item => item?.realPlacement)
     .map(mapBookyHistoryItem)
+    .filter(row => row?.providerBetId)
     .filter(row => !row.integration || row.integration === ctx.integration)
-    .slice(-max)
     .reverse()
     .map(row => ({ ...row, source: 'local' }));
 
-  const remote = await syncRemoteBookyHistory({ forceRefresh: false, limit: max * 2, profileKey: ctx.key });
+  const remote = await syncRemoteBookyHistory({ forceRefresh: false, limit: 0, profileKey: ctx.key, fetchAll: true });
   const remoteRows = Array.isArray(remote?.items) ? remote.items : [];
 
   const reconciledActiveBetsCount = reconcilePortfolioActiveBetsFromRemote(remoteRows);
@@ -1084,7 +1392,7 @@ export const getBookyHistory = async (limit = 60) => {
   }
 
   if (remoteRows.length === 0) {
-    return localRows;
+    return localRowsAll.slice(0, max);
   }
 
   const merged = new Map();
@@ -1094,7 +1402,7 @@ export const getBookyHistory = async (limit = 60) => {
     merged.set(key, row);
   }
 
-  for (const row of localRows) {
+  for (const row of localRowsAll) {
     const key = row.providerBetId ? `pb_${row.providerBetId}` : `${row.match || 'na'}_${row.placedAt || 'na'}_${row.stake || 0}`;
     if (!merged.has(key)) {
       merged.set(key, row);
@@ -1111,8 +1419,7 @@ export const getBookyHistory = async (limit = 60) => {
   }
 
   const rows = Array.from(merged.values())
-    .sort((a, b) => new Date(b.placedAt || 0) - new Date(a.placedAt || 0))
-    .slice(0, max);
+    .sort((a, b) => new Date(b.placedAt || 0) - new Date(a.placedAt || 0));
 
   const localTypeByProvider = new Map();
   for (const item of history) {
@@ -1141,10 +1448,10 @@ export const getBookyHistory = async (limit = 60) => {
     };
   });
 
-  upsertProfileHistory(ctx.key, enrichedRows);
+  replaceProfileHistory(ctx.key, enrichedRows);
   await db.write();
 
-  return enrichedRows;
+  return enrichedRows.slice(0, max);
 };
 
 export const cleanupBookyHistoricalData = async ({ retentionDays, maxPerProfile } = {}) => {
@@ -1213,6 +1520,27 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
     await cleanupBookyHistoricalData({ retentionDays });
   }
   const history = await getBookyHistory(historyLimit);
+  const profileStore = getProfileStore(ctx.key, false);
+  const fullProfileHistory = Array.isArray(profileStore?.history) ? profileStore.history : [];
+  const localBookyHistory = Array.isArray(db.data?.booky?.history) ? db.data.booky.history : [];
+  const allowedProviderBetIds = new Set(
+    localBookyHistory
+      .filter((ticket) => normalizeBookProfile(String(ticket?.payload?.integration || '').trim()) === ctx.integration)
+      .map((ticket) => ticket?.realPlacement?.response?.bets?.[0]?.id)
+      .filter((id) => id !== null && id !== undefined && id !== '')
+      .map((id) => String(id))
+  );
+  const pnlRealized = computeRealizedPnl(fullProfileHistory, {
+    integration: ctx.integration,
+    allowedProviderBetIds
+  });
+  const pnlBreakdown = computePnlBreakdown(fullProfileHistory, {
+    integration: ctx.integration,
+    allowedProviderBetIds
+  });
+  const pnlTotal = Number((pnlRealized - Number(pnlBreakdown?.open?.stake || 0)).toFixed(2));
+  const pnlSource = 'profile-history-extended-db';
+
   const profile = ctx.profile;
 
   return {
@@ -1221,6 +1549,15 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
     balance,
     history,
     historyCount: history.length,
+    historyTotalCount: fullProfileHistory.length,
+    pnl: {
+      realized: Number(pnlRealized.toFixed(2)),
+      total: pnlTotal,
+      source: pnlSource,
+      netAfterOpenStake: pnlTotal,
+      rowsCount: fullProfileHistory.length,
+      breakdown: pnlBreakdown
+    },
     fetchedAt: nowIso()
   };
 };
