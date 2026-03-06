@@ -171,6 +171,7 @@ export const placeAutoBet = async (opportunity) => {
             pick: pick, // Código interno calculado arriba
             odd: odd,
             realProb: realProb,
+            ev: Number.isFinite(Number(opportunity.ev)) ? Number(opportunity.ev) : null,
             stake: stake,         
             status: 'PENDING',
             initialScore: opportunity.score || "0-0", // Guardamos score inicial

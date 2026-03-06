@@ -133,9 +133,11 @@ const ManualMatcher = () => {
             try {
                 await doLink();
             } catch (linkError) {
+                const status = Number(linkError?.response?.status);
                 const linkMsg = String(linkError?.response?.data?.error || linkError?.message || '').toLowerCase();
                 const isTimeout = linkError?.code === 'ECONNABORTED' || linkMsg.includes('timeout');
-                if (!isTimeout) throw linkError;
+                const isRace409 = status === 409;
+                if (!isTimeout && !isRace409) throw linkError;
 
                 await new Promise(resolve => setTimeout(resolve, 700));
                 await doLink();
@@ -152,7 +154,13 @@ const ManualMatcher = () => {
             setSelectedAlt(null);
             setFilterAlt('');
         } catch (e) {
-            alert("Error linking: " + e.message);
+            const status = Number(e?.response?.status);
+            const serverMsg = e?.response?.data?.error;
+            const baseMsg = serverMsg || e?.message || 'Error desconocido';
+            const helper = status === 409
+                ? '\n\nTip: hubo una carrera de escritura; actualiza y vuelve a intentar en 1-2s.'
+                : '';
+            alert("Error linking: " + baseMsg + helper);
         } finally {
             setLinking(false);
         }

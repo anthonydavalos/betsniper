@@ -12,6 +12,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Ajustamos path para que apunte a data/ en la RAIZ (../data desde src/services está mal, necesitamos ../../data)
 const STALE_TRIGGER_FILE = path.join(__dirname, '../../data/pinnacle_stale.trigger');
+const STALE_TRIGGER_MIN_INTERVAL_MS = Math.max(30000, Number(process.env.PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS || 180000));
+let lastStaleTriggerAt = 0;
 
 const parseThresholdFromEnv = (rawValue, fallback, envName, sourceTag) => {
     if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
@@ -508,10 +510,16 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         // O si estamos en modo agresivo, eliminar el archivo 'pinnacle_live.json' para forzar refetch
                         
                         // [V3] Escribir el archivo TRIGGER para que el proceso PinnacleGateway se reinicie
-                        if (!fs.existsSync(STALE_TRIGGER_FILE)) {
-                             // Escribir Timestamp como motivo
-                             fs.writeFileSync(STALE_TRIGGER_FILE, new Date().toISOString());
-                             console.warn("🔄 REINICIO FORZADO ENVIADO AL GATEWAY!");
+                        const nowMs = Date.now();
+                        const cooldownPassed = (nowMs - lastStaleTriggerAt) >= STALE_TRIGGER_MIN_INTERVAL_MS;
+
+                        if (!cooldownPassed) {
+                            console.warn(`⏱️ Trigger stale suprimido por cooldown (${Math.ceil((STALE_TRIGGER_MIN_INTERVAL_MS - (nowMs - lastStaleTriggerAt)) / 1000)}s restantes).`);
+                        } else if (!fs.existsSync(STALE_TRIGGER_FILE)) {
+                            // Escribir Timestamp como motivo
+                            fs.writeFileSync(STALE_TRIGGER_FILE, new Date().toISOString());
+                            lastStaleTriggerAt = nowMs;
+                            console.warn("🔄 REINICIO FORZADO ENVIADO AL GATEWAY!");
                         }
                     } catch (err) {
                         console.error("Error triggering restart logic", err);

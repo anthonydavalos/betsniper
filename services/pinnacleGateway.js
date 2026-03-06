@@ -10,6 +10,8 @@ const projectRoot = path.resolve(__dirname, '..');
 // Configuration
 const REFRESH_INTERVAL = 30 * 60 * 1000; // 30 minutes
 const CHECK_STALE_FILE = path.join(__dirname, '../data/pinnacle_stale.trigger'); // Trigger File
+const ARCADIA_WS_PATH = 'api.arcadia.pinnacle.com/ws';
+const ARCADIA_HTTP_HOST = 'api.arcadia.pinnacle.com';
 
 const OUTPUT_FILE = path.join(__dirname, '../data/pinnacle_live.json');
 const TOKEN_FILE = path.join(__dirname, '../data/pinnacle_token.json');
@@ -38,16 +40,55 @@ class PinnacleGateway {
         };
         this.autoCloseEnabled = (process.env.PINNACLE_AUTO_CLOSE_ON_VALID_SOCKET || 'true').toLowerCase() !== 'false';
         this.autoCloseDelayMs = Math.max(500, Number(process.env.PINNACLE_AUTO_CLOSE_DELAY_MS || 1800));
+        this.autoCloseMinReadyMs = Math.max(0, Number(process.env.PINNACLE_AUTO_CLOSE_MIN_READY_MS || 25000));
+        this.arcadiaMinSockets = Math.max(1, Number(process.env.PINNACLE_ARCADIA_MIN_SOCKETS || 2));
+        this.staleReloadGraceMs = Math.max(0, Number(process.env.PINNACLE_STALE_RELOAD_GRACE_MS || 600000));
+        this.startedAtMs = Date.now();
         this.autoCloseTriggered = false;
         this.socketDetected = false;
         this.sessionDetected = false;
         this.firstFrameReceived = false;
+        this.arcadiaSocketRequestIds = new Set();
+    }
+
+    buildAutoCloseChecklist(reason = 'valid-socket') {
+        const elapsedMs = Date.now() - this.startedAtMs;
+        const socketsSeen = this.arcadiaSocketRequestIds.size;
+
+        return {
+            reason,
+            autoCloseEnabled: this.autoCloseEnabled,
+            alreadyTriggered: this.autoCloseTriggered,
+            sessionDetected: this.sessionDetected,
+            socketDetected: this.socketDetected,
+            firstFrameReceived: this.firstFrameReceived,
+            arcadiaSockets: `${socketsSeen}/${this.arcadiaMinSockets}`,
+            readyWindowOk: elapsedMs >= this.autoCloseMinReadyMs,
+            elapsedMs,
+            delayMs: this.autoCloseDelayMs
+        };
     }
 
     maybeAutoClose(reason = 'valid-socket') {
         if (!this.autoCloseEnabled) return;
         if (this.autoCloseTriggered) return;
         if (!this.socketDetected || !this.sessionDetected) return;
+        if (!this.firstFrameReceived) return;
+        if (this.arcadiaSocketRequestIds.size < this.arcadiaMinSockets) {
+            console.log(`⏳ Auto-close en espera: sockets Arcadia ${this.arcadiaSocketRequestIds.size}/${this.arcadiaMinSockets}.`);
+            return;
+        }
+
+        const elapsedMs = Date.now() - this.startedAtMs;
+        if (elapsedMs < this.autoCloseMinReadyMs) {
+            const waitMs = this.autoCloseMinReadyMs - elapsedMs;
+            console.log(`⏳ Socket detectado, pero esperando ${Math.ceil(waitMs / 1000)}s para evitar cierre prematuro durante login...`);
+            setTimeout(() => this.maybeAutoClose('min-ready-window'), waitMs + 100);
+            return;
+        }
+
+        const checklist = this.buildAutoCloseChecklist(reason);
+        console.log(`🧪 Auto-close checklist: ${JSON.stringify(checklist)}`);
 
         this.autoCloseTriggered = true;
         console.log(`✅ Socket Arcadia válido detectado (${reason}). Cerrando Chrome automáticamente en ${this.autoCloseDelayMs}ms...`);
@@ -131,9 +172,13 @@ class PinnacleGateway {
             console.log(`   🔗 URL: ${url}`);
             console.log(`   📂 Initiator: ${JSON.stringify(initiator || {}, null, 2)}`);
             this.socketUrl = url;
-            if (String(url || '').includes('api.arcadia.pinnacle.com/ws')) {
+            if (String(url || '').includes(ARCADIA_WS_PATH)) {
+                this.arcadiaSocketRequestIds.add(String(requestId || ''));
                 this.socketDetected = true;
-                this.maybeAutoClose('websocket-created');
+                console.log(`✅ Socket Arcadia detectado (${this.arcadiaSocketRequestIds.size}/${this.arcadiaMinSockets}).`);
+                this.maybeAutoClose('arcadia-websocket-created');
+            } else {
+                console.log(`ℹ️ Socket ignorado (no Arcadia): ${url}`);
             }
             // Intentar obtener los headers extra de la solicitud original puede requerir 'Network.requestWillBeSent'
         });
@@ -142,8 +187,9 @@ class PinnacleGateway {
         
         this.client.on('Network.requestWillBeSent', (params) => {
             const reqUrl = params.request.url;
-            // Capturar headers de Arcadio o Websocket
-            if (reqUrl.includes('api.arcadia.pinnacle.com') || reqUrl.startsWith('wss://')) {
+            const isArcadiaRequest = reqUrl.includes(ARCADIA_HTTP_HOST);
+            // Capturar headers SOLO de Arcadia para evitar falsos positivos (geocomply/local ws)
+            if (isArcadiaRequest) {
                 // Filtrar headers irrelevantes
                 const h = params.request.headers;
                 if (h['X-Session'] || h['x-session']) {
@@ -158,7 +204,7 @@ class PinnacleGateway {
                     fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData, null, 2));
                     console.log("💾 Token actualizado en disco... (Sigue navegando/logueándote)");
                     this.sessionDetected = true;
-                    this.maybeAutoClose('x-session-captured');
+                    this.maybeAutoClose('arcadia-x-session-captured');
                 }
             }
         });
@@ -193,6 +239,13 @@ class PinnacleGateway {
             this.staleCheckInterval = setInterval(() => {
                 try {
                     if (fs.existsSync(CHECK_STALE_FILE)) {
+                        const elapsedMs = Date.now() - this.startedAtMs;
+                        if (elapsedMs < this.staleReloadGraceMs) {
+                            fs.unlinkSync(CHECK_STALE_FILE);
+                            console.log('🛡️ Trigger stale ignorado durante fase de login manual.');
+                            return;
+                        }
+
                         console.warn("⚠️ DETECTADA SOLICITUD DE REINICIO POR STALE DATA! ⚠️");
                         console.warn("🔄 Recargando página para renovar Socket...");
                         
@@ -232,6 +285,7 @@ class PinnacleGateway {
 
     handleFrame({ requestId, response }) {
         if (!response.payloadData) return;
+        if (!this.arcadiaSocketRequestIds.has(String(requestId || ''))) return;
         
         try {
             // Decoding
@@ -253,7 +307,7 @@ class PinnacleGateway {
                 const data = JSON.parse(jsonStr);
                 if (!this.firstFrameReceived) {
                     this.firstFrameReceived = true;
-                    this.maybeAutoClose('first-websocket-frame');
+                    this.maybeAutoClose('arcadia-first-websocket-frame');
                 }
                 
                 // DEBUG: Log everything to a raw dump file to analyze structure

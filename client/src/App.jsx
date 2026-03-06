@@ -49,6 +49,7 @@ function getOpportunityId(op) {
 
 const BOOKY_SETTLED_STATUSES = new Set([1, 2, 4, 8, 18]);
 const isBookyOpenStatus = (value) => Number(value) === 0;
+const OPTIMISTIC_BET_TTL_MS = 20000;
 
 const resolveBookyOutcome = (row = {}) => {
     const status = Number(row?.status);
@@ -193,6 +194,31 @@ const resolveOpBetTimeIso = (row = {}, fallbackRow = null) => {
 
     const date = candidate ? new Date(candidate) : null;
     return date && Number.isFinite(date.getTime()) ? date.toISOString() : null;
+};
+
+const resolvePlacementTimingOrigin = (row = {}, fallbackRow = null) => {
+    const eventStartIso = resolveOpEventStartIso(row) || resolveOpEventStartIso(fallbackRow || {});
+    const betTimeIso = resolveOpBetTimeIso(row, fallbackRow);
+
+    const eventStartMs = eventStartIso ? new Date(eventStartIso).getTime() : NaN;
+    const betPlacedMs = betTimeIso ? new Date(betTimeIso).getTime() : NaN;
+    const hasValidTiming = Number.isFinite(eventStartMs) && Number.isFinite(betPlacedMs);
+
+    const inferredLiveByTiming = hasValidTiming
+        ? betPlacedMs >= (eventStartMs + (2 * 60 * 1000))
+        : false;
+
+    const inferredPrematchByTiming = hasValidTiming
+        ? betPlacedMs < (eventStartMs + (2 * 60 * 1000))
+        : false;
+
+    return {
+        hasValidTiming,
+        inferredLiveByTiming,
+        inferredPrematchByTiming,
+        eventStartIso,
+        betTimeIso
+    };
 };
 
 const formatTimeSafe = (candidate) => {
@@ -412,7 +438,14 @@ const hasLiveClockSignal = (value = '') => {
     const txt = String(value || '').trim().toUpperCase();
     if (!txt) return false;
     if (txt === 'HT' || txt === 'HALF TIME' || txt === 'FINAL' || txt === 'FT') return true;
-    return /\b\d{1,3}\s*'?\b/.test(txt);
+
+    // Evitar confundir hora calendario (ej: 02:09 p. m.) con minuto de juego.
+    const normalized = txt.replace(/\s+/g, ' ').trim();
+    if (/\b(A\.?\s*M\.?|P\.?\s*M\.?|AM|PM)\b/i.test(normalized)) return false;
+    if (normalized.includes(':')) return false;
+
+    // Señales válidas de reloj futbolístico: 12', 45+2', 90, 90+4 min
+    return /\b\d{1,3}(?:\+\d{1,2})?\s*'?\s*(MIN)?\b/i.test(normalized);
 };
 
 const isLiveOriginOpportunity = (op = {}) => {
@@ -496,6 +529,7 @@ function App() {
         fetchedAt: null
     });
     const [tokenHealth, setTokenHealth] = useState(null);
+    const [kellyDiagnostics, setKellyDiagnostics] = useState(null);
   
   const [loading, setLoading] = useState(false);
   
@@ -516,11 +550,13 @@ function App() {
   const prevOddsRef = useRef({}); // [NEW] Cache para detectar tendencias de cuotas
     const fetchInFlightRef = useRef(false);
     const lastBookyAccountFetchAtRef = useRef(0);
+    const lastKellyDiagnosticsFetchAtRef = useRef(0);
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
   const localDiscardedIdsRef = useRef(new Set());
   const localPlacedBetIdsRef = useRef(new Set());
   const pendingBetDetailsRef = useRef({});
+    const optimisticWarnedIdsRef = useRef(new Set());
 
   // Trigger re-render when we update refs (hacky but works for instant feedback)
   const [, setTick] = useState(0);
@@ -535,9 +571,11 @@ function App() {
     try {
                         const nowMs = Date.now();
                         const shouldFetchBooky = forceBookyRefresh || (nowMs - lastBookyAccountFetchAtRef.current) >= 15000;
+                        const shouldFetchKellyDiagnostics = forceBookyRefresh || (nowMs - lastKellyDiagnosticsFetchAtRef.current) >= 60000;
+                        const bookyHistoryLimit = 300;
                         const bookyAccountUrl = forceBookyRefresh
-                            ? '/api/booky/account?refresh=1&historyLimit=60'
-                            : '/api/booky/account?historyLimit=60';
+                            ? `/api/booky/account?refresh=1&historyLimit=${bookyHistoryLimit}`
+                            : `/api/booky/account?historyLimit=${bookyHistoryLimit}`;
 
             const baseRequests = [
                 axios.get('/api/opportunities/live'),
@@ -571,6 +609,20 @@ function App() {
                     if (tokenRes?.data?.success) setTokenHealth(tokenRes.data.token);
             } catch (_) {
                     setTokenHealth(null);
+            }
+
+            if (shouldFetchKellyDiagnostics) {
+                try {
+                    const kellyRes = await axios.get('/api/booky/kelly-diagnostics?horizonBets=200&simulations=400&ruinThreshold=0.5', {
+                        timeout: forceBookyRefresh ? 12000 : 8000
+                    });
+                    if (kellyRes?.data?.success) {
+                        setKellyDiagnostics(kellyRes.data);
+                        lastKellyDiagnosticsFetchAtRef.current = Date.now();
+                    }
+                } catch (_) {
+                    // Mantener último snapshot válido en UI para evitar parpadeos
+                }
             }
 
       // 1. First capture server active bets to use in filtering
@@ -672,7 +724,6 @@ function App() {
               if (localDiscardedIdsRef.current.has(id)) return false;
               if (localPlacedBetIdsRef.current.has(id)) return false;
                     if (blockedBetIds.has(id)) return false; // Comparar ID completo
-                    if (remoteOpenEventIds.has(String(op?.eventId || '').trim())) return false;
               return true;
            });
            setPrematchOps(cleanOps);
@@ -693,8 +744,81 @@ function App() {
           // Mantener locales solo si NO han llegado del server aun
           const stillPendingLocalIds = [];
           localPlacedBetIdsRef.current.forEach(id => {
-              if (!serverIds.has(id)) stillPendingLocalIds.push(id);
-              else localPlacedBetIdsRef.current.delete(id); // Limpiar si ya llegó
+              if (serverIds.has(id) || remoteOpenBetIds.has(id)) {
+                  localPlacedBetIdsRef.current.delete(id); // Ya está en servidor/remoto
+                  delete pendingBetDetailsRef.current[id];
+                  optimisticWarnedIdsRef.current.delete(id);
+                  return;
+              }
+
+              const optimisticMeta = pendingBetDetailsRef.current[id] || {};
+              const createdAtMs = Number(optimisticMeta?.optimisticCreatedAt || 0);
+              const ageMs = Number.isFinite(createdAtMs) && createdAtMs > 0
+                  ? (Date.now() - createdAtMs)
+                  : Number.POSITIVE_INFINITY;
+
+              const confirmedAtMs = new Date(optimisticMeta?.optimisticConfirmedAt || 0).getTime();
+              const hasConfirmedMark = Number.isFinite(confirmedAtMs) && confirmedAtMs > 0;
+              const shouldExpireByTtl = ageMs >= OPTIMISTIC_BET_TTL_MS;
+
+              if (hasConfirmedMark) {
+                  // Evitar falso negativo: solo contar misses cuando hubo fetch remoto en este ciclo.
+                  const hasFreshRemoteCheck = Boolean(
+                      shouldFetchBooky &&
+                      bookyReq?.status === 'fulfilled' &&
+                      bookyReq?.value?.data?.success
+                  );
+
+                  if (!hasFreshRemoteCheck) {
+                      stillPendingLocalIds.push(id);
+                      return;
+                  }
+
+                  const currentMisses = Number(optimisticMeta?.optimisticMissingRemoteChecks || 0);
+                  const nextMisses = Number.isFinite(currentMisses) ? (currentMisses + 1) : 1;
+                  pendingBetDetailsRef.current[id] = {
+                      ...optimisticMeta,
+                      optimisticMissingRemoteChecks: nextMisses
+                  };
+
+                  // Recién tras 3 chequeos remotos fallidos consecutivos asumimos no colocada.
+                  if (nextMisses < 3) {
+                      stillPendingLocalIds.push(id);
+                      return;
+                  }
+
+                  localPlacedBetIdsRef.current.delete(id);
+                  delete pendingBetDetailsRef.current[id];
+
+                  if (!optimisticWarnedIdsRef.current.has(id)) {
+                      optimisticWarnedIdsRef.current.add(id);
+                      const reasonText = 'Booky no reportó la apuesta tras múltiples chequeos de sincronización.';
+                      alert(
+                          `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
+                          'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
+                          'Verifica Open Bets en Booky antes de reintentar.'
+                      );
+                  }
+                  return;
+              }
+
+              if (shouldExpireByTtl) {
+                  localPlacedBetIdsRef.current.delete(id);
+                  delete pendingBetDetailsRef.current[id];
+
+                  if (!optimisticWarnedIdsRef.current.has(id)) {
+                      optimisticWarnedIdsRef.current.add(id);
+                      const reasonText = 'la confirmación tardó demasiado y no apareció en Booky.';
+                      alert(
+                          `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
+                          'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
+                          'Verifica Open Bets en Booky antes de reintentar.'
+                      );
+                  }
+                  return;
+              }
+
+              stillPendingLocalIds.push(id);
           });
           
           setPortfolio(prevPortfolio => ({
@@ -807,6 +931,15 @@ function App() {
             Number.isFinite(tokenRemainingMinutes) &&
             tokenRemainingMinutes >= Number(tokenHealth?.minRequiredMinutes || 2)
     );
+        const kellyBaseAmount = Number(kellyDiagnostics?.bankrollBase?.amount);
+        const kellyBaseCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
+        const kellyBaseMode = String(kellyDiagnostics?.bankrollBase?.baseMode || '--').toUpperCase();
+        const kellyExposurePressurePct = Number(kellyDiagnostics?.simultaneity?.exposurePressure);
+        const kellyPrematchRuin = Number(kellyDiagnostics?.riskOfRuin?.PREMATCH_VALUE?.probability);
+        const kellyLiveRuin = Number(kellyDiagnostics?.riskOfRuin?.LIVE_VALUE?.probability);
+        const kellyRecPrematch = Number(kellyDiagnostics?.fractions?.recommended?.PREMATCH_VALUE);
+        const kellyRecLive = Number(kellyDiagnostics?.fractions?.recommended?.LIVE_VALUE);
+        const kellyDiagTime = kellyDiagnostics?.fetchedAt;
     const [tokenRenewing, setTokenRenewing] = useState(false);
     const tokenRenewingRef = useRef(false);
 
@@ -908,7 +1041,12 @@ function App() {
     
     // [NEW] Añadir a localPlacedBetIds (REF) para que fetchData lo filtre de la lista de oportunidades inmediatamente
     localPlacedBetIdsRef.current.add(id);
-    pendingBetDetailsRef.current[id] = opportunity;
+    pendingBetDetailsRef.current[id] = {
+        ...opportunity,
+        optimisticCreatedAt: Date.now(),
+        optimisticConfirmedAt: null,
+        optimisticMissingRemoteChecks: 0
+    };
     forceUpdate(); // Forzar re-render inmediato para ocultarlo de la lista
 
     try {
@@ -958,7 +1096,10 @@ function App() {
 
         pendingBetDetailsRef.current[id] = {
             ...opportunity,
-            ...(ticket?.opportunity || {})
+            ...(ticket?.opportunity || {}),
+            optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
+            optimisticConfirmedAt: null,
+            optimisticMissingRemoteChecks: 0
         };
         forceUpdate();
 
@@ -991,6 +1132,10 @@ function App() {
         const confirmMode = isLiveSnipe ? 'confirm-fast' : 'confirm';
         const confirmRes = await axios.post(`/api/booky/real/${confirmMode}/${ticket.id}`, undefined, { timeout: 30000 });
         if (confirmRes.data?.success) {
+            const providerBetId =
+                confirmRes?.data?.ticket?.realPlacement?.accepted?.providerBetId ||
+                confirmRes?.data?.providerResponse?.bets?.[0]?.id ||
+                null;
             const sentStakeRaw =
                 Number(confirmRes?.data?.ticket?.realPlacement?.requested?.stake) ||
                 Number(confirmRes?.data?.ticket?.realPlacement?.sentStake);
@@ -1008,6 +1153,17 @@ function App() {
             const hasAcceptedStake = Number.isFinite(acceptedStakeRaw) && acceptedStakeRaw > 0;
             const hasSentOdd = Number.isFinite(sentOddRaw) && sentOddRaw > 1;
             const hasAcceptedOdd = Number.isFinite(acceptedOddRaw) && acceptedOddRaw > 1;
+            const hasProviderBetId = providerBetId !== null && providerBetId !== undefined && String(providerBetId).trim() !== '';
+
+            if (!hasProviderBetId && !hasAcceptedStake) {
+                localPlacedBetIdsRef.current.delete(id);
+                delete pendingBetDetailsRef.current[id];
+                forceUpdate();
+                alert('⚠️ Booky no devolvió confirmación de ticket (sin providerBetId). La apuesta no se mostrará como EN JUEGO.');
+                await fetchData({ forceBookyRefresh: true });
+                return;
+            }
+
             const prepVsSentDelta = hasSentStake ? Math.abs(sentStakeRaw - stake) : 0;
             const prepVsSentOddDelta = hasSentOdd ? Math.abs(sentOddRaw - odd) : 0;
             const sentVsAcceptedDelta = (hasSentStake && hasAcceptedStake)
@@ -1035,7 +1191,11 @@ function App() {
                 recalcByOdd: hasSentOdd && prepVsSentOddDelta >= 0.001,
                 oddOnlyRecalc: (hasSentOdd && prepVsSentOddDelta >= 0.001) && !(hasSentStake && prepVsSentDelta >= 0.01),
                 providerAdjusted: (hasAcceptedStake && sentVsAcceptedDelta >= 0.01) || (hasAcceptedOdd && sentVsAcceptedOddDelta >= 0.001),
-                confirmedAt: new Date().toISOString()
+                confirmedAt: new Date().toISOString(),
+                providerBetId: hasProviderBetId ? providerBetId : (pendingBetDetailsRef.current[id]?.providerBetId || null),
+                optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
+                optimisticConfirmedAt: new Date().toISOString(),
+                optimisticMissingRemoteChecks: 0
             };
             forceUpdate();
 
@@ -1197,15 +1357,45 @@ function App() {
         const settledBookyHistory = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
             .filter(h => BOOKY_SETTLED_STATUSES.has(Number(h?.status)));
 
+        const portfolioHistoryRows = Array.isArray(portfolio?.history) ? portfolio.history : [];
+        const historyByTicketId = new Map();
+        const historyBySelectionKey = new Map();
+
+        for (const row of portfolioHistoryRows) {
+            const ticketId = resolveOpTicketId(row);
+            if (ticketId) historyByTicketId.set(String(ticketId), row);
+
+            const selectionKey = getOpportunityId(row);
+            if (selectionKey) historyBySelectionKey.set(selectionKey, row);
+        }
+
         const bookyHistoryData = settledBookyHistory.map((h, idx) => ({
-            ...h,
-            id: h.ticketId || `booky_${idx}`,
-            date: h.placedAt || new Date().toISOString(),
-            isFinished: true,
-            isBookyHistory: true,
-            type: String(h.type || h.strategy || h.opportunityType || 'BOOKY_REAL').toUpperCase(),
-            finalScore: resolveBookyFinalScore(h),
-            liveTime: resolveBookyGameTime(h)
+            ...(() => {
+                const ticketId = resolveOpTicketId(h);
+                const selectionKey = getOpportunityId(h);
+                const linkedByTicket = ticketId ? historyByTicketId.get(String(ticketId)) : null;
+                const linkedBySelection = selectionKey ? historyBySelectionKey.get(selectionKey) : null;
+                const linked = linkedByTicket || linkedBySelection || null;
+
+                const evCandidate = Number(
+                    h?.ev ??
+                    linked?.ev ??
+                    linked?.realPlacement?.ev ??
+                    linked?.opportunity?.ev
+                );
+
+                return {
+                    ...h,
+                    id: h.ticketId || `booky_${idx}`,
+                    date: h.placedAt || new Date().toISOString(),
+                    isFinished: true,
+                    isBookyHistory: true,
+                    type: String(h.type || h.strategy || h.opportunityType || 'BOOKY_REAL').toUpperCase(),
+                    finalScore: resolveBookyFinalScore(h),
+                    liveTime: resolveBookyGameTime(h),
+                    ev: Number.isFinite(evCandidate) ? evCandidate : null
+                };
+            })()
         }));
 
         if (bookyHistoryData.length > 0) {
@@ -1337,11 +1527,17 @@ function App() {
         }));
 
         const openBookyLiveBets = getOpenBookyRemoteBets().filter(bet => {
-            const hasLiveTime = typeof bet.liveTime === 'string' && bet.liveTime.trim() && bet.liveTime !== 'Final';
-            const startDate = new Date(bet.matchDate || bet.date || Date.now());
-            const minutesSinceStart = (Date.now() - startDate.getTime()) / 60000;
-            const isLiveByTime = Number.isFinite(minutesSinceStart) && minutesSinceStart > 0 && minutesSinceStart < 130;
-            return hasLiveTime || isLiveByTime;
+            const type = String(bet?.type || '').toUpperCase();
+            const isPrematchOrigin = type.includes('PREMATCH');
+            if (isPrematchOrigin) return false;
+
+            const timingOrigin = resolvePlacementTimingOrigin(bet);
+            if (timingOrigin.inferredPrematchByTiming) return false;
+
+            const liveSignal = bet.liveTime || bet.time || '';
+            const hasTrustedLiveClock = hasLiveClockSignal(liveSignal);
+            const isLiveOrigin = isLiveOriginOpportunity(bet);
+            return timingOrigin.inferredLiveByTiming || hasTrustedLiveClock || isLiveOrigin;
         }).filter(bet => {
             const byProvider = String(bet.providerBetId || '');
             const duplicateInPortfolio = activePlayingBets.some(a => String(a.providerBetId || '') === byProvider && byProvider);
@@ -1371,16 +1567,20 @@ function App() {
         // }
 
         // 2. Filtrar Pre-Match por fecha seleccionada Y eliminar duplicados que ya estén en Live
+        const liveOpportunityKeys = new Set(
+            liveOps
+                .map(op => getOpportunityId(op))
+                .filter(Boolean)
+        );
+
         const dayPrematch = prematchOps.filter(op => {
                if (isLiveOriginOpportunity(op)) return false;
              if (!isSameDay(new Date(op.date), dateFilter)) return false;
-             
-             // Evitar que aparezca en "Todos" si ya está en "Live"
-             const isLive = liveOps.some(liveOp => 
-                 String(liveOp.eventId) === String(op.eventId) || 
-                 String(liveOp.pinnacleId) === String(op.pinnacleId)
-             );
-             return !isLive;
+
+             // Evitar duplicados por selección exacta (eventId + pick),
+             // permitiendo que convivan apuestas distintas del mismo partido.
+             const opKey = getOpportunityId(op);
+             return !liveOpportunityKeys.has(opKey);
         });
         
         // 3. [FIX] Inyectar APUESTAS ACTIVAS (Active Bets) que ya no están en scanners
@@ -1396,8 +1596,9 @@ function App() {
              if (!isSameDay(new Date(bet.matchDate), dateFilter)) return false;
 
              // b) Evitar duplicados (si ya está en liveOps o dayPrematch)
-             const existsInLive = liveOps.some(op => op.eventId === bet.eventId);
-             const existsInPrematch = dayPrematch.some(op => op.eventId === bet.eventId);
+               const betKey = getOpportunityId(bet);
+               const existsInLive = liveOpportunityKeys.has(betKey);
+               const existsInPrematch = dayPrematch.some(op => getOpportunityId(op) === betKey);
              
              return !existsInLive && !existsInPrematch;
         }).map(bet => ({
@@ -1412,13 +1613,21 @@ function App() {
         }));
 
         const dayBookyOpenBets = getOpenBookyRemoteBets().filter(bet => {
-               if (isLiveOriginOpportunity(bet)) return false;
+                         const timingOrigin = resolvePlacementTimingOrigin(bet);
+
+                         // Mantener en PREMATCH las apuestas colocadas antes del inicio,
+                         // aunque el feed remoto luego reporte gameTime/isLive.
+                         if (timingOrigin.inferredLiveByTiming) return false;
+
+                         if (!timingOrigin.inferredPrematchByTiming && isLiveOriginOpportunity(bet)) return false;
+
              const baseDate = bet.matchDate || bet.date;
              if (!baseDate) return false;
              if (!isSameDay(new Date(baseDate), dateFilter)) return false;
 
-             const existsInLive = liveOps.some(op => String(op.eventId || '') === String(bet.eventId || ''));
-             const existsInPrematch = dayPrematch.some(op => String(op.eventId || '') === String(bet.eventId || ''));
+               const betKey = getOpportunityId(bet);
+               const existsInLive = liveOpportunityKeys.has(betKey);
+               const existsInPrematch = dayPrematch.some(op => getOpportunityId(op) === betKey);
              const existsInActive = dayActiveBets.some(op => String(op.providerBetId || '') === String(bet.providerBetId || '') && bet.providerBetId);
              return !existsInLive && !existsInPrematch && !existsInActive;
         });
@@ -1433,15 +1642,22 @@ function App() {
   };
 
     const filteredOps = getFilteredData();
-    const remoteOpenBookyIds = new Set(
-        (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
-            .filter(row => isBookyOpenStatus(row?.status))
-            .map(getBookyOpenBetKey)
-            .filter(Boolean)
-    );
+    const remoteOpenBookyRows = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
+        .filter(row => isBookyOpenStatus(row?.status));
+
+    const remoteOpenBookyByKey = new Map();
+    const remoteOpenBookyIds = new Set();
+    for (const row of remoteOpenBookyRows) {
+        const key = getBookyOpenBetKey(row);
+        if (!key) continue;
+        remoteOpenBookyIds.add(key);
+        if (!remoteOpenBookyByKey.has(key)) {
+            remoteOpenBookyByKey.set(key, row);
+        }
+    }
+
     const remoteOpenBookyEventIds = new Set(
-        (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
-            .filter(row => isBookyOpenStatus(row?.status))
+        remoteOpenBookyRows
             .map(getBookyOpenEventId)
             .filter(Boolean)
     );
@@ -1456,89 +1672,112 @@ function App() {
       
       {/* --- HEADER --- */}
       <header className="max-w-7xl mx-auto mb-8">
-        <div className="flex flex-col md:flex-row justify-between items-center border-b border-slate-700 pb-6 gap-6">
-            <div className="flex items-center gap-3">
-                <Trophy className="w-8 h-8 text-emerald-400" />
+        <div className="flex flex-col xl:flex-row xl:items-center justify-between border-b border-slate-700 pb-5 gap-4">
+            
+            {/* LOGO */}
+            <div className="flex items-center gap-3 shrink-0">
+                <div className="bg-emerald-500/10 p-2 rounded-xl border border-emerald-500/20">
+                    <Trophy className="w-8 h-8 text-emerald-400" />
+                </div>
                 <div>
-                    <h1 className="text-2xl font-bold tracking-tight text-white">BetSniper <span className="text-emerald-400">Pro</span></h1>
-                    <p className="text-slate-400 text-xs">Algorithmic Trading System</p>
+                    <h1 className="text-2xl font-bold tracking-tight text-white leading-none mb-1">BetSniper <span className="text-emerald-400">Pro</span></h1>
+                    <p className="text-slate-400 text-[11px] uppercase tracking-widest font-semibold">Trading System</p>
                 </div>
             </div>
 
-            <div className="flex flex-col gap-2">
-                <div className="flex gap-4 items-center bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-xl">
-                    <div className="text-right border-r border-slate-700 pr-4">
-                        <p className="text-[10px] text-slate-500 uppercase font-bold">Capital Actual</p>
-                        <p className="text-2xl font-mono font-bold text-white flex items-center justify-end">
-                            <span className="text-base text-slate-500 mr-1">{realBalanceCurrency}</span>
-                            {Number.isFinite(realBalanceAmount) ? realBalanceAmount.toFixed(2) : '--'}
-                        </p>
+            {/* DASHBOARD CARDS */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 w-full xl:w-auto flex-1 xl:max-w-4xl">
+                
+                {/* 1. CAPITAL & PNL */}
+                <div className="bg-slate-800/60 p-3 rounded-xl border border-slate-700 flex flex-col justify-between">
+                    <div className="flex justify-between items-start mb-2">
+                        <div>
+                            <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-0.5">Capital</p>
+                            <p className="text-lg font-mono font-bold text-white flex items-center leading-none">
+                                <span className="text-sm text-slate-500 mr-1">{realBalanceCurrency}</span>
+                                {Number.isFinite(realBalanceAmount) ? realBalanceAmount.toFixed(2) : '--'}
+                            </p>
+                        </div>
+                        <div className="text-right">
+                            <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-0.5">PnL ({activeBookyLabel})</p>
+                            <p className={`text-base font-mono font-bold flex items-center justify-end leading-none ${realBookyPnLClass}`}>
+                                {realBookyPnL >= 0 ? '+' : ''}{realBookyPnL.toFixed(2)}
+                            </p>
+                        </div>
                     </div>
-                    <div className="text-left pl-2">
-                        <p className="text-[10px] text-slate-500 uppercase font-bold">PnL Real ({activeBookyLabel})</p>
-                        <p className={`text-lg font-mono font-bold flex items-center ${realBookyPnLClass}`}>
-                            {realBookyPnL >= 0 ? '+' : ''}{realBookyPnL.toFixed(2)}
-                            <TrendingUp className="w-4 h-4 ml-1" />
-                        </p>
-                    </div>
-                    
-                    <div className="flex gap-1 ml-2 pl-4 border-l border-slate-700">
-                         <button 
-                            onClick={playAlert} 
-                            className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-amber-400 transition-colors"
-                            title="Probar Sonido"
-                        >
-                            <Volume2 className="w-4 h-4" />
-                        </button>
-                        <button 
-                            onClick={() => fetchData({ forceBookyRefresh: true })} 
-                            className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors relative"
-                            title="Actualizar Datos"
-                        >
-                            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-emerald-400' : ''}`} />
-                        </button>
-                        <button 
-                            onClick={resetPortfolio}
-                            className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-red-400 transition-colors"
-                            title="Resetear Simulación"
-                        >
-                            <RotateCcw className="w-4 h-4" />
-                        </button>
+                    {/* Botones Acciones Rápidas */}
+                    <div className="flex gap-1.5 pt-2 border-t border-slate-700/50 justify-end mt-auto">
+                        <button onClick={playAlert} className="p-1.5 bg-slate-700/50 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-amber-400 transition-colors" title="Probar Sonido"><Volume2 className="w-4 h-4" /></button>
+                        <button onClick={() => fetchData({ forceBookyRefresh: true })} className="p-1.5 bg-slate-700/50 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors" title="Actualizar Datos"><RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-emerald-400' : ''}`} /></button>
+                        <button onClick={resetPortfolio} className="p-1.5 bg-slate-700/50 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-red-400 transition-colors" title="Resetear Simulación"><RotateCcw className="w-4 h-4" /></button>
                     </div>
                 </div>
 
-                <div className={`flex items-center justify-between px-3 py-2 rounded-lg border ${tokenHealthy ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-amber-500/10 border-amber-500/30'}`}>
-                    <div className="flex items-center gap-2">
-                        <span className={`inline-block w-2 h-2 rounded-full ${tokenHealthy ? 'bg-emerald-400' : 'bg-amber-400'}`}></span>
-                        <span className="text-[11px] font-bold uppercase tracking-wide text-slate-200">Booky Token</span>
+                {/* 2. KELLY DIAGNOSTICO */}
+                <div className="bg-slate-800/60 p-3 rounded-xl border border-slate-700 flex flex-col justify-between">
+                    <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>
+                            <span className="text-[11px] font-bold uppercase tracking-widest text-slate-300">Kelly Risk</span>
+                        </div>
+                        <span className="text-[9px] font-mono text-slate-500 bg-slate-900/50 px-1.5 py-0.5 rounded">
+                            {kellyDiagTime ? formatTimeSafe(kellyDiagTime) : '--:--'}
+                        </span>
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] mt-auto">
+                        <div className="flex justify-between border-b border-slate-700/30 pb-0.5">
+                            <span className="text-slate-500">Base</span>
+                            <span className="text-slate-200 font-mono font-medium">{Number.isFinite(kellyBaseAmount) ? kellyBaseAmount.toFixed(0) : '--'}</span>
+                        </div>
+                        <div className="flex justify-between border-b border-slate-700/30 pb-0.5">
+                            <span className="text-slate-500">Press</span>
+                            <span className="text-slate-200 font-mono font-medium">{Number.isFinite(kellyExposurePressurePct) ? `${(kellyExposurePressurePct * 100).toFixed(1)}%` : '--'}</span>
+                        </div>
+                        <div className="flex justify-between">
+                            <span className="text-slate-500">Ruin P</span>
+                            <span className="text-amber-400/90 font-mono font-medium">{Number.isFinite(kellyPrematchRuin) ? `${(kellyPrematchRuin * 100).toFixed(1)}%` : '--'}</span>
+                        </div>
+                        <div className="flex justify-between">
+                            <span className="text-slate-500">Ruin L</span>
+                            <span className="text-amber-400/90 font-mono font-medium">{Number.isFinite(kellyLiveRuin) ? `${(kellyLiveRuin * 100).toFixed(1)}%` : '--'}</span>
+                        </div>
+                    </div>
+                </div>
+
+                {/* 3. TOKEN STATUS */}
+                <div className={`p-3 rounded-xl border flex flex-col justify-between ${tokenHealthy ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                    <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-1.5">
+                            <span className="relative flex h-2 w-2">
+                                {!tokenHealthy && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>}
+                                <span className={`relative inline-flex rounded-full h-2 w-2 ${tokenHealthy ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]' : 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.8)]'}`}></span>
+                            </span>
+                            <span className="text-[11px] font-bold uppercase tracking-widest text-slate-200">System Link</span>
+                        </div>
+                        <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${tokenProfile === 'acity' ? 'bg-blue-500/20 text-blue-300' : tokenProfile === 'doradobet' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-700 text-slate-300'}`}>
+                            {tokenProfile ? tokenProfile : 'N/A'}
+                        </span>
+                    </div>
+                    
+                    <div className="flex justify-between items-end mt-auto">
+                        <div className="flex flex-col">
+                            <div className="text-[10px] text-slate-400 uppercase font-semibold mb-0.5">Time Left</div>
+                            <div className={`text-xl font-mono font-bold leading-none ${tokenHealthy ? 'text-emerald-400' : 'text-amber-400'}`}>
+                                {Number.isFinite(tokenRemainingMinutes) ? tokenRemainingMinutes.toFixed(1) : '--'} <span className="text-[10px] font-sans text-slate-500 font-normal">min</span>
+                            </div>
+                        </div>
                         {!tokenHealthy && (
                             <button
                                 onClick={handleTokenRenewGuide}
                                 disabled={tokenRenewing}
-                                className={`px-2 py-1 rounded border text-[10px] font-bold uppercase tracking-wide transition-colors ${tokenRenewing ? 'border-amber-400/20 text-amber-200/60 bg-amber-500/10 cursor-not-allowed' : 'border-amber-400/50 text-amber-300 hover:bg-amber-500/20'}`}
-                                title="Copiar comando de renovación"
+                                className={`px-2.5 py-1.5 rounded bg-slate-900/50 border text-[10px] font-bold uppercase tracking-wide transition-all ${tokenRenewing ? 'border-amber-500/30 text-amber-500/50 cursor-not-allowed' : 'border-amber-500/50 text-amber-400 hover:bg-amber-500/20 hover:border-amber-400'}`}
                             >
-                                {tokenRenewing ? 'Abriendo...' : 'Renovar Token'}
+                                {tokenRenewing ? 'Wait...' : 'Renovar'}
                             </button>
                         )}
-                        <div className="text-right">
-                        <p className={`text-xs font-bold ${tokenHealthy ? 'text-emerald-300' : 'text-amber-300'}`}>
-                            {tokenHealthy ? 'Listo para apostar' : 'Renovar token'}
-                        </p>
-                        <p className="text-[10px] text-slate-500 uppercase tracking-wide">
-                            Perfil:{' '}
-                            <span className={`font-bold ${tokenProfile === 'acity' ? 'text-blue-300' : tokenProfile === 'doradobet' ? 'text-emerald-300' : 'text-slate-300'}`}>
-                                {tokenProfile ? tokenProfile.toUpperCase() : 'N/A'}
-                            </span>
-                        </p>
-                        <p className="text-[10px] text-slate-400 font-mono">
-                            {Number.isFinite(tokenRemainingMinutes) ? `${tokenRemainingMinutes.toFixed(1)} min` : 'sin datos'}
-                        </p>
-                        </div>
                     </div>
                 </div>
+
             </div>
         </div>
       </header>
@@ -1682,14 +1921,6 @@ function App() {
                                     const isStatusCompleted = op.status === 'WON' || op.status === 'LOST' || op.status === 'VOID';
                                     const isBookySettledByStatus = BOOKY_SETTLED_STATUSES.has(Number(op?.status));
                                     
-                                    const isLive =
-                                        activeTab !== 'FINISHED' &&
-                                        !op.isBookyHistory &&
-                                        !isBookySettledByStatus &&
-                                        !isStatusCompleted &&
-                                        !isExplicitlyFinished &&
-                                        (isReallyLiveType || (new Date(op.date) < new Date() && !op.isFinished && minutesElapsed < 150));
-                                    
                                     // Búsqueda en historial para ver si esta operación fue ejecutada
                                     // Fix: Linkeo robusto por eventId + selection (manejo de fallback)
                                     const opSelection = op.selection || op.action;
@@ -1697,14 +1928,40 @@ function App() {
                                     const activeMatch = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
                                     
                                     const opBetKey = getOpportunityId(op);
-                                    const activeInRemoteBooky = Boolean(opBetKey && remoteOpenBookyIds.has(opBetKey));
-                                    const activeInRemoteBookyEvent = remoteOpenBookyEventIds.has(String(op?.eventId || '').trim());
-                                    const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : ((activeMatch || activeInRemoteBooky || activeInRemoteBookyEvent) ? 'ACTIVE' : 'PENDING'));
-                                    const betData = op.isBookyHistory ? op : (historyMatch || activeMatch || op);
+                                    const remoteOpenRow = opBetKey ? (remoteOpenBookyByKey.get(opBetKey) || null) : null;
+                                    const activeInRemoteBooky = Boolean(remoteOpenRow);
+                                    const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : ((activeMatch || activeInRemoteBooky || op.isBookyRemoteOpen) ? 'ACTIVE' : 'PENDING'));
+                                    const betData = op.isBookyHistory ? op : (historyMatch || activeMatch || remoteOpenRow || op);
+                                    const visualLiveSignal =
+                                        op?.liveTime ||
+                                        op?.time ||
+                                        op?.pinnacleInfo?.time ||
+                                        betData?.liveTime ||
+                                        betData?.time ||
+                                        betData?.raw?.selections?.[0]?.gameTime ||
+                                        op?.raw?.selections?.[0]?.gameTime ||
+                                        '';
+                                    const hasTrustedVisualLiveClock = hasLiveClockSignal(visualLiveSignal);
+                                    const isLive =
+                                        activeTab !== 'FINISHED' &&
+                                        !op.isBookyHistory &&
+                                        !isBookySettledByStatus &&
+                                        !isStatusCompleted &&
+                                        !isExplicitlyFinished &&
+                                        (isReallyLiveType || hasTrustedVisualLiveClock);
                                     const eventStartIso = op.isBookyHistory ? (resolveBookyEventStartIso(op) || resolveOpEventStartIso(op)) : resolveOpEventStartIso(op);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
                                     const betTimeIso = resolveOpBetTimeIso(betData, op);
                                     const marketLabel = normalizeMarketLabel(op.market);
+                                    const eventStartMs = eventStartIso ? new Date(eventStartIso).getTime() : NaN;
+                                    const betPlacedMs = betTimeIso ? new Date(betTimeIso).getTime() : NaN;
+                                    const hasValidTiming = Number.isFinite(eventStartMs) && Number.isFinite(betPlacedMs);
+                                    const inferredLiveByTiming = hasValidTiming
+                                        ? betPlacedMs >= (eventStartMs + (2 * 60 * 1000))
+                                        : false;
+                                    const inferredPrematchByTiming = hasValidTiming
+                                        ? betPlacedMs < (eventStartMs + (2 * 60 * 1000))
+                                        : false;
                                     const stakeSyncFlags = resolveStakeSyncFlags(
                                         betData,
                                         Number(op?.kellyStake || 0),
@@ -1726,10 +1983,17 @@ function App() {
                                     const showSnipeBadge =
                                         effectiveType === 'LIVE_SNIPE' ||
                                         effectiveType === 'LA_VOLTEADA' ||
-                                        (typeUnknown && hasLiveSignal);
+                                        (typeUnknown && (hasLiveSignal || inferredLiveByTiming));
                                     const showPrematchBadge =
                                         effectiveType === 'PREMATCH_VALUE' ||
-                                        (typeUnknown && !hasLiveSignal);
+                                        (typeUnknown && !hasLiveSignal && inferredPrematchByTiming);
+                                    const evRaw = Number(
+                                        betData?.ev ??
+                                        op?.ev ??
+                                        historyMatch?.ev ??
+                                        activeMatch?.ev
+                                    );
+                                    const hasEv = Number.isFinite(evRaw);
                                     const selectionCanonical = resolveCanonicalSelectionLabel(betData || op);
                                     const selectionBookyRaw = op.isBookyHistory ? resolveBookySelectionText(betData || op) : null;
                                     const selectionDiff = Boolean(
@@ -1980,11 +2244,11 @@ function App() {
                                             </div>
                                         </td>
                                         <td className="p-3 text-center">
-                                             {executionStatus === 'FINISHED' ? (
+                                             {executionStatus === 'FINISHED' && !hasEv ? (
                                                  <span className="text-slate-500 font-mono text-xs">-</span>
                                              ) : (
-                                                <span className={`px-1.5 py-0.5 rounded font-bold ${op.ev > 5 ? 'text-emerald-400' : 'text-blue-400'}`}>
-                                                    +{op.ev ? op.ev.toFixed(1) : '0.0'}%
+                                                <span className={`px-1.5 py-0.5 rounded font-bold ${hasEv && evRaw > 5 ? 'text-emerald-400' : 'text-blue-400'}`}>
+                                                    {hasEv ? `${evRaw >= 0 ? '+' : ''}${evRaw.toFixed(1)}%` : '0.0%'}
                                                 </span>
                                              )}
                                         </td>

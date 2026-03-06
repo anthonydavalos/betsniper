@@ -70,7 +70,7 @@ const getPriorityScore = (event, linkedSet) => {
 };
 
 const extractOddsFromDetails = (details, eventName = '') => {
-    const safeOdds = { home: 0, draw: 0, away: 0, totals: [], btts: {} };
+    const safeOdds = { home: 0, draw: 0, away: 0, doubleChance: {}, totals: [], btts: {} };
     if (!details || !Array.isArray(details.markets) || !Array.isArray(details.odds)) return safeOdds;
 
     const oddsMap = new Map(details.odds.map(o => [o.id, o]));
@@ -173,6 +173,17 @@ const extractOddsFromDetails = (details, eventName = '') => {
         const no = odds.find(o => o.typeId === 76 || normalizeText(o.name).includes('no'));
         if (yes?.price) safeOdds.btts.yes = yes.price;
         if (no?.price) safeOdds.btts.no = no.price;
+    }
+
+    const dcMarket = details.markets.find(m => m.typeId === 10 || normalizeText(m.name).includes('double chance') || normalizeText(m.name).includes('doble oportunidad'));
+    if (dcMarket) {
+        const odds = flattenOddIds(dcMarket).map(id => oddsMap.get(id)).filter(Boolean);
+        for (const odd of odds) {
+            const name = normalizeText(odd.name || '').replace(/\s+/g, '');
+            if (name.includes('1x') && odd?.price > 1) safeOdds.doubleChance.homeDraw = odd.price;
+            if (name.includes('12') && odd?.price > 1) safeOdds.doubleChance.homeAway = odd.price;
+            if (name.includes('x2') && odd?.price > 1) safeOdds.doubleChance.drawAway = odd.price;
+        }
     }
 
     return safeOdds;

@@ -8,6 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '../..');
 const envPath = path.join(projectRoot, '.env');
+const bookyDataDir = path.join(projectRoot, 'data', 'booky');
 
 const DEFAULT_BALANCE_REFRESH_MS = 45000;
 const DEFAULT_HISTORY_REFRESH_MS = 60000;
@@ -64,6 +65,185 @@ const getRuntimeEnvValue = (key, fallback = '') => {
   return fallback;
 };
 
+const getConfiguredCashflowFromDate = () => {
+  const value = String(getRuntimeEnvValue('BOOKY_CASHFLOW_FROM_DATE', '') || '').trim();
+  return value || null;
+};
+
+const getConfiguredFinishedFromDate = () => {
+  const explicit = String(getRuntimeEnvValue('BOOKY_FINISHED_FROM_DATE', '') || '').trim();
+  if (explicit) return explicit;
+  return getConfiguredCashflowFromDate();
+};
+
+const parseEnvDateStartIso = (rawValue = null) => {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return null;
+
+  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(raw)
+    ? `${raw}T00:00:00.000Z`
+    : raw;
+
+  const ts = new Date(normalized).getTime();
+  if (!Number.isFinite(ts)) return null;
+  return new Date(ts).toISOString();
+};
+
+const filterRowsFromIsoDate = (rows = [], fromIso = null) => {
+  if (!fromIso) return Array.isArray(rows) ? rows : [];
+  const fromMs = new Date(fromIso).getTime();
+  if (!Number.isFinite(fromMs)) return Array.isArray(rows) ? rows : [];
+
+  return (Array.isArray(rows) ? rows : []).filter((row) => {
+    const ts = getEntryTimestampMs(row);
+    return Number.isFinite(ts) && ts >= fromMs;
+  });
+};
+
+const getKellyBaseMode = () => {
+  const raw = String(
+    getRuntimeEnvValue('KELLY_BASE_MODE', getRuntimeEnvValue('BOOKY_KELLY_BASE_MODE', 'NAV'))
+  ).trim().toUpperCase();
+  if (raw === 'BALANCE') return 'BALANCE';
+  return 'NAV';
+};
+
+const getProfileOpenExposureStake = (profileKey = '') => {
+  const store = getProfileStore(profileKey, false);
+  const rows = Array.isArray(store?.history) ? store.history : [];
+  let exposure = 0;
+
+  for (const row of rows) {
+    const status = Number(row?.status);
+    if (!Number.isFinite(status)) continue;
+    if (BOOKY_SETTLED_PROVIDER_STATUSES.has(status)) continue;
+
+    const stake = safeNumber(row?.stake, NaN);
+    if (!Number.isFinite(stake) || stake <= 0) continue;
+    exposure += stake;
+  }
+
+  return Number(exposure.toFixed(2));
+};
+
+const getPortfolioOpenExposureStake = (integration = null) => {
+  const activeBets = Array.isArray(db.data?.portfolio?.activeBets) ? db.data.portfolio.activeBets : [];
+  let exposure = 0;
+
+  for (const bet of activeBets) {
+    if (!bet || typeof bet !== 'object') continue;
+    if (integration) {
+      const betIntegration = normalizeBookProfile(String(bet?.integration || '').trim());
+      if (betIntegration && betIntegration !== normalizeBookProfile(integration)) continue;
+    }
+
+    const stake = safeNumber(bet?.stake ?? bet?.kellyStake, NaN);
+    if (!Number.isFinite(stake) || stake <= 0) continue;
+    exposure += stake;
+  }
+
+  return Number(exposure.toFixed(2));
+};
+
+const getPnlBaseCapital = (profileKey = '') => {
+  const profile = normalizeBookProfile(profileKey || getActiveProfileContext().key);
+  const profileUpper = String(profile).trim().toUpperCase();
+
+  const candidates = [
+    `BOOKY_PNL_BASE_CAPITAL_${profileUpper}`,
+    `BOOKY_INITIAL_CAPITAL_${profileUpper}`,
+    `BOOKY_INITIAL_BALANCE_${profileUpper}`,
+    'BOOKY_PNL_BASE_CAPITAL',
+    'BOOKY_INITIAL_CAPITAL',
+    'BOOKY_INITIAL_BALANCE'
+  ];
+
+  for (const key of candidates) {
+    const raw = getRuntimeEnvValue(key, '');
+    const value = safeNumber(raw, NaN);
+    if (Number.isFinite(value) && value > 0) {
+      return {
+        amount: value,
+        source: key,
+        updatedAt: null,
+        profile
+      };
+    }
+  }
+
+  const store = getProfileStore(profile, false);
+  const dbAmount = safeNumber(store?.pnlBase?.amount, NaN);
+  if (Number.isFinite(dbAmount) && dbAmount > 0) {
+    return {
+      amount: Number(dbAmount.toFixed(2)),
+      source: store?.pnlBase?.source || 'db-pnl-base',
+      updatedAt: store?.pnlBase?.updatedAt || null,
+      profile
+    };
+  }
+
+  return {
+    amount: NaN,
+    source: null,
+    updatedAt: null,
+    profile
+  };
+};
+
+const readSpyCashflowSummaryFromDisk = ({ profileKey = null, filePath = null } = {}) => {
+  const profile = normalizeBookProfile(profileKey || getActiveProfileContext().key);
+  const safePath = filePath
+    ? path.resolve(filePath)
+    : path.join(bookyDataDir, `spy-cashflow-${profile}.latest.json`);
+
+  if (!fs.existsSync(safePath)) {
+    return {
+      ok: false,
+      reason: 'spy-file-not-found',
+      profile,
+      filePath: safePath,
+      summary: null
+    };
+  }
+
+  try {
+    const raw = fs.readFileSync(safePath, 'utf8');
+    const summary = JSON.parse(raw || '{}');
+    return {
+      ok: true,
+      reason: null,
+      profile,
+      filePath: safePath,
+      summary
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'spy-file-invalid-json',
+      profile,
+      filePath: safePath,
+      summary: null,
+      error: error?.message || 'No se pudo parsear spy-cashflow.'
+    };
+  }
+};
+
+const extractPnlBaseFromSpySummary = (summary = {}) => {
+  const direct = safeNumber(summary?.cashflowStats?.suggestionBaseCapital, NaN);
+  if (Number.isFinite(direct) && direct > 0) {
+    return Number(direct.toFixed(2));
+  }
+
+  const deposits = safeNumber(summary?.cashflowStats?.deposits, NaN);
+  const withdrawals = safeNumber(summary?.cashflowStats?.withdrawals, NaN);
+  if (Number.isFinite(deposits) && Number.isFinite(withdrawals)) {
+    const net = Number((deposits - withdrawals).toFixed(2));
+    if (net > 0) return net;
+  }
+
+  return NaN;
+};
+
 const normalizeBookProfile = (value = '') => {
   const normalized = String(value || '').trim().toLowerCase();
   if (!normalized) return 'doradobet';
@@ -101,6 +281,7 @@ const buildRuntimeProviderParams = ({ withTimestamp = false } = {}) => {
 
 const ensureProfileStoreShape = (store = {}) => {
   if (!store.account || typeof store.account !== 'object') store.account = {};
+  if (!store.pnlBase || typeof store.pnlBase !== 'object') store.pnlBase = {};
   if (!store.remoteHistory || typeof store.remoteHistory !== 'object') {
     store.remoteHistory = { items: [], updatedAt: null, source: 'cache' };
   }
@@ -121,6 +302,7 @@ const getProfileStore = (profileKey, createIfMissing = true) => {
       profile: profileKey,
       integration: profileKey,
       account: {},
+      pnlBase: {},
       remoteHistory: { items: [], updatedAt: null, source: 'cache' },
       history: [],
       updatedAt: null
@@ -366,12 +548,42 @@ const normalizeLeagueValue = (value) => {
   return null;
 };
 
-const selectionTypeIdToPick = (selectionTypeId) => {
+const extractLineFromSelection = (selection = {}) => {
+  const fromSelectionText = String(selection?.selection || selection?.name || selection?.raw?.name || '').replace(',', '.');
+  const textMatch = fromSelectionText.match(/(\d+(?:\.\d+)?)/);
+  if (textMatch) {
+    const line = Number(textMatch[1]);
+    if (Number.isFinite(line)) return Number(line.toFixed(2));
+  }
+
+  const specRaw = selection?.raw?.spec;
+  if (typeof specRaw === 'string' && specRaw.trim()) {
+    try {
+      const parsed = JSON.parse(specRaw);
+      const candidates = [parsed?.['1'], parsed?.line, parsed?.value];
+      for (const candidate of candidates) {
+        const line = Number(String(candidate).replace(',', '.'));
+        if (Number.isFinite(line)) return Number(line.toFixed(2));
+      }
+    } catch (_) {}
+  }
+
+  return NaN;
+};
+
+const selectionTypeIdToPick = (selectionTypeId, selection = null) => {
   const id = Number(selectionTypeId);
   if (!Number.isFinite(id)) return null;
   if (id === 1) return 'home';
   if (id === 2) return 'draw';
   if (id === 3) return 'away';
+  if (id === 74) return 'btts_yes';
+  if (id === 76) return 'btts_no';
+  if (id === 12 || id === 13) {
+    const line = extractLineFromSelection(selection || {});
+    if (!Number.isFinite(line)) return null;
+    return `${id === 12 ? 'over' : 'under'}_${line}`;
+  }
   return null;
 };
 
@@ -394,7 +606,7 @@ const reconcilePortfolioActiveBetsFromRemote = (remoteRows = []) => {
 
     const eventId = Number(row?.eventId);
     const firstSelection = Array.isArray(row?.selections) ? row.selections[0] : null;
-    const pick = selectionTypeIdToPick(firstSelection?.selectionTypeId);
+    const pick = selectionTypeIdToPick(firstSelection?.selectionTypeId, firstSelection);
     if (Number.isFinite(eventId) && pick) {
       byEventPick.set(`${eventId}_${pick}`, row);
     }
@@ -1362,7 +1574,12 @@ const mapBookyHistoryItem = (entry = {}) => {
     pinnacleId: opportunity.pinnacleId || null,
     type: opportunity.type || entry?.payload?.type || null,
     strategy: opportunity.strategy || entry?.payload?.strategy || null,
-    integration: integration || null
+    integration: integration || null,
+    ev: Number.isFinite(Number(opportunity?.ev)) ? Number(opportunity.ev) : null,
+    realProb: Number.isFinite(Number(opportunity?.realProb)) ? Number(opportunity.realProb) : null,
+    kellyStake: Number.isFinite(Number(opportunity?.kellyStake)) ? Number(opportunity.kellyStake) : null,
+    pick: opportunity?.pick || entry?.payload?.pick || null,
+    opportunitySnapshot: opportunity || null
   };
 };
 
@@ -1422,29 +1639,61 @@ export const getBookyHistory = async (limit = 60) => {
     .sort((a, b) => new Date(b.placedAt || 0) - new Date(a.placedAt || 0));
 
   const localTypeByProvider = new Map();
+  const localTypeByEventPick = new Map();
   for (const item of history) {
     const providerBetId = item?.realPlacement?.response?.bets?.[0]?.id;
-    if (providerBetId === null || providerBetId === undefined || providerBetId === '') continue;
-
     const type = item?.opportunity?.type || item?.payload?.type || null;
     const strategy = item?.opportunity?.strategy || item?.payload?.strategy || null;
-    if (!type && !strategy) continue;
+    const ev = Number.isFinite(Number(item?.opportunity?.ev)) ? Number(item.opportunity.ev) : null;
+    const realProb = Number.isFinite(Number(item?.opportunity?.realProb)) ? Number(item.opportunity.realProb) : null;
+    const kellyStake = Number.isFinite(Number(item?.opportunity?.kellyStake)) ? Number(item.opportunity.kellyStake) : null;
+    const market = item?.opportunity?.market || item?.payload?.market || null;
+    const selection = item?.opportunity?.selection || item?.payload?.selection || null;
+    const pickDirect = item?.opportunity?.pick || item?.payload?.pick || null;
 
-    localTypeByProvider.set(String(providerBetId), { type, strategy });
+    if (!type && !strategy && !Number.isFinite(ev) && !Number.isFinite(realProb)) continue;
+
+    const meta = { type, strategy, ev, realProb, kellyStake, market, selection, pick: pickDirect };
+
+    if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
+      localTypeByProvider.set(String(providerBetId), meta);
+    }
+
+    const eventId = Number(item?.opportunity?.eventId || item?.payload?.eventId || item?.realPlacement?.response?.bets?.[0]?.selections?.[0]?.eventId);
+    const placementSelection = item?.realPlacement?.response?.bets?.[0]?.selections?.[0] || null;
+    const selectionTypeId = Number(placementSelection?.selectionTypeId);
+    const pick = selectionTypeIdToPick(selectionTypeId, placementSelection) || pickDirect;
+    if (Number.isFinite(eventId) && pick) {
+      localTypeByEventPick.set(`${eventId}_${pick}`, meta);
+    }
   }
 
   const enrichedRows = rows.map((row) => {
     const providerBetId = row?.providerBetId;
     if (providerBetId === null || providerBetId === undefined || providerBetId === '') return row;
 
-    const localMeta = localTypeByProvider.get(String(providerBetId));
+    let localMeta = localTypeByProvider.get(String(providerBetId));
+    if (!localMeta) {
+      const eventId = Number(row?.eventId);
+      const selectionTypeId = Number(row?.selections?.[0]?.selectionTypeId);
+      const pick = selectionTypeIdToPick(selectionTypeId);
+      if (Number.isFinite(eventId) && pick) {
+        localMeta = localTypeByEventPick.get(`${eventId}_${pick}`) || null;
+      }
+    }
     if (!localMeta) return row;
 
     return {
       ...row,
       type: row?.type || localMeta.type || null,
       strategy: row?.strategy || localMeta.strategy || null,
-      opportunityType: row?.opportunityType || localMeta.type || localMeta.strategy || null
+      opportunityType: row?.opportunityType || localMeta.type || localMeta.strategy || null,
+      ev: Number.isFinite(Number(row?.ev)) ? Number(row.ev) : (Number.isFinite(Number(localMeta?.ev)) ? Number(localMeta.ev) : null),
+      realProb: Number.isFinite(Number(row?.realProb)) ? Number(row.realProb) : (Number.isFinite(Number(localMeta?.realProb)) ? Number(localMeta.realProb) : null),
+      kellyStake: Number.isFinite(Number(row?.kellyStake)) ? Number(row.kellyStake) : (Number.isFinite(Number(localMeta?.kellyStake)) ? Number(localMeta.kellyStake) : null),
+      market: row?.market || localMeta.market || null,
+      selection: row?.selection || localMeta.selection || null,
+      pick: row?.pick || localMeta.pick || null
     };
   });
 
@@ -1510,6 +1759,100 @@ export const cleanupBookyHistoricalData = async ({ retentionDays, maxPerProfile 
   return result;
 };
 
+export const importBookyPnlBaseFromSpy = async ({ profileKey = null, filePath = null } = {}) => {
+  await initDB();
+  await db.read();
+  ensureBookyStore();
+
+  const ctx = getActiveProfileContext();
+  const profile = normalizeBookProfile(profileKey || ctx.key);
+  const readResult = readSpyCashflowSummaryFromDisk({ profileKey: profile, filePath });
+
+  if (!readResult.ok) {
+    return {
+      success: false,
+      profile,
+      reason: readResult.reason,
+      filePath: readResult.filePath,
+      error: readResult.error || null
+    };
+  }
+
+  const amount = extractPnlBaseFromSpySummary(readResult.summary || {});
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return {
+      success: false,
+      profile,
+      reason: 'no-valid-base-in-spy-summary',
+      filePath: readResult.filePath,
+      summaryGeneratedAt: readResult.summary?.generatedAt || null
+    };
+  }
+
+  const configuredFromDate = getConfiguredCashflowFromDate();
+  const summaryFromDate = String(readResult.summary?.probeFromDate || '').trim() || null;
+  if (configuredFromDate && configuredFromDate !== summaryFromDate) {
+    return {
+      success: false,
+      profile,
+      reason: 'probe-from-mismatch',
+      filePath: readResult.filePath,
+      configuredFromDate,
+      summaryFromDate
+    };
+  }
+
+  const store = getProfileStore(profile, true);
+  store.pnlBase = {
+    amount: Number(amount.toFixed(2)),
+    source: 'spy-cashflow-file',
+    updatedAt: nowIso(),
+    summaryGeneratedAt: readResult.summary?.generatedAt || null,
+    summaryStartedAt: readResult.summary?.startedAt || null,
+    probeFromDate: readResult.summary?.probeFromDate || null,
+    filePath: readResult.filePath,
+    stats: readResult.summary?.cashflowStats || null
+  };
+
+  await db.write();
+
+  return {
+    success: true,
+    profile,
+    pnlBase: {
+      amount: store.pnlBase.amount,
+      source: store.pnlBase.source,
+      updatedAt: store.pnlBase.updatedAt,
+      probeFromDate: store.pnlBase.probeFromDate,
+      filePath: store.pnlBase.filePath,
+      configuredFromDate
+    }
+  };
+};
+
+export const getBookyPnlBaseSnapshot = async ({ profileKey = null } = {}) => {
+  await initDB();
+  await db.read();
+  ensureBookyStore();
+
+  const ctx = getActiveProfileContext();
+  const profile = normalizeBookProfile(profileKey || ctx.key);
+  const resolved = getPnlBaseCapital(profile);
+  const store = getProfileStore(profile, false);
+
+  return {
+    profile,
+    configuredFromDate: getConfiguredCashflowFromDate(),
+    resolved: {
+      amount: Number.isFinite(resolved?.amount) ? Number(resolved.amount.toFixed(2)) : null,
+      source: resolved?.source || null,
+      updatedAt: resolved?.updatedAt || null
+    },
+    dbPnlBase: store?.pnlBase || null,
+    fetchedAt: nowIso()
+  };
+};
+
 export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLimit = 60, cleanupOld = false, retentionDays = null } = {}) => {
   const ctx = getActiveProfileContext();
   const balance = await fetchBookyBalance({ forceRefresh, profileKey: ctx.key });
@@ -1522,6 +1865,10 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
   const history = await getBookyHistory(historyLimit);
   const profileStore = getProfileStore(ctx.key, false);
   const fullProfileHistory = Array.isArray(profileStore?.history) ? profileStore.history : [];
+  const finishedFromDateRaw = getConfiguredFinishedFromDate();
+  const finishedFromDateIso = parseEnvDateStartIso(finishedFromDateRaw);
+  const filteredHistory = filterRowsFromIsoDate(history, finishedFromDateIso);
+  const filteredFullProfileHistory = filterRowsFromIsoDate(fullProfileHistory, finishedFromDateIso);
   const localBookyHistory = Array.isArray(db.data?.booky?.history) ? db.data.booky.history : [];
   const allowedProviderBetIds = new Set(
     localBookyHistory
@@ -1530,15 +1877,24 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
       .filter((id) => id !== null && id !== undefined && id !== '')
       .map((id) => String(id))
   );
-  const pnlRealized = computeRealizedPnl(fullProfileHistory, {
+  const pnlRealized = computeRealizedPnl(filteredFullProfileHistory, {
     integration: ctx.integration,
     allowedProviderBetIds
   });
-  const pnlBreakdown = computePnlBreakdown(fullProfileHistory, {
+  const pnlBreakdown = computePnlBreakdown(filteredFullProfileHistory, {
     integration: ctx.integration,
     allowedProviderBetIds
   });
-  const pnlTotal = Number((pnlRealized - Number(pnlBreakdown?.open?.stake || 0)).toFixed(2));
+  const openStake = Number(pnlBreakdown?.open?.stake || 0);
+  const pnlCashAfterOpenStake = Number((pnlRealized - openStake).toFixed(2));
+  const pnlHistoryNet = Number(pnlRealized.toFixed(2));
+  const pnlBase = getPnlBaseCapital(ctx.key);
+  const balanceAmount = safeNumber(balance?.amount, NaN);
+  const hasBalanceAnchoredPnl = Number.isFinite(balanceAmount) && Number.isFinite(pnlBase.amount);
+  const pnlByBalance = hasBalanceAnchoredPnl
+    ? Number((balanceAmount - pnlBase.amount).toFixed(2))
+    : null;
+  const pnlNetAfterOpenStake = Number.isFinite(pnlByBalance) ? pnlByBalance : pnlHistoryNet;
   const pnlSource = 'profile-history-extended-db';
 
   const profile = ctx.profile;
@@ -1547,15 +1903,21 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
     profile,
     integration: ctx.integration,
     balance,
-    history,
-    historyCount: history.length,
-    historyTotalCount: fullProfileHistory.length,
+    history: filteredHistory,
+    historyCount: filteredHistory.length,
+    historyTotalCount: filteredFullProfileHistory.length,
+    historyFromDate: finishedFromDateIso,
+    historyFromDateRaw: finishedFromDateRaw,
     pnl: {
       realized: Number(pnlRealized.toFixed(2)),
-      total: pnlTotal,
+      total: pnlNetAfterOpenStake,
       source: pnlSource,
-      netAfterOpenStake: pnlTotal,
-      rowsCount: fullProfileHistory.length,
+      netAfterOpenStake: pnlNetAfterOpenStake,
+      cashAfterOpenStake: pnlCashAfterOpenStake,
+      byBalance: Number.isFinite(pnlByBalance) ? pnlByBalance : null,
+      baseCapital: Number.isFinite(pnlBase.amount) ? pnlBase.amount : null,
+      baseCapitalSource: pnlBase.source,
+      rowsCount: filteredFullProfileHistory.length,
       breakdown: pnlBreakdown
     },
     fetchedAt: nowIso()
@@ -1566,14 +1928,33 @@ export const getKellyBankrollBase = async () => {
   await initDB();
   await db.read();
   ensureBookyStore();
+  const ctx = getActiveProfileContext();
+  const baseMode = getKellyBaseMode();
 
   const real = await fetchBookyBalance({ forceRefresh: false });
   const realAmount = safeNumber(real?.amount, NaN);
   if (Number.isFinite(realAmount) && realAmount > 0) {
+    if (baseMode === 'NAV') {
+      const profileOpenExposure = getProfileOpenExposureStake(ctx.key);
+      const portfolioOpenExposure = getPortfolioOpenExposureStake(ctx.integration);
+      const openExposure = Number(Math.max(profileOpenExposure, portfolioOpenExposure).toFixed(2));
+      const navAmount = Number((realAmount + openExposure).toFixed(2));
+
+      return {
+        amount: navAmount,
+        source: 'booky-nav',
+        updatedAt: real?.updatedAt || null,
+        openExposure,
+        baseMode
+      };
+    }
+
     return {
       amount: realAmount,
       source: 'booky-real',
-      updatedAt: real?.updatedAt || null
+      updatedAt: real?.updatedAt || null,
+      openExposure: 0,
+      baseMode
     };
   }
 
@@ -1582,7 +1963,9 @@ export const getKellyBankrollBase = async () => {
     return {
       amount: portfolioBalance,
       source: 'portfolio-fallback',
-      updatedAt: null
+      updatedAt: null,
+      openExposure: 0,
+      baseMode
     };
   }
 
@@ -1590,6 +1973,207 @@ export const getKellyBankrollBase = async () => {
   return {
     amount: Number.isFinite(configBankroll) && configBankroll > 0 ? configBankroll : 100,
     source: 'config-fallback',
-    updatedAt: null
+    updatedAt: null,
+    openExposure: 0,
+    baseMode
+  };
+};
+
+const computeSimultaneityPeaks = (rows = [], windows = [5, 10, 15, 30, 60]) => {
+  const sorted = [...rows]
+    .filter((row) => Number.isFinite(new Date(row?.placedAt || row?.createdAt || 0).getTime()))
+    .sort((a, b) => new Date(a.placedAt || a.createdAt || 0) - new Date(b.placedAt || b.createdAt || 0));
+
+  return windows.map((windowMin) => {
+    let peakCount = 0;
+    let peakStake = 0;
+    let peakAt = null;
+
+    for (let i = 0; i < sorted.length; i++) {
+      const startMs = new Date(sorted[i].placedAt || sorted[i].createdAt || 0).getTime();
+      let count = 0;
+      let stake = 0;
+
+      for (let k = i; k < sorted.length; k++) {
+        const rowMs = new Date(sorted[k].placedAt || sorted[k].createdAt || 0).getTime();
+        const diffMin = (rowMs - startMs) / 60000;
+        if (diffMin > windowMin) break;
+        count += 1;
+        stake += Number(sorted[k]?.stake || 0);
+      }
+
+      if (count > peakCount || (count === peakCount && stake > peakStake)) {
+        peakCount = count;
+        peakStake = stake;
+        peakAt = new Date(startMs).toISOString();
+      }
+    }
+
+    return {
+      windowMin,
+      peakCount,
+      peakStake: Number(peakStake.toFixed(2)),
+      peakAt
+    };
+  });
+};
+
+const estimateRuinProbability = ({
+  bankroll = 0,
+  fraction = 0.1,
+  returns = [],
+  horizonBets = 300,
+  simulations = 2000,
+  ruinThreshold = 0.2
+} = {}) => {
+  const initial = Number(bankroll);
+  const f = Number(fraction);
+  const sample = Array.isArray(returns) ? returns.filter((v) => Number.isFinite(v)) : [];
+  const horizon = Math.max(10, Number(horizonBets) || 300);
+  const sims = Math.max(200, Number(simulations) || 2000);
+  const threshold = Math.max(0.01, Math.min(0.99, Number(ruinThreshold) || 0.2));
+
+  if (!Number.isFinite(initial) || initial <= 0 || !Number.isFinite(f) || f <= 0 || sample.length === 0) {
+    return {
+      probability: null,
+      ruinedSimulations: 0,
+      simulations: sims,
+      horizonBets: horizon,
+      ruinThreshold: threshold,
+      thresholdAmount: Number((initial * threshold).toFixed(2))
+    };
+  }
+
+  const thresholdAmount = initial * threshold;
+  let ruined = 0;
+
+  for (let s = 0; s < sims; s++) {
+    let bankrollNow = initial;
+
+    for (let i = 0; i < horizon; i++) {
+      const r = sample[Math.floor(Math.random() * sample.length)];
+      const multiplier = 1 + (f * r);
+      bankrollNow *= Math.max(0, multiplier);
+      if (bankrollNow <= thresholdAmount) {
+        ruined += 1;
+        break;
+      }
+    }
+  }
+
+  return {
+    probability: Number((ruined / sims).toFixed(4)),
+    ruinedSimulations: ruined,
+    simulations: sims,
+    horizonBets: horizon,
+    ruinThreshold: threshold,
+    thresholdAmount: Number(thresholdAmount.toFixed(2))
+  };
+};
+
+export const getBookyKellyDiagnostics = async ({
+  profileKey = null,
+  horizonBets = 300,
+  simulations = 2000,
+  ruinThreshold = 0.2
+} = {}) => {
+  await initDB();
+  await db.read();
+  ensureBookyStore();
+
+  const ctx = getActiveProfileContext();
+  const profile = normalizeBookProfile(profileKey || ctx.key);
+  const profileStore = getProfileStore(profile, false);
+  const historyRows = Array.isArray(profileStore?.history) ? profileStore.history : [];
+
+  const settledRows = historyRows.filter((row) => BOOKY_SETTLED_PROVIDER_STATUSES.has(Number(row?.status)));
+  const pnlByRow = settledRows.map((row) => {
+    const stake = Number(row?.stake || 0);
+    const pnl = resolveRowPnl(row);
+    const roi = stake > 0 ? pnl / stake : null;
+    return { stake, pnl, roi };
+  });
+
+  const roiSample = pnlByRow.map((x) => x.roi).filter((x) => Number.isFinite(x));
+  const avgRoi = roiSample.length > 0
+    ? Number((roiSample.reduce((a, b) => a + b, 0) / roiSample.length).toFixed(4))
+    : null;
+  const hitRate = pnlByRow.length > 0
+    ? Number((pnlByRow.filter((x) => x.pnl > 0).length / pnlByRow.length).toFixed(4))
+    : null;
+
+  const kellyBase = await getKellyBankrollBase();
+  const windows = computeSimultaneityPeaks(historyRows, [5, 15, 30, 60]);
+  const peak30 = windows.find((w) => w.windowMin === 30) || { peakStake: 0 };
+  const exposurePressure = Number.isFinite(Number(kellyBase?.amount)) && Number(kellyBase.amount) > 0
+    ? Number((Number(peak30.peakStake || 0) / Number(kellyBase.amount)).toFixed(4))
+    : 0;
+
+  const envFractions = {
+    PREMATCH_VALUE: Number(getRuntimeEnvValue('KELLY_FRACTION_PREMATCH_VALUE', '0.22')),
+    LIVE_VALUE: Number(getRuntimeEnvValue('KELLY_FRACTION_LIVE_VALUE', '0.10')),
+    LIVE_SNIPE: Number(getRuntimeEnvValue('KELLY_FRACTION_LIVE_SNIPE', '0.08')),
+    DEFAULT: Number(getRuntimeEnvValue('KELLY_FRACTION_DEFAULT', '0.10'))
+  };
+
+  const pressureFactor = exposurePressure >= 0.4 ? 0.75 : exposurePressure >= 0.25 ? 0.85 : 1;
+  const recommendedFractions = {
+    PREMATCH_VALUE: Number((Math.max(0.05, envFractions.PREMATCH_VALUE * pressureFactor)).toFixed(3)),
+    LIVE_VALUE: Number((Math.max(0.04, envFractions.LIVE_VALUE * pressureFactor)).toFixed(3)),
+    LIVE_SNIPE: Number((Math.max(0.03, envFractions.LIVE_SNIPE * pressureFactor)).toFixed(3)),
+    DEFAULT: Number((Math.max(0.04, envFractions.DEFAULT * pressureFactor)).toFixed(3))
+  };
+
+  const ruinEstimate = {
+    PREMATCH_VALUE: estimateRuinProbability({
+      bankroll: Number(kellyBase?.amount || 0),
+      fraction: recommendedFractions.PREMATCH_VALUE,
+      returns: roiSample,
+      horizonBets,
+      simulations,
+      ruinThreshold
+    }),
+    LIVE_VALUE: estimateRuinProbability({
+      bankroll: Number(kellyBase?.amount || 0),
+      fraction: recommendedFractions.LIVE_VALUE,
+      returns: roiSample,
+      horizonBets,
+      simulations,
+      ruinThreshold
+    }),
+    LIVE_SNIPE: estimateRuinProbability({
+      bankroll: Number(kellyBase?.amount || 0),
+      fraction: recommendedFractions.LIVE_SNIPE,
+      returns: roiSample,
+      horizonBets,
+      simulations,
+      ruinThreshold
+    })
+  };
+
+  return {
+    profile,
+    fetchedAt: nowIso(),
+    bankrollBase: kellyBase,
+    sample: {
+      totalRows: historyRows.length,
+      settledRows: settledRows.length,
+      avgRoi,
+      hitRate
+    },
+    simultaneity: {
+      windows,
+      exposurePressure
+    },
+    fractions: {
+      env: envFractions,
+      recommended: recommendedFractions
+    },
+    riskOfRuin: ruinEstimate,
+    notes: [
+      'La simulación usa distribución empírica de ROI por apuesta liquidada (bootstrap con reemplazo).',
+      'Ruin se define como bankroll <= umbral configurado (por defecto 20% del bankroll inicial).',
+      'La recomendación reduce fracciones si la simultaneidad observada es alta (ventana 30 min).'
+    ]
   };
 };
