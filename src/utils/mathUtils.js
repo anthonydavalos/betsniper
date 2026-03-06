@@ -55,12 +55,21 @@ export const calculateEV = (realProbPercent, offeredOdd) => {
 
 // --- 3. GESTIÓN DE RIESGO AVANZADA (RISK PROFILES & RUIN CONTROL) ---
 // Define la fracción de Kelly base para cada estrategia según su volatilidad
-const RISK_PROFILES = {
-  'PREMATCH_VALUE': 0.25,   // 1/4 Kelly (Baja Volatilidad, Alta Confianza)
-  'LIVE_VALUE': 0.125,      // 1/8 Kelly (Media Volatilidad, Ruido de Mercado)
-  'LIVE_SNIPE': 0.10,       // 1/10 Kelly (Alta Volatilidad, "Cisne Negro") - Equivale a ROR ~0%
-  'MANUAL': 0.125,          // Default seguro
-  'DEFAULT': 0.125
+const clampFraction = (value, fallback) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+};
+
+const getRiskProfiles = () => {
+  const env = process.env || {};
+  return {
+    PREMATCH_VALUE: clampFraction(env.KELLY_FRACTION_PREMATCH_VALUE, 0.22),
+    LIVE_VALUE: clampFraction(env.KELLY_FRACTION_LIVE_VALUE, 0.10),
+    LIVE_SNIPE: clampFraction(env.KELLY_FRACTION_LIVE_SNIPE, 0.08),
+    MANUAL: clampFraction(env.KELLY_FRACTION_MANUAL, 0.10),
+    DEFAULT: clampFraction(env.KELLY_FRACTION_DEFAULT, 0.10)
+  };
 };
 
 /**
@@ -75,6 +84,7 @@ const RISK_PROFILES = {
  * @returns {Object} - { percentage: %, amount: $, fractionUsed: 0.125 }
  */
 export const calculateKellyStake = (realProbPercent, odd, bankroll, strategyOrFraction = 'DEFAULT', correlationFactor = 0.2) => {
+  const RISK_PROFILES = getRiskProfiles();
   // 1. Determinar fracción base (Risk Profile)
   let fraction = RISK_PROFILES['DEFAULT'];
   if (typeof strategyOrFraction === 'number') fraction = strategyOrFraction;

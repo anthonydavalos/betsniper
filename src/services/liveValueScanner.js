@@ -6,6 +6,15 @@ import { getKellyBankrollBase } from './bookyAccountService.js';
 
 let liveKellyBankroll = 100;
 
+const parsePositiveNumberOr = (value, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const LIVE_VALUE_MIN_EV = parsePositiveNumberOr(process.env.LIVE_VALUE_MIN_EV, 0.02);
+const LIVE_VALUE_NON_1X2_STAKE_FACTOR = parsePositiveNumberOr(process.env.LIVE_VALUE_NON_1X2_STAKE_FACTOR, 1);
+const LIVE_VALUE_MIN_DISPLAY_STAKE = parsePositiveNumberOr(process.env.LIVE_VALUE_MIN_DISPLAY_STAKE, 0.1);
+
 const liveOpportunityStability = new Map();
 const STABILITY_WINDOW_MS = 25000;
 const STABILITY_MIN_HITS = 2;
@@ -77,6 +86,21 @@ const flattenMarketOddIds = (market = {}) => {
     if (Array.isArray(market.desktopOddIds)) return market.desktopOddIds.flat().filter(Boolean);
     if (Array.isArray(market.oddIds)) return market.oddIds.filter(Boolean);
     return [];
+};
+
+const resolveDoubleChanceSide = (odd = {}) => {
+    const normalized = normalizeMarketText(odd?.name || '');
+    const compact = normalized.replace(/\s+/g, '');
+
+    if (compact.includes('1x')) return '1X';
+    if (compact.includes('x2')) return 'X2';
+    if (compact.includes('12')) return '12';
+
+    if (normalized.includes('home draw') || normalized.includes('local empate')) return '1X';
+    if (normalized.includes('draw away') || normalized.includes('empate visita')) return 'X2';
+    if (normalized.includes('home away') || normalized.includes('local visita')) return '12';
+
+    return null;
 };
 
 const parseScorePair = (value) => {
@@ -436,15 +460,21 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
         }
 
         // >>> ESTRATEGIA B: DOUBLE CHANCE (DOBLE OPORTUNIDAD) <<<
-        const marketDC = details.markets.find(m => m.typeId === 10);
+        const marketDC = details.markets.find(m => {
+            if (m.typeId === 10) return true;
+            const name = normalizeMarketText(m.name || '');
+            return name.includes('double chance') || name.includes('doble oportunidad') || name.includes('doble chance');
+        });
         if (marketDC && pinLiveOdds.doubleChance) {
             const oddIds = (marketDC.desktopOddIds || []).flat();
             const oddsObjs = oddIds.map(id => altenarOddsMap.get(id)).filter(Boolean);
 
-            const cand1X = oddsObjs.find(o => o.name.includes(event.name.split(' vs ')[0]) || o.name.includes('1X')); 
-            const candX2 = oddsObjs.find(o => (event.name.split(' vs ')[1] && o.name.includes(event.name.split(' vs ')[1])) || o.name.includes('X2'));
+            const cand1X = oddsObjs.find(o => resolveDoubleChanceSide(o) === '1X');
+            const cand12 = oddsObjs.find(o => resolveDoubleChanceSide(o) === '12');
+            const candX2 = oddsObjs.find(o => resolveDoubleChanceSide(o) === 'X2');
 
             if (cand1X && pinLiveOdds.doubleChance.homeDraw) checkAndAddOpp(opportunities, event, pinMatch, 'Double Chance', '1X', cand1X.price, pinLiveOdds.doubleChance.homeDraw, pinLiveOdds.doubleChance, pinLiveOdds);
+            if (cand12 && pinLiveOdds.doubleChance.homeAway) checkAndAddOpp(opportunities, event, pinMatch, 'Double Chance', '12', cand12.price, pinLiveOdds.doubleChance.homeAway, pinLiveOdds.doubleChance, pinLiveOdds);
             if (candX2 && pinLiveOdds.doubleChance.drawAway) checkAndAddOpp(opportunities, event, pinMatch, 'Double Chance', 'X2', candX2.price, pinLiveOdds.doubleChance.drawAway, pinLiveOdds.doubleChance, pinLiveOdds);
         }
 
@@ -561,12 +591,14 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
     //    console.log(`TYPE: ${marketName} ${selection} | Alt: ${altOdd} | Pin: ${pinOdd} | EV: ${(ev*100).toFixed(1)}%`);
     // }
 
-    // Umbral estricto para producción: EV > 2%
-    if (ev > 0.02 && kellyRes.amount > 0) {
-        const safeStake = is1x2MarketName(marketName) ? kellyRes.amount : kellyRes.amount * 0.5;
+    // Umbral configurable por entorno (default 2%)
+    if (ev > LIVE_VALUE_MIN_EV && kellyRes.amount > 0) {
+        const isMain1x2 = is1x2MarketName(marketName);
+        const stakeFactor = isMain1x2 ? 1 : LIVE_VALUE_NON_1X2_STAKE_FACTOR;
+        const safeStake = kellyRes.amount * stakeFactor;
 
-        // [FILTER] Min Stake 1.00 PEN (Evitar centavos)
-        if (safeStake < 1) return;
+        // Filtro mínimo para visualización (default 0.10)
+        if (safeStake < LIVE_VALUE_MIN_DISPLAY_STAKE) return;
 
         // [ANTI-FAKE-SPIKE] Requerir confirmación temporal en 2 ticks antes de publicar.
         // Evita falsas oportunidades cuando un feed actualiza antes que el otro por unos segundos.

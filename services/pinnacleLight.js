@@ -10,6 +10,7 @@ const __dirname = path.dirname(__filename);
 const OUTPUT_FILE = path.join(__dirname, '../data/pinnacle_live.json');
 const OUTPUT_PREMATCH_FILE = path.join(__dirname, '../data/pinnacle_prematch.json');
 const TOKEN_FILE = path.join(__dirname, '../data/pinnacle_token.json');
+const LOCK_FILE = path.join(__dirname, '../data/pinnacle_light.lock');
 
 const WS_URL = "wss://api.arcadia.pinnacle.com/ws";
 // 1. Endpoint de PRECIOS (Rápido, frecuente)
@@ -111,6 +112,64 @@ class PinnacleLight {
         this.lastHttpAt = 0;
         this.minHttpGapMs = BASE_MIN_HTTP_GAP_MS;
         this.httpBackoffUntil = 0;
+        this.lockAcquired = false;
+    }
+
+    isProcessAlive(pid) {
+        if (!Number.isFinite(Number(pid)) || Number(pid) <= 0) return false;
+        try {
+            process.kill(Number(pid), 0);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    acquireLock() {
+        try {
+            if (fs.existsSync(LOCK_FILE)) {
+                try {
+                    const raw = fs.readFileSync(LOCK_FILE, 'utf-8');
+                    const parsed = JSON.parse(raw || '{}');
+                    const existingPid = Number(parsed?.pid);
+
+                    if (existingPid && existingPid !== process.pid && this.isProcessAlive(existingPid)) {
+                        console.warn(`⚠️ PinnacleLight ya está corriendo (PID ${existingPid}). Abortando nueva instancia para evitar aperturas duplicadas.`);
+                        return false;
+                    }
+                } catch (_) {
+                    // lock corrupto: se sobreescribe
+                }
+            }
+
+            fs.writeFileSync(
+                LOCK_FILE,
+                JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2)
+            );
+            this.lockAcquired = true;
+            return true;
+        } catch (e) {
+            console.error(`❌ No se pudo crear lock de PinnacleLight: ${e.message}`);
+            return false;
+        }
+    }
+
+    releaseLock() {
+        if (!this.lockAcquired) return;
+
+        try {
+            if (!fs.existsSync(LOCK_FILE)) return;
+            const raw = fs.readFileSync(LOCK_FILE, 'utf-8');
+            const parsed = JSON.parse(raw || '{}');
+            const lockPid = Number(parsed?.pid);
+            if (!lockPid || lockPid === process.pid) {
+                fs.unlinkSync(LOCK_FILE);
+            }
+        } catch (_) {
+            // noop
+        } finally {
+            this.lockAcquired = false;
+        }
     }
 
     async arcadiaGet(url, config = {}) {
@@ -251,12 +310,17 @@ class PinnacleLight {
                 this.start(); // Re-start simple
             } else {
                 console.error("❌ Fallo crítico: No se generó el token o el usuario no inició sesión correctamente.");
+                this.releaseLock();
                 process.exit(1);
             }
         });
     }
 
     start() {
+        if (!this.lockAcquired && !this.acquireLock()) {
+            return;
+        }
+
         if (!this.loadHeaders()) {
             console.log("⚠️ No hay token guardado. Iniciando Generador...");
             this.refreshSession();
@@ -705,5 +769,24 @@ class PinnacleLight {
 
 // Auto-arranque
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    new PinnacleLight().start();
+    const runner = new PinnacleLight();
+    const release = () => {
+        try {
+            runner.releaseLock();
+        } catch (_) {
+            // noop
+        }
+    };
+
+    process.on('SIGINT', () => {
+        release();
+        process.exit(0);
+    });
+    process.on('SIGTERM', () => {
+        release();
+        process.exit(0);
+    });
+    process.on('exit', release);
+
+    runner.start();
 }

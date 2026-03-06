@@ -7,6 +7,87 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.0] — 2026-03-05 — Sprint: Booky Robustness + EV Enrichment + Arcadia Hardening
+
+> Rama: `master` | Base commit: `756476c`
+
+### ✅ Added
+
+#### Booky — PnL Base + Diagnósticos Kelly
+- **`src/routes/booky.js`**:
+  - Nuevos endpoints: `GET /api/booky/pnl-base`, `GET /api/booky/kelly-diagnostics`, `POST /api/booky/pnl-base/import-spy`, `POST /api/booky/pnl-base/sync`.
+  - `GET /api/booky/account` amplía `historyLimit` (default 300, máximo 500).
+- **`src/services/bookyAccountService.js`**:
+  - Importación de base de PnL desde spy-cashflow (`importBookyPnlBaseFromSpy`).
+  - Snapshot de base PnL (`getBookyPnlBaseSnapshot`).
+  - Diagnóstico Kelly con riesgo de ruina bootstrap (`getBookyKellyDiagnostics`) y recomendación de fracciones por presión de simultaneidad.
+  - Soporte de `BOOKY_FINISHED_FROM_DATE` (fallback a `BOOKY_CASHFLOW_FROM_DATE`) para filtrar historial finalizado y métricas de PnL.
+- **Scripts nuevos**:
+  - **`scripts/spy-booky-cashflow.js`** — captura endpoints de caja/transacciones y estima base de capital sugerida.
+  - **`scripts/sync-booky-pnl-base-from-spy.js`** — sincroniza base PnL desde el último spy.
+- **`package.json`**:
+  - Scripts agregados: `spy:booky:cashflow`, `spy:booky:cashflow:headless`, `sync:booky:pnl-base`, `sync:booky:pnl-base:acity`.
+
+#### Frontend — Telemetría de Riesgo en Header
+- **`client/src/App.jsx`**:
+  - Panel Kelly en header con base, presión de exposición, riesgo de ruina por estrategia y timestamp de diagnóstico.
+  - Fetch throttled de `kelly-diagnostics` (cada 60s) y de cuenta Booky con mayor profundidad de historial.
+
+### 🔄 Changed
+
+#### Booky — Enriquecimiento histórico y cálculo de base Kelly
+- **`src/services/bookyAccountService.js`**:
+  - Enriquecimiento de historial remoto por `providerBetId` y fallback `eventId+pick` para rescatar `type/strategy/ev/realProb/kellyStake`.
+  - Mejor mapeo de picks para Totals/BTTS (`selectionTypeIdToPick` + parse de línea).
+  - PnL neto ahora soporta enfoque anclado a balance real (`byBalance`) y conserva breakdown de exposición abierta.
+  - `getKellyBankrollBase` soporta modo `NAV` con exposición abierta (además de fallback `booky-real → portfolio → config`).
+
+#### Oportunidades y Scanners
+- **`src/services/liveValueScanner.js`**:
+  - Umbrales configurables para EV y stake (`LIVE_VALUE_MIN_EV`, `LIVE_VALUE_NON_1X2_STAKE_FACTOR`, `LIVE_VALUE_MIN_DISPLAY_STAKE`).
+  - Parsing de Double Chance más robusto, incluyendo selección `12`.
+- **`src/services/prematchScannerService.js`** y **`src/services/altenarPrematchScheduler.js`**:
+  - Activación/evaluación de Double Chance en prematch (`1X`, `12`, `X2`) con extracción desde detalles Altenar.
+- **`src/services/liveScannerService.js`**:
+  - Cooldown anti-spam para trigger de stale/restart del gateway (`PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS`).
+
+#### Arcadia / Pinnacle — Estabilidad operativa
+- **`services/pinnacleGateway.js`**:
+  - Auto-close endurecido: mínimo de sockets Arcadia, ventana mínima de readiness, checklist de validación y filtrado estricto de tráfico Arcadia (evita falsos positivos de sockets no relevantes).
+  - Grace period para ignorar trigger stale durante fase de login manual.
+- **`services/pinnacleLight.js`**:
+  - Lock de proceso con archivo (`pinnacle_light.lock`) para evitar instancias duplicadas.
+  - Liberación de lock en `SIGINT/SIGTERM/exit`.
+
+#### Matcher y aliases
+- **`src/routes/matcher.js`**:
+  - Reintentos internos de persistencia en `POST /link` para mitigar carrera con scanner/ingestor.
+  - Verificación explícita de persistencia y respuesta `409` si no queda grabado tras reintentos.
+- **`client/src/components/ManualMatcher.jsx`**:
+  - Manejo de `409` como carrera transitoria (retry/control de mensaje al usuario).
+- **`src/utils/dynamicAliases.json`**:
+  - Nuevos aliases operativos para mejorar matching en ligas con naming heterogéneo.
+
+### 🐛 Fixed
+
+#### UI / Estado de apuestas
+- **`client/src/App.jsx`**:
+  - Corrección de clasificación LIVE vs PREMATCH usando señales confiables de reloj + inferencia temporal (`placedAt` vs `eventStart`).
+  - Deduplicación por selección (`eventId + pick`) para evitar ocultar picks distintos del mismo partido.
+  - Evita “stake fantasma”: expiración/limpieza de apuestas optimistas no confirmadas con TTL y chequeos remotos consecutivos.
+  - Evita marcar apuesta como confirmada sin `providerBetId` o sin evidencia mínima de aceptación.
+  - En FINISHED, EV se reconcilia con snapshots locales/históricos cuando el row remoto viene incompleto.
+
+#### Persistencia de EV
+- **`src/services/paperTradingService.js`**:
+  - Persistencia de `ev` al crear nuevas apuestas en portfolio, habilitando trazabilidad histórica posterior.
+
+#### Riesgo configurable
+- **`src/utils/mathUtils.js`**:
+  - Fracciones Kelly migradas a configuración por entorno (`KELLY_FRACTION_*`) con clamp seguro.
+
+---
+
 ## [v3.3.0] — 2026-03-04 — Sprint: PnL Integrity + Live Render Fix + Pinnacle Auto-Close
 
 > Rama: `master` | Base commit: `1f36a63`

@@ -539,6 +539,26 @@ export const scanPrematchOpportunities = async () => {
                      evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs1x2.away, currentBankroll, '1x2');
                 }
 
+                // A.1) Analizar Double Chance
+                // ==========================================
+                if (pinMatch.odds?.doubleChance && altenarOdds?.doubleChance) {
+                    const dcPin = pinMatch.odds.doubleChance;
+                    const dcAlt = altenarOdds.doubleChance;
+
+                    if (dcAlt.homeDraw && dcPin.homeDraw) {
+                        const realProb = 1 / dcPin.homeDraw;
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '1X', dcAlt.homeDraw, realProb, currentBankroll, 'Double Chance');
+                    }
+                    if (dcAlt.homeAway && dcPin.homeAway) {
+                        const realProb = 1 / dcPin.homeAway;
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '12', dcAlt.homeAway, realProb, currentBankroll, 'Double Chance');
+                    }
+                    if (dcAlt.drawAway && dcPin.drawAway) {
+                        const realProb = 1 / dcPin.drawAway;
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'X2', dcAlt.drawAway, realProb, currentBankroll, 'Double Chance');
+                    }
+                }
+
                 // B) Analizar Totals (Over/Under)
                 // ==========================================
                 if (pinMatch.odds.totals && Array.isArray(pinMatch.odds.totals) && 

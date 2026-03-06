@@ -4,12 +4,29 @@ import { registerDynamicAlias } from '../utils/teamMatcher.js';
 
 const router = express.Router();
 
+const wait = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
+
 const buildTupleKey = (row = {}) => {
     const home = String(row?.home || '').trim().toLowerCase();
     const away = String(row?.away || '').trim().toLowerCase();
     const ts = new Date(row?.date || '').getTime();
     if (!home || !away || !Number.isFinite(ts)) return null;
     return `${home}__${away}__${ts}`;
+};
+
+const hasPersistedManualLink = ({ rows = [], pinnacleId, altenarId, targetKey }) => {
+    const expectedAlt = String(altenarId ?? '').trim();
+    if (!expectedAlt) return false;
+
+    return rows.some(row => {
+        const sameId = String(row?.id ?? '') === String(pinnacleId ?? '');
+        const sameTuple = targetKey && buildTupleKey(row) === targetKey;
+        if (!sameId && !sameTuple) return false;
+
+        const rowAlt = String(row?.altenarId ?? '').trim();
+        const manual = String(row?.linkSource || '').toLowerCase() === 'manual';
+        return manual && rowAlt === expectedAlt;
+    });
 };
 
 // GET /api/matcher/data
@@ -68,19 +85,40 @@ router.post('/link', async (req, res) => {
         }
 
         const targetKey = buildTupleKey(match);
-        const updatedAt = new Date().toISOString();
         let appliedCount = 0;
+        let persisted = false;
 
-        for (const row of (db.data.upcomingMatches || [])) {
-            const sameId = String(row?.id || '') === String(pinnacleId);
-            const sameTuple = targetKey && buildTupleKey(row) === targetKey;
-            if (!sameId && !sameTuple) continue;
+        // Reintento interno para mitigar carreras con scanner/ingestor.
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+            await db.read();
 
-            row.altenarId = altenarId;
-            row.altenarName = altenarName;
-            row.linkSource = 'manual';
-            row.linkUpdatedAt = updatedAt;
-            appliedCount += 1;
+            let attemptApplied = 0;
+            const updatedAt = new Date().toISOString();
+            for (const row of (db.data.upcomingMatches || [])) {
+                const sameId = String(row?.id || '') === String(pinnacleId);
+                const sameTuple = targetKey && buildTupleKey(row) === targetKey;
+                if (!sameId && !sameTuple) continue;
+
+                row.altenarId = altenarId;
+                row.altenarName = altenarName;
+                row.linkSource = 'manual';
+                row.linkUpdatedAt = updatedAt;
+                attemptApplied += 1;
+            }
+
+            appliedCount = Math.max(appliedCount, attemptApplied);
+            await db.write();
+
+            await db.read();
+            persisted = hasPersistedManualLink({
+                rows: db.data.upcomingMatches || [],
+                pinnacleId,
+                altenarId,
+                targetKey
+            });
+
+            if (persisted) break;
+            await wait(150 * attempt);
         }
         
         // APRENDIZAJE: Guardar nuevos alias encontrados
@@ -100,14 +138,9 @@ router.post('/link', async (req, res) => {
             console.warn(`⚠️ [Learning] Altenar match object not found for ID ${altenarId}. Cannot learn aliases.`);
         }
 
-        await db.write();
-
-        // Verificación post-write (anti-carrera visible): confirmar que quedó persistido en disco.
-        await db.read();
-        const persisted = (db.data.upcomingMatches || []).find(m => String(m.id || '') === String(pinnacleId));
-        if (!persisted || String(persisted.altenarId || '') !== String(altenarId || '')) {
+        if (!persisted) {
             return res.status(409).json({
-                error: 'Link no persistido (posible condición de carrera). Reintenta en 1-2s.',
+                error: 'Link no persistido tras reintentos (condición de carrera con scanner/ingestor). Reintenta en 1-2s.',
                 pinnacleId,
                 altenarId,
                 appliedCount
