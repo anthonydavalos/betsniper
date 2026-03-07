@@ -5,6 +5,56 @@ import db from '../db/database.js';
 
 const router = express.Router();
 
+const PREMATCH_CACHE_TTL_MS = Math.max(
+  5000,
+  Number.isFinite(Number(process.env.PREMATCH_CACHE_TTL_MS))
+    ? Number(process.env.PREMATCH_CACHE_TTL_MS)
+    : 20000
+);
+
+let prematchCache = {
+  timestamp: null,
+  data: [],
+  updatedAtMs: 0
+};
+
+let prematchInFlightPromise = null;
+
+const runPrematchRefresh = async () => {
+  const allOpportunities = await scanPrematchOpportunities();
+  prematchCache = {
+    timestamp: new Date().toISOString(),
+    data: Array.isArray(allOpportunities) ? allOpportunities : [],
+    updatedAtMs: Date.now()
+  };
+  return prematchCache;
+};
+
+const ensurePrematchRefresh = ({ deferred = false } = {}) => {
+  if (prematchInFlightPromise) return prematchInFlightPromise;
+
+  if (deferred) {
+    prematchInFlightPromise = new Promise((resolve, reject) => {
+      setTimeout(async () => {
+        try {
+          const latest = await runPrematchRefresh();
+          resolve(latest);
+        } catch (error) {
+          reject(error);
+        } finally {
+          prematchInFlightPromise = null;
+        }
+      }, 0);
+    });
+    return prematchInFlightPromise;
+  }
+
+  prematchInFlightPromise = runPrematchRefresh().finally(() => {
+    prematchInFlightPromise = null;
+  });
+  return prematchInFlightPromise;
+};
+
 // Helper: Generar ID único por oportunidad (eventId + selection)
 // Debe coincidir con la función del frontend
 function normalizePick(obj = {}) {
@@ -40,6 +90,14 @@ function getOpportunityId(op) {
   return `${eventId}_${normalizePick(op)}`;
 }
 
+function filterIgnoredPrematchRows(rows = []) {
+  const ignoredIds = new Set(getDiscardedIds());
+  return rows.filter(op => {
+    const opId = getOpportunityId(op);
+    return !ignoredIds.has(opId);
+  });
+}
+
 // POST /api/opportunities/discard
 // Añade un evento a la lista negra
 router.post('/discard', (req, res) => {
@@ -70,26 +128,57 @@ router.get('/live', async (req, res) => {
 // Retorna oportunidades Pre-Match calculadas vs Altenar (GetUpcoming)
 router.get('/prematch', async (req, res) => {
   try {
-    // Escaner Real vs Altenar
-    const allOpportunities = await scanPrematchOpportunities();
-    
-    // [MOD] Filtro de descartados en tiempo real (por selección individual)
-    const ignoredIds = new Set(getDiscardedIds());
-    // console.log("Ignored IDs:", Array.from(ignoredIds)); 
-    
-    const filteredOpportunities = allOpportunities.filter(op => {
-         const opId = getOpportunityId(op); // ID único por selección
-         const isIgnored = ignoredIds.has(opId);
-         // if (isIgnored) console.log(`Omitiendo Oportunidad ${opId} (Blacklisted)`);
-         return !isIgnored;
-    });
+    const refresh = String(req.query?.refresh || '').toLowerCase();
+    const forceRefresh = refresh === '1' || refresh === 'true' || refresh === 'yes';
+    const nowMs = Date.now();
+    const hasFreshCache = (nowMs - Number(prematchCache.updatedAtMs || 0)) <= PREMATCH_CACHE_TTL_MS;
+
+    if (!forceRefresh && hasFreshCache) {
+      const filteredFromCache = filterIgnoredPrematchRows(prematchCache.data || []);
+      return res.json({
+        timestamp: prematchCache.timestamp || new Date().toISOString(),
+        count: filteredFromCache.length,
+        data: filteredFromCache,
+        source: 'cache',
+        cacheAgeMs: nowMs - Number(prematchCache.updatedAtMs || nowMs)
+      });
+    }
+
+    // Modo rápido por defecto: no bloquear request esperando el scan pesado.
+    // Se devuelve último snapshot (o vacío) y el refresco sigue en background.
+    if (!forceRefresh) {
+      ensurePrematchRefresh({ deferred: true });
+      const filteredSnapshot = filterIgnoredPrematchRows(prematchCache.data || []);
+      return res.json({
+        timestamp: prematchCache.timestamp || new Date().toISOString(),
+        count: filteredSnapshot.length,
+        data: filteredSnapshot,
+        source: filteredSnapshot.length > 0 ? 'stale-while-revalidate' : 'warming',
+        warming: true,
+        cacheAgeMs: nowMs - Number(prematchCache.updatedAtMs || nowMs)
+      });
+    }
+
+    const latest = await ensurePrematchRefresh({ deferred: false });
+    const filteredOpportunities = filterIgnoredPrematchRows(latest.data || []);
 
     res.json({
-        timestamp: new Date().toISOString(),
-        count: filteredOpportunities.length,
-        data: filteredOpportunities
+      timestamp: latest.timestamp || new Date().toISOString(),
+      count: filteredOpportunities.length,
+      data: filteredOpportunities,
+      source: 'fresh-forced'
     });
   } catch (error) {
+    if (Array.isArray(prematchCache.data) && prematchCache.data.length > 0) {
+      const filteredFallback = filterIgnoredPrematchRows(prematchCache.data || []);
+      return res.json({
+        timestamp: prematchCache.timestamp || new Date().toISOString(),
+        count: filteredFallback.length,
+        data: filteredFallback,
+        source: 'stale-fallback',
+        warning: error.message
+      });
+    }
     res.status(500).json({ error: error.message });
   }
 });

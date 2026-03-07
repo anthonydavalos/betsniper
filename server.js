@@ -26,10 +26,22 @@ import { exec } from 'child_process';
 import path from 'path';
 
 const backgroundWorkersEnabled = process.env.DISABLE_BACKGROUND_WORKERS !== 'true';
+const liveScannerEnabled = process.env.DISABLE_LIVE_SCANNER !== 'true';
+const prematchSchedulerEnabled = process.env.DISABLE_PREMATCH_SCHEDULER !== 'true';
+const pinnacleIngestCronEnabled = process.env.DISABLE_PINNACLE_INGEST_CRON !== 'true';
 
 if (backgroundWorkersEnabled) {
-  startBackgroundScanner();
-  startAltenarPrematchAdaptiveScheduler();
+  if (liveScannerEnabled) {
+    startBackgroundScanner();
+  } else {
+    console.log('⏸️ Live scanner desactivado (DISABLE_LIVE_SCANNER=true).');
+  }
+
+  if (prematchSchedulerEnabled) {
+    startAltenarPrematchAdaptiveScheduler();
+  } else {
+    console.log('⏸️ Prematch scheduler desactivado (DISABLE_PREMATCH_SCHEDULER=true).');
+  }
 } else {
   console.log('⏸️ Workers de fondo desactivados (DISABLE_BACKGROUND_WORKERS=true).');
 }
@@ -46,12 +58,14 @@ const runPinnacleIngest = async () => {
 };
 
 // 1. Ejecutar al inicio (con pequeño delay para no chocar con initDB)
-if (backgroundWorkersEnabled) {
+if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
   setTimeout(runPinnacleIngest, 5000);
+} else if (backgroundWorkersEnabled && !pinnacleIngestCronEnabled) {
+  console.log('⏸️ Ingesta automática de Pinnacle desactivada (DISABLE_PINNACLE_INGEST_CRON=true).');
 }
 
 // 2. Programar intervalo (2 Horas = 7200000 ms)
-if (backgroundWorkersEnabled) {
+if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
   setInterval(runPinnacleIngest, 2 * 60 * 60 * 1000);
 }
 

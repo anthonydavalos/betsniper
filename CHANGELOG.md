@@ -7,6 +7,52 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.2] — 2026-03-07 — Sprint: Throughput Hardening + Worker Isolation
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Observabilidad operativa
+- **`scripts/health-latency.js`**:
+  - Nuevo script para medir latencia por muestras sobre endpoints críticos (`/api/portfolio`, `/api/opportunities/live`, `/api/opportunities/prematch`, `/api/booky/account`, `/api/booky/kelly-diagnostics`).
+  - Reporte por endpoint con `ok/total`, `timeouts`, promedio y `p95`.
+  - Configurable por argumentos (`--base`, `--samples`, `--timeout`, `--interval`) y env vars (`HEALTH_*`).
+- **`package.json`**:
+  - Nuevo comando `npm run health:latency`.
+
+#### Control granular de workers
+- **`server.js`**:
+  - Nuevas flags por worker:
+    - `DISABLE_LIVE_SCANNER`
+    - `DISABLE_PREMATCH_SCHEDULER`
+    - `DISABLE_PINNACLE_INGEST_CRON`
+  - Mantiene compatibilidad con `DISABLE_BACKGROUND_WORKERS` como master switch.
+
+### 🔄 Changed
+
+#### Frontend polling desacoplado y tolerante a fallos
+- **`client/src/App.jsx`**:
+  - Polling separado: ciclo core (`live + portfolio`) y ciclo prematch independiente.
+  - `booky/account`, `token-health` y `kelly-diagnostics` desacoplados del fetch core para evitar bloquear la UI.
+  - Reducción de payload remoto de Booky en polling (`historyLimit`) para acelerar balance/capital.
+  - Mantenimiento de snapshots previos ante fallos parciales (sin tumbar el dashboard).
+
+#### Prematch endpoint no bloqueante
+- **`src/routes/opportunities.js`**:
+  - Cache TTL configurable (`PREMATCH_CACHE_TTL_MS`) y deduplicación de requests concurrentes.
+  - Estrategia `stale-while-revalidate`: devuelve snapshot rápido y refresca en background.
+  - Fallback a cache stale cuando falla el refresh.
+
+### 🐛 Fixed
+
+#### Freeze intermitente de API en horas pico
+- **`src/services/scannerService.js`**:
+  - Se removió el escaneo prematch pesado del loop live para evitar bloquear el event loop.
+  - Reemplazo por refresco liviano de IDs prematch desde DB (mantiene filtrado sin penalizar throughput).
+
+---
+
 ## [v3.4.1] — 2026-03-06 — Sprint: Live PIN Integrity + Re-Entry Fidelity + UI Consistency
 
 > Rama: `master`

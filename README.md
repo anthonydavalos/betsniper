@@ -517,6 +517,9 @@ TZ=America/Lima
 
 ```env
 DISABLE_BACKGROUND_WORKERS=false
+DISABLE_LIVE_SCANNER=false
+DISABLE_PREMATCH_SCHEDULER=false
+DISABLE_PINNACLE_INGEST_CRON=false
 ```
 > Pon `true` solo para depurar el servidor Express sin que los scanners consuman CPU.
 
@@ -1241,7 +1244,23 @@ ALTENAR_SPORT_ID=0
 # BOOKY_HISTORY_REFRESH_MS=60000
 # BOOKY_HISTORY_RETENTION_DAYS=30
 # BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
+
+# Rendimiento de endpoint prematch (opcional)
+# PREMATCH_CACHE_TTL_MS=20000
 ```
+
+#### Modo de Alta Carga (Sabadazo)
+
+Para mantener el dashboard responsivo cuando sube mucho el volumen de partidos:
+
+```env
+DISABLE_BACKGROUND_WORKERS=false
+DISABLE_LIVE_SCANNER=false
+DISABLE_PREMATCH_SCHEDULER=true
+DISABLE_PINNACLE_INGEST_CRON=true
+```
+
+Luego, reinicia backend. En días normales vuelve ambos flags a `false`.
 
 ### Personalización de Risk Profiles
 
@@ -1354,6 +1373,7 @@ El payload capturado se guarda en `data/booky/capture-*.json` y queda disponible
 |---|---|
 | `npm run smoke:booky` | Ejecuta el flujo E2E completo en modo **seguro**: `token-health` → `account snapshot` → `prepare ticket` → `confirm-fast`. **No envía ninguna apuesta real** aunque `BOOKY_REAL_PLACEMENT_ENABLED=true`. |
 | `npm run smoke:booky:live` | Igual pero pasa por el path de placement real (requiere `BOOKY_REAL_PLACEMENT_ENABLED=true` y EV ≥ 0%). Usar solo para validar el flujo completo en ambiente controlado. |
+| `npm run health:latency` | Ejecuta un chequeo de latencia por muestras sobre endpoints críticos (`portfolio`, `live`, `prematch`, `booky/account`, `kelly-diagnostics`) para detectar freezes/event-loop blocking. |
 
 > **Recomendación:** ejecutar `npm run smoke:booky` después de cada renovación de token para confirmar que el sistema está operativo.
 
@@ -1599,6 +1619,23 @@ node scripts/audit_date.js 2026-03-01
 - **Si la API devuelve `[]`:** El matcher no está vinculando eventos. Usa la pestaña "Matcher" para forzar links.
 - **Si hay error 500:** Revisa que exist `data/pinnacle_live.json` y contenga datos.
 - **Si `pinnacle_live.json` está vacío:** El proceso de Terminal 2 falló. Reinicia.
+
+---
+
+### Problema: "Latencia intermitente / pantallazos en carga"
+
+**Síntoma:** a veces carga rápido y a veces todo timeout (capital, oportunidades, kelly card).
+
+**Diagnóstico rápido:**
+
+```bash
+npm run health:latency
+```
+
+**Si aparecen timeouts intermitentes:**
+1. Activa modo de alta carga (`DISABLE_PREMATCH_SCHEDULER=true`, `DISABLE_PINNACLE_INGEST_CRON=true`).
+2. Reinicia backend.
+3. Repite `npm run health:latency` y confirma que `portfolio/live` quedan estables.
 
 ---
 

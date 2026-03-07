@@ -51,6 +51,19 @@ El sistema debe persistir datos para minimizar peticiones y evitar bloqueos.
 
 ## 3. MÓDULOS DEL BACKEND (Lógica de Negocio)
 
+### 3.0 Operación en Alta Carga (Throughput Guardrails)
+
+Para días de alta congestión (ej. sábados), el sistema debe priorizar **responsividad de API** y **estabilidad del event loop**:
+
+1. **Aislamiento de workers por bandera** (evitar apagar todo el backend):
+  - `DISABLE_BACKGROUND_WORKERS` (master switch)
+  - `DISABLE_LIVE_SCANNER`
+  - `DISABLE_PREMATCH_SCHEDULER`
+  - `DISABLE_PINNACLE_INGEST_CRON`
+2. **Perfil recomendado de alta carga:** mantener Live Scanner activo y desactivar solo scheduler prematch + cron de ingesta cuando haya freezes.
+3. **Prematch endpoint con cache agresivo:** usar `stale-while-revalidate` y `PREMATCH_CACHE_TTL_MS` para evitar scans pesados por request.
+4. **Diagnóstico de latencia operativo:** ejecutar `npm run health:latency` para validar `portfolio/live/prematch/booky/kelly` antes y después de ajustes.
+
 ### MÓDULO A: "Source of Truth" (Pinnacle Arcadia)
 **Endpoint:** `guest.api.arcadia.pinnacle.com/0.1` (Guest API Unofficial).
 **Restricción:** Usar Headers/Cookies de "Invitado" y throttling para no ser bloqueado por WAF.
