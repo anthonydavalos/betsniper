@@ -105,6 +105,7 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 - Captura payload placeWidget: `npm run capture:booky:*`.
 - Spy de historial/endpoints: `npm run spy:booky:history`.
 - Smoke test API booky: `npm run smoke:booky` y `npm run smoke:booky:live`.
+- Ingesta Pinnacle manual: `npm run ingest:pinnacle:force` (normal) y `npm run ingest:pinnacle:safe` (sin flush incremental, recomendado en OneDrive).
 - Plantilla de experimento matcher: `MATCH_DIAG_TEMPLATE.md` (guía A/B para ajustar `MATCH_TIME_TOLERANCE_MINUTES` con baseline prefilled).
 
 ## 🚀 Características Principales
@@ -1394,6 +1395,18 @@ Descarga y normaliza eventos prematch de Pinnacle Arcadia (REST) en `db.json`.
 - Convierte cuotas americanas a decimales.
 - Calcula probabilidades Fair (sin vig).
 - **Cuándo usarlo:** una vez al día, o cada vez que quieras refrescar el caché prematch de Pinnacle.
+
+Comandos recomendados:
+
+```bash
+# Modo normal (con flush incremental)
+npm run ingest:pinnacle:force
+
+# Modo seguro para OneDrive (sin flush incremental)
+npm run ingest:pinnacle:safe
+```
+
+> Si operas sobre carpetas sincronizadas (OneDrive), usa `ingest:pinnacle:safe` para reducir colisiones de escritura (`EPERM/EBUSY`).
 
 ---
 
