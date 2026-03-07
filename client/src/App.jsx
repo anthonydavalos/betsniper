@@ -1958,7 +1958,10 @@ function App() {
         }).filter(bet => {
             const byProvider = String(bet.providerBetId || '');
             const duplicateInPortfolio = activePlayingBets.some(a => String(a.providerBetId || '') === byProvider && byProvider);
-            const duplicateInOps = ops.some(o => String(o.eventId || '') === String(bet.eventId || ''));
+            const betOppKey = getOpportunityId(bet);
+            const duplicateInOps = betOppKey
+                ? ops.some(o => getOpportunityId(o) === betOppKey)
+                : false;
             return !duplicateInPortfolio && !duplicateInOps;
         });
 
