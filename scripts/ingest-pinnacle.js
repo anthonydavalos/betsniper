@@ -1,5 +1,5 @@
 import { americanToDecimal } from '../src/utils/oddsConverter.js';
-import db, { initDB } from '../src/db/database.js';
+import db, { initDB, writeDBWithRetry } from '../src/db/database.js';
 import { fileURLToPath } from 'url';
 import { pinnacleClient } from '../src/config/pinnacleClient.js';
 
@@ -8,6 +8,14 @@ import { pinnacleClient } from '../src/config/pinnacleClient.js';
 
 // --- HELPERS ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function parseEnvBoolean(value, defaultValue = false) {
+    if (value == null) return defaultValue;
+    const normalized = String(value).trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+    return defaultValue;
+}
 
 async function fetchMarketsForMatch(matchId) {
     try {
@@ -102,9 +110,29 @@ function processBTTS(markets, participants) {
     return null;
 }
 
-export const ingestPinnaclePrematch = async (force = false) => {
+export const ingestPinnaclePrematch = async (force = false, options = {}) => {
     await initDB();
     await db.read();
+
+    const incrementalFlushEnabledFromEnv = parseEnvBoolean(
+        process.env.PINNACLE_INGEST_INCREMENTAL_FLUSH_ENABLED,
+        true
+    );
+    const incrementalFlushEnabled =
+        typeof options.incrementalFlushEnabled === 'boolean'
+            ? options.incrementalFlushEnabled
+            : incrementalFlushEnabledFromEnv;
+    const incrementalFlushEveryLeaguesRaw = Number.parseInt(
+        process.env.PINNACLE_INGEST_INCREMENTAL_FLUSH_EVERY_LEAGUES || '8',
+        10
+    );
+    const incrementalFlushEveryLeagues = Number.isFinite(incrementalFlushEveryLeaguesRaw) && incrementalFlushEveryLeaguesRaw > 0
+        ? incrementalFlushEveryLeaguesRaw
+        : 8;
+
+    if (!incrementalFlushEnabled) {
+        console.log('🧱 Flush incremental desactivado (PINNACLE_INGEST_INCREMENTAL_FLUSH_ENABLED=false).');
+    }
 
     const existingMatches = Array.isArray(db.data?.upcomingMatches) ? db.data.upcomingMatches : [];
     const existingById = new Map(existingMatches.map(m => [String(m.id), m]));
@@ -251,26 +279,29 @@ export const ingestPinnaclePrematch = async (force = false) => {
         processedLeagues++;
         
         // --- INCREMENTAL SAVE (Anti-Crash) ---
-        try {
-            const existing = db.data.upcomingMatches || [];
-            const getPeruDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
-            const todayStr = getPeruDate(new Date());
-            
-            // Recalculate Kept Matches based on current refinedMatches state
-            // Note: This is slightly inefficient (O(N^2)) but safe for 100s of matches
-            const kept = existing.filter(old => {
-                const dStr = getPeruDate(old.date);
-                const replaced = refinedMatches.some(newM => newM.id === old.id);
-                return dStr === todayStr && !replaced;
-            });
-            
-            const merged = [...kept, ...refinedMatches].sort((a, b) => new Date(a.date) - new Date(b.date));
-            db.data.upcomingMatches = merged;
-            db.data.pinnacleLastUpdate = new Date().toISOString();
-            await db.write();
-            // console.log(`   💾 Saved progress: ${merged.length} total matches.`);
-        } catch (saveErr) {
-            console.error("   ❌ Error saving progress:", saveErr.message);
+        // Reducimos frecuencia de flush para bajar colisiones de escritura con OneDrive.
+        const shouldFlushIncremental =
+            incrementalFlushEnabled &&
+            processedLeagues % incrementalFlushEveryLeagues === 0;
+        if (shouldFlushIncremental) {
+            try {
+                const existing = db.data.upcomingMatches || [];
+                const getPeruDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
+                const todayStr = getPeruDate(new Date());
+
+                const kept = existing.filter(old => {
+                    const dStr = getPeruDate(old.date);
+                    const replaced = refinedMatches.some(newM => newM.id === old.id);
+                    return dStr === todayStr && !replaced;
+                });
+
+                const merged = [...kept, ...refinedMatches].sort((a, b) => new Date(a.date) - new Date(b.date));
+                db.data.upcomingMatches = merged;
+                db.data.pinnacleLastUpdate = new Date().toISOString();
+                await writeDBWithRetry({ maxAttempts: 12, baseDelayMs: 140 });
+            } catch (saveErr) {
+                console.error("   ❌ Error saving progress:", saveErr.message);
+            }
         }
     }
 
@@ -311,7 +342,7 @@ export const ingestPinnaclePrematch = async (force = false) => {
     db.data.upcomingMatches = finalMatchList; 
     db.data.lastUpdate = new Date().toISOString(); // General
     db.data.pinnacleLastUpdate = new Date().toISOString(); // Específico
-    await db.write();
+    await writeDBWithRetry({ maxAttempts: 16, baseDelayMs: 180 });
     
     console.log(`✅ INGESTA PINNACLE COMPLETADA. Total: ${finalMatchList.length} partidos en DB.`);
 }
@@ -319,5 +350,15 @@ export const ingestPinnaclePrematch = async (force = false) => {
 // Ejecución directa desde CLI
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const force = process.argv.includes('--force');
-    ingestPinnaclePrematch(force);
+    const noIncrementalFlush = process.argv.includes('--no-incremental-flush');
+    ingestPinnaclePrematch(force, {
+        incrementalFlushEnabled: noIncrementalFlush ? false : undefined
+    })
+        .then(() => {
+            process.exit(0);
+        })
+        .catch((error) => {
+            console.error(`❌ Ingesta Pinnacle falló: ${error?.message || error}`);
+            process.exit(1);
+        });
 }

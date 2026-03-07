@@ -28,6 +28,8 @@
     "token:booky:dorado": "node scripts/extract-booky-auth-token.js --headed --require-profile=doradobet",
     "token:booky:dorado:wait-close": "node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=doradobet",
     "health:latency": "node scripts/health-latency.js",
+    "ingest:pinnacle:force": "node scripts/ingest-pinnacle.js --force",
+    "ingest:pinnacle:safe": "node scripts/ingest-pinnacle.js --force --no-incremental-flush",
     "migrate:booky:legacy-integration": "node scripts/migrate-booky-legacy-integration.mjs --apply",
     "migrate:booky:legacy-integration:aggressive": "node scripts/migrate-booky-legacy-integration.mjs --aggressive --apply",
     "smoke:booky": "node scripts/smoke-booky.js",
