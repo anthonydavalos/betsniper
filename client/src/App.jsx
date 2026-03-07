@@ -1339,6 +1339,22 @@ function App() {
   const handlePlaceBet = async (opportunity) => {
     const id = getOpportunityId(opportunity); // ID único por selección (eventId + selection)
         const optimisticIsSnipe = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE';
+
+        const releaseLocalOptimisticLock = () => {
+            localPlacedBetIdsRef.current.delete(id);
+            delete pendingBetDetailsRef.current[id];
+            optimisticWarnedIdsRef.current.delete(id);
+            forceUpdate();
+        };
+
+        const shouldKeepBlockedAfterForcedRefresh = () => {
+            const blockedByBetKey = blockedBetIdsRef.current instanceof Set && blockedBetIdsRef.current.has(id);
+            const eventId = String(opportunity?.eventId || '').trim();
+            const blockedByEvent = eventId && remoteOpenEventIdsRef.current instanceof Set
+                ? remoteOpenEventIdsRef.current.has(eventId)
+                : false;
+            return Boolean(blockedByBetKey || blockedByEvent);
+        };
     
         // Evitar doble clic (lock inmediato con ref para evitar race de setState)
         if (processingBetsRef.current.has(id)) return;
@@ -1442,19 +1458,54 @@ function App() {
         };
         forceUpdate();
 
+        const oldOdd = Number(opportunity?.price || opportunity?.odd || 0);
+        const oldStake = Number(opportunity?.kellyStake || 0);
+        const oldEv = Number(opportunity?.ev || 0);
+        const oldRealProb = Number(opportunity?.realProb || 0);
         const odd = Number(ticket?.opportunity?.price || ticket?.opportunity?.odd || 0);
         const stake = Number(ticket?.opportunity?.kellyStake || 0);
+        const ev = Number(ticket?.opportunity?.ev || 0);
+        const realProb = Number(ticket?.opportunity?.realProb || 0);
+        const fairProbSource = String(ticket?.opportunity?.fairProbSource || '').trim();
+
+        const showDelta = (before, after, digits = 2) => {
+            const b = Number(before);
+            const a = Number(after);
+            if (!Number.isFinite(b) || !Number.isFinite(a)) return null;
+            if (Math.abs(a - b) < 0.0001) return null;
+            return `${b.toFixed(digits)} -> ${a.toFixed(digits)}`;
+        };
+
+        const oddDeltaLine = showDelta(oldOdd, odd, 2);
+        const stakeDeltaLine = showDelta(oldStake, stake, 2);
+        const evDeltaLine = showDelta(oldEv, ev, 2);
+        const probDeltaLine = showDelta(oldRealProb, realProb, 2);
         const tokenMins = Number(token?.remainingMinutes || 0);
         const tokenLine = tokenCheckAvailable
             ? `Token restante: ${tokenMins.toFixed(1)} min\n\n`
             : 'Token: verificación rápida no disponible (se validará al confirmar)\n\n';
 
+        const refreshLines = [
+            'Recalculo previo a confirmación:',
+            `Cuota actual: ${odd.toFixed(2)}`,
+            `Stake recalculado: S/. ${stake.toFixed(2)}`,
+            `EV recalculado: ${ev.toFixed(2)}%`,
+            `Prob real recalculada: ${realProb.toFixed(2)}%`
+        ];
+
+        if (oddDeltaLine) refreshLines.push(`Delta cuota: ${oddDeltaLine}`);
+        if (stakeDeltaLine) refreshLines.push(`Delta stake: ${stakeDeltaLine}`);
+        if (evDeltaLine) refreshLines.push(`Delta EV: ${evDeltaLine}`);
+        if (probDeltaLine) refreshLines.push(`Delta prob real: ${probDeltaLine}`);
+        if (fairProbSource) refreshLines.push(`Fuente fair prob: ${fairProbSource}`);
+
+        const refreshBlock = `${refreshLines.join('\n')}\n\n`;
+
         const ok = window.confirm(
             `Apuesta REAL Booky\n\n` +
             `Partido: ${ticket?.opportunity?.match || '-'}\n` +
             `Selección: ${ticket?.opportunity?.selection || '-'}\n` +
-            `Cuota: ${odd.toFixed(2)}\n` +
-            `Stake: S/. ${stake.toFixed(2)}\n` +
+            refreshBlock +
             tokenLine +
             `¿Confirmar envío REAL a Booky?`
         );
@@ -1580,7 +1631,13 @@ function App() {
                       `requestId: ${diagnostic.requestId ?? 'n/a'}`
                     : '';
                 alert(`⚠️ Estado incierto: la casa pudo aceptar la apuesta.\nVerifica Open Bets antes de reintentar.${diagText}`);
-                await fetchData();
+                await fetchData({ forceBookyRefresh: true });
+
+                // Si Booky no reporta la apuesta como abierta luego de refresco forzado,
+                // liberamos el lock local para permitir reapostar inmediatamente.
+                if (!shouldKeepBlockedAfterForcedRefresh()) {
+                    releaseLocalOptimisticLock();
+                }
                 return;
             }
             const msg = confirmRes.data?.message || 'Error desconocido';
@@ -1603,7 +1660,12 @@ function App() {
                         : '';
                 if (code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') {
                     alert(`⚠️ Estado incierto: la casa pudo aceptar la apuesta.\nVerifica Open Bets antes de reintentar.${diagText}`);
-                    await fetchData();
+                    await fetchData({ forceBookyRefresh: true });
+
+                    // Misma lógica: desbloquear solo si no existe registro abierto real.
+                    if (!shouldKeepBlockedAfterForcedRefresh()) {
+                        releaseLocalOptimisticLock();
+                    }
                 } else {
                     const normalizedMsg = String(msg || '').toLowerCase();
                     if (normalizedMsg.includes('ticket no encontrado')) {
