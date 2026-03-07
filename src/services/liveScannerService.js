@@ -683,13 +683,14 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         // B) Obtener Probabilidad Real (Pinnacle Arcadia Live)
                         let realProb = 0;
                         let isLivePinnacle = false;
+                        let pinLiveOdds = null;
 
                         // Import dinámico para evitar ciclos si fuera necesario, o directo arriba
                         const { getPinnacleLiveOdds, calculateNoVigProb } = await import('./pinnacleService.js');
                         
                         if (pinMatch.id) {
                             const pinData = await getPinnacleLiveOdds(pinMatch.id);
-                            const pinLiveOdds = pinData ? pinData.moneyline : null;
+                            pinLiveOdds = pinData ? pinData.moneyline : null;
 
                             if (pinLiveOdds) {
                                 // Calcular Total Implied Prob (Suma de inversas)
@@ -714,6 +715,13 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                             const minute = parseInt((event.liveTime||"0").replace("'", ""));
                             const timeDecayFactor = Math.max(0.3, 1 - (minute / 120)); // Reduce prob conforme avanza tiempo
                             realProb = condition.prematchProb * timeDecayFactor;
+                        }
+
+                        // Regla estricta: LIVE_SNIPE requiere cuota live real de Pinnacle.
+                        // Evita colocar apuestas con EV estimado pero sin referencia PIN usable en UI/registro.
+                        if (!isLivePinnacle) {
+                            console.log(`   ⚠️ Skip LIVE_SNIPE sin cuota Pinnacle Live: ${event.name} (${condition.side})`);
+                            continue;
                         }
 
                         // C) Validar EV+ y Kelly

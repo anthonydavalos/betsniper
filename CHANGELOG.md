@@ -7,6 +7,74 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.1] — 2026-03-06 — Sprint: Live PIN Integrity + Re-Entry Fidelity + UI Consistency
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Frontend — Persistencia y Fallback de referencia Pinnacle
+- **`client/src/App.jsx`**:
+  - Caché sticky en memoria para referencias Pinnacle por claves robustas (`ticket`, `opp`, `pin`) para evitar pérdida de contexto en ciclos de refresh.
+  - Enriquecimiento de apuestas abiertas remotas (`getOpenBookyRemoteBets`) con fallback por `providerBetId` hacia `portfolio.activeBets/history`.
+  - Soporte de `pinnacleInfo`, `pinnaclePrice`, `ev`, `realProb`, `pick` y `kellyStake` en filas remotas abiertas.
+
+#### Frontend — UX de Re-Entry y trazabilidad visual
+- **`client/src/App.jsx`**:
+  - Re-Snipe en la misma fila activa con validaciones: mejora mínima de cuota, EV mínimo y stake mínimo.
+  - Badge visual `RE-ENTRY CANDIDATE` para candidatas de reapuesta.
+  - Nueva etiqueta contextual `ENTRY #x/y` para distinguir entradas múltiples del mismo `match+pick` (re-entries), ordenadas por hora de ticket.
+
+### 🔄 Changed
+
+#### Frontend — Confirmación optimista más robusta
+- **`client/src/App.jsx`**:
+  - TTL optimista extendido: base (`45s`) y modo snipe (`60s`).
+  - Estado de flujo optimista (`optimisticInFlight`, `optimisticFlow`) para evitar falsos negativos durante confirmación real.
+  - Expiración de optimistic rows condicionada a chequeo remoto fresco y misses consecutivos controlados.
+
+#### Frontend — Alertas y rendering en LIVE más estables
+- **`client/src/App.jsx`**:
+  - Cooldown de alertas por oportunidad (`LIVE_ALERT_COOLDOWN_MS`) para reducir ruido por flapping.
+  - Supresión de tendencias/flechas en filas activas ejecutadas; se conservan en `PENDING`.
+  - Reconciliación de `effectivePinnacleInfo/effectivePinnaclePrice` con fallback multifuente (`betData`, snapshot pendiente, candidato live, sticky cache).
+
+#### Frontend — Política de stake mínimo visual
+- **`client/src/App.jsx`**:
+  - Filtro duro de oportunidades con stake sugerido `< S/. 1` en ingestión de `liveOps/prematchOps` y defensa adicional en `getFilteredData`.
+
+#### Booky History — Hidratación persistente de metadata
+- **`src/services/bookyAccountService.js`**:
+  - Enriquecimiento de historial remoto con metadata local de portfolio y profile history (`type`, `strategy`, `ev`, `realProb`, `kellyStake`, `pick`, `pinnacleInfo`, `pinnaclePrice`).
+  - Fusión de metadatos por `providerBetId` y fallback por `eventId+pick` para conservar contexto cuando el remoto viene sparse.
+  - `mapBookyHistoryItem` ahora preserva explícitamente `pinnacleInfo` y `pinnaclePrice`.
+
+### 🐛 Fixed
+
+#### LIVE PIN OFF — integridad de fuente
+- **`client/src/App.jsx`** y **`src/services/bookyAccountService.js`**:
+  - Separación estricta de uso de cuota PIN por origen:
+    - `PREMATCH`: permitido fallback de referencia desde `prematchContext`.
+    - `LIVE`: bloqueado fallback prematch para evitar mostrar cuota pre-match como si fuera live.
+  - Sanitización para invalidar `pinnaclePrice` live cuando coincide 1:1 con `prematchPrice` en filas ejecutadas/históricas.
+  - Excepción para oportunidades `PENDING`: se conserva la cuota scanner para no ocultar PIN válido durante detección en vivo.
+
+#### Re-Entry colapsado en UI
+- **`client/src/App.jsx`**:
+  - Resolución de filas prioriza `providerBetId` (ticket) antes de `eventId+selection`.
+  - Corrige el colapso de múltiples entradas en una sola hidratación visual (ticket/odd/stake/EV/hora incorrectos).
+
+#### LIVE_SNIPE sin cuota PIN live real
+- **`src/services/liveScannerService.js`**:
+  - Endurecida regla de publicación: `LIVE_SNIPE` requiere cuota live real de Pinnacle (`isLivePinnacle`), evitando tickets nuevos con `pinnaclePrice=null`.
+  - Corrección de alcance de `pinLiveOdds` para evitar inconsistencias al construir payload de oportunidad.
+
+#### Matcher aliases operativos
+- **`src/utils/dynamicAliases.json`**:
+  - Ajustes y altas de aliases para mejorar matching en nombres divergentes de equipos/ligas.
+
+---
+
 ## [v3.4.0] — 2026-03-05 — Sprint: Booky Robustness + EV Enrichment + Arcadia Hardening
 
 > Rama: `master` | Base commit: `756476c`

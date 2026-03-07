@@ -802,6 +802,81 @@ const getEntryTimestampMs = (entry = {}) => {
   return Number.isFinite(ts) ? ts : 0;
 };
 
+const pickFirstDefined = (...values) => {
+  for (const value of values) {
+    if (value !== null && value !== undefined) return value;
+  }
+  return null;
+};
+
+const toFiniteOrNull = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const mergeMetaRows = (...rows) => {
+  const sources = rows.filter(Boolean);
+  if (sources.length === 0) return null;
+
+  return {
+    type: pickFirstDefined(...sources.map((m) => m.type)),
+    strategy: pickFirstDefined(...sources.map((m) => m.strategy)),
+    ev: pickFirstDefined(...sources.map((m) => m.ev)),
+    realProb: pickFirstDefined(...sources.map((m) => m.realProb)),
+    kellyStake: pickFirstDefined(...sources.map((m) => m.kellyStake)),
+    market: pickFirstDefined(...sources.map((m) => m.market)),
+    selection: pickFirstDefined(...sources.map((m) => m.selection)),
+    pick: pickFirstDefined(...sources.map((m) => m.pick)),
+    pinnacleInfo: pickFirstDefined(...sources.map((m) => m.pinnacleInfo)),
+    pinnaclePrice: pickFirstDefined(...sources.map((m) => m.pinnaclePrice))
+  };
+};
+
+const derivePinnacleReferencePrice = ({ pinnacleInfo = null, pick = null, market = null, selection = null } = {}) => {
+  const ctx = pinnacleInfo?.prematchContext;
+  if (!ctx || typeof ctx !== 'object') return null;
+
+  const pickKey = String(pick || '').trim().toLowerCase();
+  const marketLabel = normalizeApiMarketLabel(market || '');
+  const selectionText = String(selection || '').toLowerCase();
+
+  let candidate = null;
+  if (pickKey === 'home' || selectionText.includes('local') || selectionText.includes('home')) {
+    candidate = Number(ctx.home);
+  } else if (pickKey === 'draw' || selectionText.includes('empate') || selectionText.includes('draw')) {
+    candidate = Number(ctx.draw);
+  } else if (pickKey === 'away' || selectionText.includes('visita') || selectionText.includes('away')) {
+    candidate = Number(ctx.away);
+  } else if (pickKey.startsWith('over_') || selectionText.includes('over') || selectionText.includes('mas ') || selectionText.includes('más ')) {
+    candidate = Number(ctx.over25);
+  } else if (pickKey.startsWith('under_') || selectionText.includes('under') || selectionText.includes('menos')) {
+    candidate = Number(ctx.under25);
+  } else if (marketLabel === '1x2' && Number.isFinite(Number(ctx.home)) && Number(ctx.home) > 1) {
+    candidate = Number(ctx.home);
+  }
+
+  return Number.isFinite(candidate) && candidate > 1 ? candidate : null;
+};
+
+const isPrematchTypeLabel = (value = null) => {
+  const txt = String(value || '').trim().toUpperCase();
+  return txt.includes('PREMATCH');
+};
+
+const sanitizePinnaclePriceForType = ({ price = null, pinnacleInfo = null, typeLabel = null } = {}) => {
+  const raw = Number(price);
+  if (!Number.isFinite(raw) || raw <= 1) return null;
+
+  if (isPrematchTypeLabel(typeLabel)) return raw;
+
+  const prematchPrice = Number(pinnacleInfo?.prematchPrice);
+  if (Number.isFinite(prematchPrice) && prematchPrice > 1 && Math.abs(raw - prematchPrice) < 1e-9) {
+    return null;
+  }
+
+  return raw;
+};
+
 const resolveRowPnl = (row = {}) => {
   const status = Number(row?.status);
   if (!Number.isFinite(status)) return 0;
@@ -1579,6 +1654,10 @@ const mapBookyHistoryItem = (entry = {}) => {
     realProb: Number.isFinite(Number(opportunity?.realProb)) ? Number(opportunity.realProb) : null,
     kellyStake: Number.isFinite(Number(opportunity?.kellyStake)) ? Number(opportunity.kellyStake) : null,
     pick: opportunity?.pick || entry?.payload?.pick || null,
+    pinnacleInfo: opportunity?.pinnacleInfo || entry?.payload?.pinnacleInfo || null,
+    pinnaclePrice: Number.isFinite(Number(opportunity?.pinnaclePrice))
+      ? Number(opportunity.pinnaclePrice)
+      : (Number.isFinite(Number(opportunity?.pinnacleInfo?.price)) ? Number(opportunity.pinnacleInfo.price) : null),
     opportunitySnapshot: opportunity || null
   };
 };
@@ -1640,6 +1719,80 @@ export const getBookyHistory = async (limit = 60) => {
 
   const localTypeByProvider = new Map();
   const localTypeByEventPick = new Map();
+  const portfolioMetaByProvider = new Map();
+  const portfolioMetaByEventPick = new Map();
+  const profileStickyByProvider = new Map();
+  const profileStickyByEventPick = new Map();
+
+  const profileStore = getProfileStore(ctx.key, false);
+  const profileHistoryRows = Array.isArray(profileStore?.history) ? profileStore.history : [];
+
+  for (const row of profileHistoryRows) {
+    const providerBetId = row?.providerBetId;
+    const eventId = Number(row?.eventId);
+    const pick = String(row?.pick || '').toLowerCase().trim();
+    const meta = {
+      type: row?.type || null,
+      strategy: row?.strategy || null,
+      ev: Number.isFinite(Number(row?.ev)) ? Number(row.ev) : null,
+      realProb: Number.isFinite(Number(row?.realProb)) ? Number(row.realProb) : null,
+      kellyStake: Number.isFinite(Number(row?.kellyStake)) ? Number(row.kellyStake) : null,
+      market: row?.market || null,
+      selection: row?.selection || null,
+      pick: pick || null,
+      pinnacleInfo: row?.pinnacleInfo || null,
+      pinnaclePrice: toFiniteOrNull(row?.pinnaclePrice ?? row?.pinnacleInfo?.price)
+    };
+
+    if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
+      const key = String(providerBetId);
+      const prev = profileStickyByProvider.get(key) || null;
+      profileStickyByProvider.set(key, mergeMetaRows(meta, prev));
+    }
+
+    if (Number.isFinite(eventId) && pick) {
+      const key = `${eventId}_${pick}`;
+      const prev = profileStickyByEventPick.get(key) || null;
+      profileStickyByEventPick.set(key, mergeMetaRows(meta, prev));
+    }
+  }
+
+  const portfolioRows = [
+    ...(Array.isArray(db.data?.portfolio?.activeBets) ? db.data.portfolio.activeBets : []),
+    ...(Array.isArray(db.data?.portfolio?.history) ? db.data.portfolio.history : [])
+  ];
+
+  for (const bet of portfolioRows) {
+    const providerBetId = bet?.providerBetId;
+    const eventId = Number(bet?.eventId);
+    const pick = String(bet?.pick || '').toLowerCase().trim();
+
+    const meta = {
+      type: bet?.type || null,
+      strategy: bet?.strategy || null,
+      ev: Number.isFinite(Number(bet?.ev)) ? Number(bet.ev) : null,
+      realProb: Number.isFinite(Number(bet?.realProb)) ? Number(bet.realProb) : null,
+      kellyStake: Number.isFinite(Number(bet?.kellyStake)) ? Number(bet.kellyStake) : null,
+      market: bet?.market || null,
+      selection: bet?.selection || null,
+      pick: pick || null,
+      pinnacleInfo: bet?.pinnacleInfo || null,
+      pinnaclePrice: toFiniteOrNull(bet?.pinnaclePrice ?? bet?.pinnacleInfo?.price)
+    };
+
+    if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
+      const key = String(providerBetId);
+      const prev = portfolioMetaByProvider.get(key) || null;
+      portfolioMetaByProvider.set(key, mergeMetaRows(meta, prev));
+    }
+
+    if (Number.isFinite(eventId) && pick) {
+      const key = `${eventId}_${pick}`;
+      const prev = portfolioMetaByEventPick.get(key) || null;
+      portfolioMetaByEventPick.set(key, mergeMetaRows(meta, prev));
+    }
+  }
+
   for (const item of history) {
     const providerBetId = item?.realPlacement?.response?.bets?.[0]?.id;
     const type = item?.opportunity?.type || item?.payload?.type || null;
@@ -1650,10 +1803,17 @@ export const getBookyHistory = async (limit = 60) => {
     const market = item?.opportunity?.market || item?.payload?.market || null;
     const selection = item?.opportunity?.selection || item?.payload?.selection || null;
     const pickDirect = item?.opportunity?.pick || item?.payload?.pick || null;
+    const pinnacleInfo = item?.opportunity?.pinnacleInfo || item?.payload?.pinnacleInfo || null;
+    const pinnaclePrice = toFiniteOrNull(
+      item?.opportunity?.pinnaclePrice ??
+      item?.payload?.pinnaclePrice ??
+      item?.opportunity?.pinnacleInfo?.price
+    );
 
-    if (!type && !strategy && !Number.isFinite(ev) && !Number.isFinite(realProb)) continue;
+    const hasPinnacleReference = Boolean(pinnacleInfo) || Number.isFinite(Number(pinnaclePrice));
+    if (!type && !strategy && !Number.isFinite(ev) && !Number.isFinite(realProb) && !hasPinnacleReference) continue;
 
-    const meta = { type, strategy, ev, realProb, kellyStake, market, selection, pick: pickDirect };
+    const meta = { type, strategy, ev, realProb, kellyStake, market, selection, pick: pickDirect, pinnacleInfo, pinnaclePrice };
 
     if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
       localTypeByProvider.set(String(providerBetId), meta);
@@ -1670,17 +1830,27 @@ export const getBookyHistory = async (limit = 60) => {
 
   const enrichedRows = rows.map((row) => {
     const providerBetId = row?.providerBetId;
-    if (providerBetId === null || providerBetId === undefined || providerBetId === '') return row;
+    let localMeta = (providerBetId === null || providerBetId === undefined || providerBetId === '')
+      ? null
+      : localTypeByProvider.get(String(providerBetId));
 
-    let localMeta = localTypeByProvider.get(String(providerBetId));
-    if (!localMeta) {
-      const eventId = Number(row?.eventId);
-      const selectionTypeId = Number(row?.selections?.[0]?.selectionTypeId);
-      const pick = selectionTypeIdToPick(selectionTypeId);
-      if (Number.isFinite(eventId) && pick) {
-        localMeta = localTypeByEventPick.get(`${eventId}_${pick}`) || null;
-      }
-    }
+    const providerPortfolioMeta = (providerBetId === null || providerBetId === undefined || providerBetId === '')
+      ? null
+      : (portfolioMetaByProvider.get(String(providerBetId)) || null);
+    const providerStickyMeta = (providerBetId === null || providerBetId === undefined || providerBetId === '')
+      ? null
+      : (profileStickyByProvider.get(String(providerBetId)) || null);
+
+    const eventId = Number(row?.eventId);
+    const selectionTypeId = Number(row?.selections?.[0]?.selectionTypeId);
+    const pick = selectionTypeIdToPick(selectionTypeId);
+    const eventPickKey = Number.isFinite(eventId) && pick ? `${eventId}_${pick}` : null;
+
+    const eventLocalMeta = eventPickKey ? (localTypeByEventPick.get(eventPickKey) || null) : null;
+    const eventPortfolioMeta = eventPickKey ? (portfolioMetaByEventPick.get(eventPickKey) || null) : null;
+    const eventStickyMeta = eventPickKey ? (profileStickyByEventPick.get(eventPickKey) || null) : null;
+
+    localMeta = mergeMetaRows(localMeta, providerPortfolioMeta, providerStickyMeta, eventLocalMeta, eventPortfolioMeta, eventStickyMeta);
     if (!localMeta) return row;
 
     return {
@@ -1693,7 +1863,27 @@ export const getBookyHistory = async (limit = 60) => {
       kellyStake: Number.isFinite(Number(row?.kellyStake)) ? Number(row.kellyStake) : (Number.isFinite(Number(localMeta?.kellyStake)) ? Number(localMeta.kellyStake) : null),
       market: row?.market || localMeta.market || null,
       selection: row?.selection || localMeta.selection || null,
-      pick: row?.pick || localMeta.pick || null
+      pick: row?.pick || localMeta.pick || null,
+      pinnacleInfo: row?.pinnacleInfo || localMeta.pinnacleInfo || null,
+      pinnaclePrice: (() => {
+        const typeLabel = row?.type || row?.strategy || row?.opportunityType || localMeta?.type || localMeta?.strategy || null;
+        const info = row?.pinnacleInfo || localMeta?.pinnacleInfo || null;
+        const direct = Number.isFinite(Number(row?.pinnaclePrice))
+          ? Number(row.pinnaclePrice)
+          : (Number.isFinite(Number(localMeta?.pinnaclePrice)) ? Number(localMeta.pinnaclePrice) : null);
+        const normalizedDirect = sanitizePinnaclePriceForType({ price: direct, pinnacleInfo: info, typeLabel });
+        if (Number.isFinite(normalizedDirect)) return normalizedDirect;
+
+        if (!isPrematchTypeLabel(typeLabel)) return null;
+
+        const derived = derivePinnacleReferencePrice({
+          pinnacleInfo: info,
+          pick: row?.pick || localMeta?.pick || null,
+          market: row?.market || localMeta?.market || null,
+          selection: row?.selection || localMeta?.selection || null
+        });
+        return sanitizePinnaclePriceForType({ price: derived, pinnacleInfo: info, typeLabel });
+      })()
     };
   });
 
