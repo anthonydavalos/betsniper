@@ -263,6 +263,13 @@ const normalizeMarketLabel = (value) => {
     return raw;
 };
 
+const extractLineFromText = (value = '') => {
+    const match = String(value || '').replace(',', '.').match(/(\d+(?:\.\d+)?)/);
+    if (!match) return null;
+    const n = Number(match[1]);
+    return Number.isFinite(n) ? n : null;
+};
+
 const resolveSelectionLabel = (row = {}) => {
     const source = String(row?.selection || row?.action || '').trim();
     let clean = source
@@ -639,9 +646,38 @@ function App() {
         } else if (pickKey === 'away' || selectionText.includes('visita') || selectionText.includes('away')) {
             candidate = Number(ctx.away);
         } else if (pickKey.startsWith('over_') || selectionText.includes('over') || selectionText.includes('mas ') || selectionText.includes('más ')) {
-            candidate = Number(ctx.over25);
+            const pickLine = extractLineFromText(pickKey);
+            const selectionLine = extractLineFromText(selectionText);
+            const marketLine = extractLineFromText(marketLabel);
+            const targetLine = pickLine ?? selectionLine ?? marketLine;
+            const totals = Array.isArray(ctx.totals) ? ctx.totals : [];
+            const exact = Number.isFinite(targetLine)
+                ? totals.find((t) => Math.abs(Number(t?.line) - targetLine) < 0.1)
+                : null;
+            candidate = Number(exact?.over);
+            if (!(Number.isFinite(candidate) && candidate > 1)) {
+                candidate = Number(ctx.over25);
+            }
         } else if (pickKey.startsWith('under_') || selectionText.includes('under') || selectionText.includes('menos')) {
-            candidate = Number(ctx.under25);
+            const pickLine = extractLineFromText(pickKey);
+            const selectionLine = extractLineFromText(selectionText);
+            const marketLine = extractLineFromText(marketLabel);
+            const targetLine = pickLine ?? selectionLine ?? marketLine;
+            const totals = Array.isArray(ctx.totals) ? ctx.totals : [];
+            const exact = Number.isFinite(targetLine)
+                ? totals.find((t) => Math.abs(Number(t?.line) - targetLine) < 0.1)
+                : null;
+            candidate = Number(exact?.under);
+            if (!(Number.isFinite(candidate) && candidate > 1)) {
+                candidate = Number(ctx.under25);
+            }
+        } else if (marketLabel === 'BTTS') {
+            const btts = ctx.btts || {};
+            if (pickKey === 'btts_yes' || selectionText.includes('yes') || selectionText.includes('si') || selectionText.includes('sí')) {
+                candidate = Number(btts.yes);
+            } else if (pickKey === 'btts_no' || selectionText.includes('no')) {
+                candidate = Number(btts.no);
+            }
         } else if (marketLabel === '1x2') {
             if (Number.isFinite(Number(ctx.home)) && Number(ctx.home) > 1) candidate = Number(ctx.home);
         }
@@ -1332,8 +1368,26 @@ function App() {
             .get('/api/booky/token-health', { timeout: 3500 })
             .catch(() => null);
 
-        const prepareTimeoutMs = 25000;
+        const prepareTimeoutMs = 45000;
         const doPrepare = () => axios.post('/api/booky/prepare', opportunity, { timeout: prepareTimeoutMs });
+        const recoverPreparedTicket = async () => {
+            const ticketsRes = await axios.get('/api/booky/tickets', { timeout: 7000 });
+            const pending = Array.isArray(ticketsRes?.data?.pending) ? ticketsRes.data.pending : [];
+            const nowMs = Date.now();
+
+            return pending.find((t) => {
+                if (String(t?.status || '').toUpperCase() !== 'DRAFT') return false;
+                const expMs = new Date(t?.expiresAt || '').getTime();
+                if (!Number.isFinite(expMs) || expMs <= nowMs) return false;
+
+                const tOpp = t?.opportunity || {};
+                const sameEvent = String(tOpp?.eventId || '') === String(opportunity?.eventId || '');
+                const sameSelection = String(tOpp?.selection || '').trim().toLowerCase() === String(opportunity?.selection || '').trim().toLowerCase();
+                const sameMarket = String(tOpp?.market || '').trim().toLowerCase() === String(opportunity?.market || '').trim().toLowerCase();
+
+                return sameEvent && sameSelection && sameMarket;
+            });
+        };
 
         let prepRes;
         try {
@@ -1343,8 +1397,13 @@ function App() {
             const isTimeout = prepError?.code === 'ECONNABORTED' || prepMsg.includes('timeout');
             if (!isTimeout) throw prepError;
 
-            await new Promise(resolve => setTimeout(resolve, 700));
-            prepRes = await doPrepare();
+            const recovered = await recoverPreparedTicket().catch(() => null);
+            if (recovered) {
+                prepRes = { data: { success: true, ticket: recovered } };
+            } else {
+                await new Promise(resolve => setTimeout(resolve, 1200));
+                prepRes = await doPrepare();
+            }
         }
 
         if (!prepRes.data?.success || !prepRes.data?.ticket) {

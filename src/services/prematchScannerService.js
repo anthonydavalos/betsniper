@@ -1,4 +1,4 @@
-import db from '../db/database.js';
+import db, { writeDBWithRetry } from '../db/database.js';
 import { findMatch, isTimeMatch, normalizeName, getSimilarity, getTokenSimilarity, TEAM_ALIASES } from '../utils/teamMatcher.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { getAllPinnaclePrematchOdds } from './pinnacleService.js';
@@ -65,17 +65,8 @@ const getPrematchWindowUtc = () => {
 };
 
 const writeDbWithRetry = async (maxRetries = 12, waitMs = 300) => {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            await db.write();
-            return true;
-        } catch (error) {
-            const isLockErr = error?.code === 'EPERM' || error?.code === 'EBUSY';
-            if (!isLockErr || attempt === maxRetries) throw error;
-            await new Promise(r => setTimeout(r, waitMs * attempt));
-        }
-    }
-    return false;
+    await writeDBWithRetry({ maxAttempts: maxRetries, baseDelayMs: waitMs });
+    return true;
 };
 
 const splitEventSides = (value = '') => {
@@ -534,9 +525,9 @@ export const scanPrematchOpportunities = async () => {
                 // ==========================================
                 const realProbs1x2 = getFairProbabilities(pinMatch.odds);
                 if (realProbs1x2 && altenarOdds) {
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs1x2.home, currentBankroll, '1x2');
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs1x2.draw, currentBankroll, '1x2');
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs1x2.away, currentBankroll, '1x2');
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs1x2.home, currentBankroll, '1x2', pinMatch.odds?.home);
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs1x2.draw, currentBankroll, '1x2', pinMatch.odds?.draw);
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs1x2.away, currentBankroll, '1x2', pinMatch.odds?.away);
                 }
 
                 // A.1) Analizar Double Chance
@@ -547,15 +538,15 @@ export const scanPrematchOpportunities = async () => {
 
                     if (dcAlt.homeDraw && dcPin.homeDraw) {
                         const realProb = 1 / dcPin.homeDraw;
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '1X', dcAlt.homeDraw, realProb, currentBankroll, 'Double Chance');
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '1X', dcAlt.homeDraw, realProb, currentBankroll, 'Double Chance', dcPin.homeDraw);
                     }
                     if (dcAlt.homeAway && dcPin.homeAway) {
                         const realProb = 1 / dcPin.homeAway;
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '12', dcAlt.homeAway, realProb, currentBankroll, 'Double Chance');
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '12', dcAlt.homeAway, realProb, currentBankroll, 'Double Chance', dcPin.homeAway);
                     }
                     if (dcAlt.drawAway && dcPin.drawAway) {
                         const realProb = 1 / dcPin.drawAway;
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'X2', dcAlt.drawAway, realProb, currentBankroll, 'Double Chance');
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'X2', dcAlt.drawAway, realProb, currentBankroll, 'Double Chance', dcPin.drawAway);
                     }
                 }
 
@@ -573,9 +564,9 @@ export const scanPrematchOpportunities = async () => {
                             if (realProbsTotal) {
 
                                 // Over (p1)
-                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Over ${pinTotal.line}`, altTotal.over, realProbsTotal.p1, currentBankroll, 'Total');
+                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Over ${pinTotal.line}`, altTotal.over, realProbsTotal.p1, currentBankroll, 'Total', pinTotal.over);
                                 // Under (p2)
-                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Under ${pinTotal.line}`, altTotal.under, realProbsTotal.p2, currentBankroll, 'Total');
+                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Under ${pinTotal.line}`, altTotal.under, realProbsTotal.p2, currentBankroll, 'Total', pinTotal.under);
                             }
                         }
                     }
@@ -590,8 +581,8 @@ export const scanPrematchOpportunities = async () => {
                     const realProbsBTTS = getFair2Way(pinMatch.odds.btts.yes, pinMatch.odds.btts.no);
                     
                     if (realProbsBTTS) {
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS Yes', altenarOdds.btts.yes, realProbsBTTS.p1, currentBankroll, 'BTTS');
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS No', altenarOdds.btts.no, realProbsBTTS.p2, currentBankroll, 'BTTS');
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS Yes', altenarOdds.btts.yes, realProbsBTTS.p1, currentBankroll, 'BTTS', pinMatch.odds?.btts?.yes);
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS No', altenarOdds.btts.no, realProbsBTTS.p2, currentBankroll, 'BTTS', pinMatch.odds?.btts?.no);
                     }
                 }
             }
@@ -653,7 +644,7 @@ export const scanPrematchOpportunities = async () => {
 };
 
 // Helper interno para evaluar y agregar oportunidad
-const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd, realProb, bankroll, marketName = '1x2') => {
+const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd, realProb, bankroll, marketName = '1x2', pinnacleReferenceOdd = null) => {
     if (!offeredOdd || offeredOdd <= 1) return;
 
     // EV Formula: (ProbReal * CuotaOfrecida) - 1
@@ -681,6 +672,9 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
             market: marketName,
             selection: listSide,
             odd: offeredOdd,
+            pinnaclePrice: Number.isFinite(Number(pinnacleReferenceOdd)) && Number(pinnacleReferenceOdd) > 1
+                ? Number(pinnacleReferenceOdd)
+                : null,
             realProb: realProb * 100,
             ev: evPercentage,
             kellyStake: kellyResult.amount, // Extraer el monto ($) del objeto devuelto
@@ -694,6 +688,8 @@ const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd,
                     away: dbMatch.odds?.away,
                     over25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over,
                     under25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under,
+                    totals: dbMatch.odds?.totals || [],
+                    btts: dbMatch.odds?.btts || null,
                 }
             }
         });
