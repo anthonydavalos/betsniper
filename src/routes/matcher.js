@@ -1,5 +1,5 @@
 import express from 'express';
-import db from '../db/database.js';
+import db, { pruneStaleEventCaches, writeDBWithRetry } from '../db/database.js';
 import { registerDynamicAlias } from '../utils/teamMatcher.js';
 
 const router = express.Router();
@@ -33,6 +33,11 @@ const hasPersistedManualLink = ({ rows = [], pinnacleId, altenarId, targetKey })
 // Devuelve todos los partidos de Pinnacle y Altenar para el matcher manual
 router.get('/data', async (req, res) => {
     try {
+        await pruneStaleEventCaches({
+            upcomingGraceMinutes: Number(process.env.DB_UPCOMING_RETENTION_MINUTES || 180),
+            altenarGraceMinutes: Number(process.env.DB_ALTENAR_RETENTION_MINUTES || 180),
+            persist: true
+        });
         await db.read();
         const pinnacle = db.data.upcomingMatches || [];
         const altenar = db.data.altenarUpcoming || [];
@@ -71,6 +76,11 @@ router.post('/link', async (req, res) => {
     console.log(`📥 [API] Link Request received: Pin=${pinnacleId} (${typeof pinnacleId}), Alt=${altenarId} (${typeof altenarId})`);
 
     try {
+        await pruneStaleEventCaches({
+            upcomingGraceMinutes: Number(process.env.DB_UPCOMING_RETENTION_MINUTES || 180),
+            altenarGraceMinutes: Number(process.env.DB_ALTENAR_RETENTION_MINUTES || 180),
+            persist: true
+        });
         await db.read();
         
         // Búsqueda robusta (String/Number agnostic)
@@ -89,7 +99,7 @@ router.post('/link', async (req, res) => {
         let persisted = false;
 
         // Reintento interno para mitigar carreras con scanner/ingestor.
-        for (let attempt = 1; attempt <= 3; attempt += 1) {
+        for (let attempt = 1; attempt <= 5; attempt += 1) {
             await db.read();
 
             let attemptApplied = 0;
@@ -107,7 +117,7 @@ router.post('/link', async (req, res) => {
             }
 
             appliedCount = Math.max(appliedCount, attemptApplied);
-            await db.write();
+            await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 140 });
 
             await db.read();
             persisted = hasPersistedManualLink({
@@ -118,7 +128,7 @@ router.post('/link', async (req, res) => {
             });
 
             if (persisted) break;
-            await wait(150 * attempt);
+            await wait(220 * attempt);
         }
         
         // APRENDIZAJE: Guardar nuevos alias encontrados
@@ -169,7 +179,7 @@ router.post('/unlink', async (req, res) => {
             match.altenarName = null;
             match.linkSource = null;
             match.linkUpdatedAt = new Date().toISOString();
-            await db.write();
+            await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 140 });
             res.json({ success: true, match });
         } else {
             res.status(404).json({ error: "Match not found" });
