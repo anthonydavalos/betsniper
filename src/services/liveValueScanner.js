@@ -11,16 +11,39 @@ const parsePositiveNumberOr = (value, fallback) => {
     return Number.isFinite(n) && n > 0 ? n : fallback;
 };
 
+const parsePositiveIntOr = (value, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    const intN = Math.floor(n);
+    return intN > 0 ? intN : fallback;
+};
+
+const parseBooleanFromEnv = (rawValue, fallback = false) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const normalized = String(rawValue).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+};
+
 const LIVE_VALUE_MIN_EV = parsePositiveNumberOr(process.env.LIVE_VALUE_MIN_EV, 0.02);
 const LIVE_VALUE_NON_1X2_STAKE_FACTOR = parsePositiveNumberOr(process.env.LIVE_VALUE_NON_1X2_STAKE_FACTOR, 1);
 const LIVE_VALUE_MIN_DISPLAY_STAKE = parsePositiveNumberOr(process.env.LIVE_VALUE_MIN_DISPLAY_STAKE, 0.1);
+const LIVE_VALUE_ENABLE_STABILITY_FILTER = parseBooleanFromEnv(process.env.LIVE_VALUE_ENABLE_STABILITY_FILTER, true);
+const LIVE_VALUE_STABILITY_MIN_HITS = parsePositiveIntOr(process.env.LIVE_VALUE_STABILITY_MIN_HITS, 2);
+const LIVE_VALUE_STABILITY_MIN_AGE_MS = parsePositiveIntOr(process.env.LIVE_VALUE_STABILITY_MIN_AGE_MS, 4000);
+const LIVE_VALUE_REQUIRE_SCORE_SYNC = parseBooleanFromEnv(process.env.LIVE_VALUE_REQUIRE_SCORE_SYNC, true);
+const LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF = parsePositiveIntOr(process.env.LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF, 0);
 
 const liveOpportunityStability = new Map();
 const STABILITY_WINDOW_MS = 25000;
-const STABILITY_MIN_HITS = 2;
-const STABILITY_MIN_AGE_MS = 4000;
 
 const shouldPublishStableOpportunity = (opKey) => {
+    if (!LIVE_VALUE_ENABLE_STABILITY_FILTER) return true;
+
     const now = Date.now();
     const prev = liveOpportunityStability.get(opKey);
 
@@ -41,7 +64,7 @@ const shouldPublishStableOpportunity = (opKey) => {
     liveOpportunityStability.set(opKey, next);
 
     const age = now - next.firstSeenAt;
-    return next.hits >= STABILITY_MIN_HITS && age >= STABILITY_MIN_AGE_MS;
+    return next.hits >= LIVE_VALUE_STABILITY_MIN_HITS && age >= LIVE_VALUE_STABILITY_MIN_AGE_MS;
 };
 
 const pruneStabilityCache = () => {
@@ -135,6 +158,20 @@ const isScoreSynchronized = (altenarScore, pinnacleScore) => {
     if (!a || !p) return false;
 
     return a[0] === p[0] && a[1] === p[1];
+};
+
+const isScoreSyncAcceptable = (altenarScore, pinnacleScore) => {
+    if (!LIVE_VALUE_REQUIRE_SCORE_SYNC) return true;
+    if (isScoreSynchronized(altenarScore, pinnacleScore)) return true;
+
+    if (LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF <= 0) return false;
+
+    const a = parseScorePair(altenarScore);
+    const p = parseScorePair(pinnacleScore);
+    if (!a || !p) return false;
+
+    const totalDiff = Math.abs((a[0] + a[1]) - (p[0] + p[1]));
+    return totalDiff <= LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF;
 };
 
 const isMatchTotalMarket = (market, eventName, oddsMap) => {
@@ -429,7 +466,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
 
         // [ANTI-FALSO-POSITIVO] Si marcador Altenar y Pinnacle no están sincronizados,
         // NO evaluamos oportunidades en este ciclo para evitar alertas falsas post-gol.
-        const scoreInSync = isScoreSynchronized(event.score, pinLiveOdds.score);
+        const scoreInSync = isScoreSyncAcceptable(event.score, pinLiveOdds.score);
         if (!scoreInSync) {
             const altScore = parseScorePair(event.score);
             const pinScore = parseScorePair(pinLiveOdds.score);

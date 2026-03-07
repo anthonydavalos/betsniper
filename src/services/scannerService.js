@@ -5,6 +5,23 @@ import { scanLiveOpportunities as performValueScan, getLiveOverview } from './li
 import { scanLiveOpportunities as performTurnaroundScan } from './liveScannerService.js'; 
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 
+const parseBooleanFromEnv = (rawValue, fallback = false) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+    const normalized = String(rawValue).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+};
+
+const parsePositiveIntOr = (value, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    const intN = Math.floor(n);
+    return intN > 0 ? intN : fallback;
+};
+
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER" (Background Worker)
 // Estrategia: "La Volteada" (Favorito Pre-match perdiendo por 1 gol)
@@ -16,7 +33,8 @@ let cachedOpportunities = [];
 let cachedPrematchIds = new Set(); // IDs de eventos ya detectados en Pre-Match
 const liveQuoteStability = new Map();
 const QUOTE_STABILITY_WINDOW_MS = 20000;
-const QUOTE_STABILITY_MIN_HITS = 2;
+const LIVE_GLOBAL_STABILITY_ENABLED = parseBooleanFromEnv(process.env.LIVE_GLOBAL_STABILITY_ENABLED, true);
+const QUOTE_STABILITY_MIN_HITS = parsePositiveIntOr(process.env.LIVE_GLOBAL_STABILITY_MIN_HITS, 2);
 
 // Helper: Generar ID único por oportunidad (eventId + selection)
 // Debe coincidir con la función del frontend
@@ -84,6 +102,8 @@ const pruneQuoteStabilityCache = () => {
 };
 
 const filterStableLiveQuotes = (ops = []) => {
+    if (!LIVE_GLOBAL_STABILITY_ENABLED) return ops;
+
     const now = Date.now();
     const stable = [];
 

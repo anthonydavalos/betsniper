@@ -70,10 +70,17 @@ const MATCH_MIN_ACCEPT_SCORE = parseThresholdFromEnv(
     'MATCH_MIN_ACCEPT_SCORE',
     'LiveScanner'
 );
+const LIVE_SNIPE_REQUIRE_PINNACLE_LIVE = parseBooleanFromEnv(
+    process.env.LIVE_SNIPE_REQUIRE_PINNACLE_LIVE,
+    true,
+    'LIVE_SNIPE_REQUIRE_PINNACLE_LIVE',
+    'LiveScanner'
+);
 
 console.log(
     `🔧 [MatcherConfig] diag=${ENABLE_MATCH_DIAGNOSTICS ? 1 : 0} ` +
-    `fuzzy=${MATCHER_FUZZY_THRESHOLD} minAccept=${MATCH_MIN_ACCEPT_SCORE}`
+    `fuzzy=${MATCHER_FUZZY_THRESHOLD} minAccept=${MATCH_MIN_ACCEPT_SCORE} ` +
+    `requirePinLive=${LIVE_SNIPE_REQUIRE_PINNACLE_LIVE ? 1 : 0}`
 );
 
 const normalizeMarketText = (value = '') => String(value)
@@ -719,7 +726,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
 
                         // Regla estricta: LIVE_SNIPE requiere cuota live real de Pinnacle.
                         // Evita colocar apuestas con EV estimado pero sin referencia PIN usable en UI/registro.
-                        if (!isLivePinnacle) {
+                        if (!isLivePinnacle && LIVE_SNIPE_REQUIRE_PINNACLE_LIVE) {
                             console.log(`   ⚠️ Skip LIVE_SNIPE sin cuota Pinnacle Live: ${event.name} (${condition.side})`);
                             continue;
                         }
