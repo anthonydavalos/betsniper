@@ -49,7 +49,13 @@ function getOpportunityId(op) {
 
 const BOOKY_SETTLED_STATUSES = new Set([1, 2, 4, 8, 18]);
 const isBookyOpenStatus = (value) => Number(value) === 0;
-const OPTIMISTIC_BET_TTL_MS = 20000;
+const OPTIMISTIC_BET_TTL_MS = 45000;
+const OPTIMISTIC_BET_TTL_SNIPE_MS = 60000;
+const LIVE_ALERT_COOLDOWN_MS = 90000;
+const REENTRY_MIN_ODD_IMPROVEMENT_PCT = 8;
+const REENTRY_MIN_EV_PERCENT = 3;
+const REENTRY_MIN_STAKE_SOL = 1;
+const MIN_BOOKY_STAKE_SOL = 1;
 
 const resolveBookyOutcome = (row = {}) => {
     const status = Number(row?.status);
@@ -448,6 +454,17 @@ const hasLiveClockSignal = (value = '') => {
     return /\b\d{1,3}(?:\+\d{1,2})?\s*'?\s*(MIN)?\b/i.test(normalized);
 };
 
+const resolveOptimisticTtlMs = (meta = {}) => {
+    const custom = Number(meta?.optimisticTtlMs);
+    if (Number.isFinite(custom) && custom > 0) return custom;
+    return meta?.optimisticIsSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS;
+};
+
+const hasMinBookyStake = (op = {}) => {
+    const suggestedStake = Number(op?.kellyStake ?? op?.stake ?? 0);
+    return Number.isFinite(suggestedStake) && suggestedStake >= MIN_BOOKY_STAKE_SOL;
+};
+
 const isLiveOriginOpportunity = (op = {}) => {
     const type = String(op?.type || op?.strategy || '').toUpperCase();
     if (type.includes('LIVE') || type === 'LA_VOLTEADA') return true;
@@ -461,6 +478,27 @@ const isLiveOriginOpportunity = (op = {}) => {
         '';
 
     return hasLiveClockSignal(liveSignal);
+};
+
+const isPrematchOriginOpportunity = (op = {}) => {
+    const type = String(op?.type || op?.strategy || op?.opportunityType || '').toUpperCase();
+    if (type.includes('PREMATCH')) return true;
+    if (isLiveOriginOpportunity(op)) return false;
+    return false;
+};
+
+const sanitizePinnaclePriceForOrigin = ({ price = null, pinnacleInfo = null, isPrematchOrigin = false, preserveForPending = false } = {}) => {
+    const raw = Number(price);
+    if (!Number.isFinite(raw) || raw <= 1) return null;
+    if (isPrematchOrigin) return raw;
+    if (preserveForPending) return raw;
+
+    const prematchPrice = Number(pinnacleInfo?.prematchPrice);
+    if (Number.isFinite(prematchPrice) && prematchPrice > 1 && Math.abs(raw - prematchPrice) < 1e-9) {
+        return null;
+    }
+
+    return raw;
 };
 
 function playAlert(kind = 'DEFAULT') {
@@ -548,6 +586,9 @@ function App() {
   const isFirstLoad = useRef(true);
     const prevLiveOpsIdsRef = useRef(new Set());
   const prevOddsRef = useRef({}); // [NEW] Cache para detectar tendencias de cuotas
+        const latestLiveCandidatesByKeyRef = useRef(new Map());
+          const stickyPinnacleByKeyRef = useRef(new Map());
+        const lastAlertedLiveOpAtRef = useRef(new Map());
     const fetchInFlightRef = useRef(false);
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
@@ -561,6 +602,123 @@ function App() {
   // Trigger re-render when we update refs (hacky but works for instant feedback)
   const [, setTick] = useState(0);
   const forceUpdate = () => setTick(t => t + 1);
+
+    const hasPrematchContext = (info = null) => {
+        const ctx = info?.prematchContext;
+        if (!ctx || typeof ctx !== 'object') return false;
+
+        const candidates = [ctx.home, ctx.draw, ctx.away, ctx.over25, ctx.under25];
+        return candidates.some(value => Number.isFinite(Number(value)) && Number(value) > 1);
+    };
+
+    const derivePinnacleReferencePrice = ({ pinnacleInfo = null, pick = null, market = null, selection = null } = {}) => {
+        const ctx = pinnacleInfo?.prematchContext;
+        if (!ctx || typeof ctx !== 'object') return null;
+
+        const pickKey = String(pick || '').trim().toLowerCase();
+        const marketLabel = normalizeMarketLabel(market || '');
+        const selectionText = String(selection || '').toLowerCase();
+
+        let candidate = null;
+
+        if (pickKey === 'home' || selectionText.includes('local') || selectionText.includes('home')) {
+            candidate = Number(ctx.home);
+        } else if (pickKey === 'draw' || selectionText.includes('empate') || selectionText.includes('draw')) {
+            candidate = Number(ctx.draw);
+        } else if (pickKey === 'away' || selectionText.includes('visita') || selectionText.includes('away')) {
+            candidate = Number(ctx.away);
+        } else if (pickKey.startsWith('over_') || selectionText.includes('over') || selectionText.includes('mas ') || selectionText.includes('más ')) {
+            candidate = Number(ctx.over25);
+        } else if (pickKey.startsWith('under_') || selectionText.includes('under') || selectionText.includes('menos')) {
+            candidate = Number(ctx.under25);
+        } else if (marketLabel === '1x2') {
+            if (Number.isFinite(Number(ctx.home)) && Number(ctx.home) > 1) candidate = Number(ctx.home);
+        }
+
+        return Number.isFinite(candidate) && candidate > 1 ? candidate : null;
+    };
+
+    const extractPinnaclePrice = (row = {}) => {
+        const raw = Number(
+                row?.pinnaclePrice ??
+                row?.pinnacleInfo?.price ??
+                row?.realPlacement?.requested?.odd
+        );
+        return Number.isFinite(raw) && raw > 1 ? raw : null;
+    };
+
+    const buildPinnacleReferenceKeys = (row = {}) => {
+        const keys = [];
+
+        const providerBetId = resolveOpTicketId(row);
+        if (providerBetId !== null && providerBetId !== undefined && String(providerBetId).trim() !== '') {
+                keys.push(`ticket:${String(providerBetId).trim()}`);
+        }
+
+        const oppKey = getOpportunityId(row);
+        if (oppKey) keys.push(`opp:${oppKey}`);
+
+        const pinnacleId = row?.pinnacleId || row?.pinnacleInfo?.id || null;
+        if (pinnacleId !== null && pinnacleId !== undefined && String(pinnacleId).trim() !== '') {
+                keys.push(`pin:${String(pinnacleId).trim()}`);
+        }
+
+        return keys;
+    };
+
+    const mergePinnacleInfoCandidates = (...candidates) => {
+        const validCandidates = candidates.filter(Boolean);
+        if (validCandidates.length === 0) return null;
+
+        const first = validCandidates[0];
+        if (hasPrematchContext(first)) return first;
+
+        const withPrematch = validCandidates.find(hasPrematchContext);
+        if (!withPrematch) return first;
+
+        return {
+                ...first,
+                prematchContext: withPrematch?.prematchContext || first?.prematchContext || null
+        };
+    };
+
+    const getStickyPinnacleReference = (row = {}) => {
+        const keys = buildPinnacleReferenceKeys(row);
+        for (const key of keys) {
+                const found = stickyPinnacleByKeyRef.current.get(key);
+                if (found) return found;
+        }
+        return null;
+    };
+
+    const rememberStickyPinnacleReference = (row = {}) => {
+        const keys = buildPinnacleReferenceKeys(row);
+        if (keys.length === 0) return;
+
+        const pinnacleInfo = row?.pinnacleInfo || null;
+        const pinnaclePrice = extractPinnaclePrice(row);
+        if (!hasPrematchContext(pinnacleInfo) && !Number.isFinite(pinnaclePrice)) return;
+
+        const payload = {
+                pinnacleInfo,
+                pinnaclePrice,
+                updatedAt: Date.now()
+        };
+
+        for (const key of keys) {
+                const prev = stickyPinnacleByKeyRef.current.get(key) || null;
+                const mergedInfo = mergePinnacleInfoCandidates(payload.pinnacleInfo, prev?.pinnacleInfo);
+                const mergedPrice = Number.isFinite(payload.pinnaclePrice)
+                        ? payload.pinnaclePrice
+                        : (Number.isFinite(prev?.pinnaclePrice) ? prev.pinnaclePrice : null);
+
+                stickyPinnacleByKeyRef.current.set(key, {
+                        pinnacleInfo: mergedInfo,
+                        pinnaclePrice: mergedPrice,
+                        updatedAt: Date.now()
+                });
+        }
+    };
 
   // --- API CALLS ---
 
@@ -670,6 +828,16 @@ function App() {
           // [FIX] Filtrar con blacklist local para evitar parpadeo
           // Si el servidor aun trae un evento que acabamos de descartar o apostar, lo ocultamos
           const serverOps = liveRes.data.data;
+
+          // Mantener snapshot completo por selección para detectar re-snipe en filas ya apostadas.
+          const latestByKey = new Map();
+          serverOps.forEach(op => {
+              const key = getOpportunityId(op);
+              if (key) latestByKey.set(key, op);
+              rememberStickyPinnacleReference(op);
+          });
+          latestLiveCandidatesByKeyRef.current = latestByKey;
+
           const cleanOps = serverOps.filter(op => {
               const id = getOpportunityId(op); // ID único por selección
               
@@ -683,6 +851,9 @@ function App() {
               // Comparar ID completo (eventId + selection) para filtrado granular
               if (blockedBetIds.has(id)) return false;
               if (remoteOpenEventIds.has(String(op?.eventId || '').trim())) return false;
+
+              // Regla Booky: no mostrar oportunidades con stake sugerido < S/. 1
+              if (!hasMinBookyStake(op)) return false;
 
               return true;
           });
@@ -719,6 +890,9 @@ function App() {
            const cleanOps = serverOps.filter(op => {
               if (isLiveOriginOpportunity(op)) return false;
 
+                  // Regla Booky: no mostrar oportunidades con stake sugerido < S/. 1
+                  if (!hasMinBookyStake(op)) return false;
+
               const id = getOpportunityId(op); // ID único por selección
               
               if (localDiscardedIdsRef.current.has(id)) return false;
@@ -730,6 +904,9 @@ function App() {
       }
 
       if (portfolioRes.data) {
+          (portfolioRes.data.activeBets || []).forEach(rememberStickyPinnacleReference);
+          (portfolioRes.data.history || []).forEach(rememberStickyPinnacleReference);
+
           // [MOD] Optimistic merge: Si tenemos apuestas locales pendientes que aun no estan en el server, las mantenemos
           const serverActiveBets = portfolioRes.data.activeBets || [];
           
@@ -757,18 +934,25 @@ function App() {
                   ? (Date.now() - createdAtMs)
                   : Number.POSITIVE_INFINITY;
 
+              const optimisticTtlMs = resolveOptimisticTtlMs(optimisticMeta);
+              const isInFlight = Boolean(optimisticMeta?.optimisticInFlight);
+              const hasFreshRemoteCheck = Boolean(
+                  shouldFetchBooky &&
+                  bookyReq?.status === 'fulfilled' &&
+                  bookyReq?.value?.data?.success
+              );
+
               const confirmedAtMs = new Date(optimisticMeta?.optimisticConfirmedAt || 0).getTime();
               const hasConfirmedMark = Number.isFinite(confirmedAtMs) && confirmedAtMs > 0;
-              const shouldExpireByTtl = ageMs >= OPTIMISTIC_BET_TTL_MS;
+              const shouldExpireByTtl = ageMs >= optimisticTtlMs;
+
+              // Si la confirmación real sigue en vuelo, no expirar por TTL.
+              if (isInFlight) {
+                  stillPendingLocalIds.push(id);
+                  return;
+              }
 
               if (hasConfirmedMark) {
-                  // Evitar falso negativo: solo contar misses cuando hubo fetch remoto en este ciclo.
-                  const hasFreshRemoteCheck = Boolean(
-                      shouldFetchBooky &&
-                      bookyReq?.status === 'fulfilled' &&
-                      bookyReq?.value?.data?.success
-                  );
-
                   if (!hasFreshRemoteCheck) {
                       stillPendingLocalIds.push(id);
                       return;
@@ -803,12 +987,18 @@ function App() {
               }
 
               if (shouldExpireByTtl) {
+                  // Evitar falso negativo: solo expirar cuando hubo chequeo remoto fresco.
+                  if (!hasFreshRemoteCheck) {
+                      stillPendingLocalIds.push(id);
+                      return;
+                  }
+
                   localPlacedBetIdsRef.current.delete(id);
                   delete pendingBetDetailsRef.current[id];
 
                   if (!optimisticWarnedIdsRef.current.has(id)) {
                       optimisticWarnedIdsRef.current.add(id);
-                      const reasonText = 'la confirmación tardó demasiado y no apareció en Booky.';
+                      const reasonText = 'no apareció en Booky dentro de la ventana de gracia extendida.';
                       alert(
                           `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
                           'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
@@ -895,16 +1085,54 @@ function App() {
     }
 
     const currentIds = new Set(liveOps.map(op => getOpportunityId(op)));
-    const newOps = liveOps.filter(op => !prevLiveOpsIdsRef.current.has(getOpportunityId(op)));
+    const activeKeys = new Set(
+        (Array.isArray(portfolio?.activeBets) ? portfolio.activeBets : [])
+            .map(getOpportunityId)
+            .filter(Boolean)
+    );
 
-    if (newOps.length > 0) {
-        const hasSnipe = newOps.some(op => op.type === 'LIVE_SNIPE' || op.strategy === 'LIVE_SNIPE');
-        console.log(`🔔 ${newOps.length} Nueva(s) Oportunidad(es) Detectada(s) - Sonido: ${hasSnipe ? 'SNIPE' : 'DEFAULT'}`);
+    const remoteOpenRows = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
+        .filter(row => isBookyOpenStatus(row?.status));
+    remoteOpenRows.forEach(row => {
+        const key = getBookyOpenBetKey(row);
+        if (key) activeKeys.add(key);
+    });
+
+    // No disparar sonido para selecciones ya abiertas (evita ruido por reaparición temporal).
+    const newOps = liveOps.filter(op => {
+        const key = getOpportunityId(op);
+        if (!key) return false;
+        if (activeKeys.has(key)) return false;
+        return !prevLiveOpsIdsRef.current.has(key);
+    });
+
+    const nowMs = Date.now();
+    const eligibleForAlert = newOps.filter(op => {
+        const key = getOpportunityId(op);
+        if (!key) return false;
+        const lastAt = Number(lastAlertedLiveOpAtRef.current.get(key) || 0);
+        return (nowMs - lastAt) >= LIVE_ALERT_COOLDOWN_MS;
+    });
+
+    if (eligibleForAlert.length > 0) {
+        const hasSnipe = eligibleForAlert.some(op => op.type === 'LIVE_SNIPE' || op.strategy === 'LIVE_SNIPE');
+        console.log(`🔔 ${eligibleForAlert.length} Nueva(s) Oportunidad(es) Detectada(s) - Sonido: ${hasSnipe ? 'SNIPE' : 'DEFAULT'}`);
         playAlert(hasSnipe ? 'SNIPE' : 'DEFAULT');
+        eligibleForAlert.forEach(op => {
+            const key = getOpportunityId(op);
+            if (key) lastAlertedLiveOpAtRef.current.set(key, nowMs);
+        });
+    }
+
+    // Mantener mapa de cooldown acotado (evitar crecimiento indefinido)
+    for (const [key, ts] of lastAlertedLiveOpAtRef.current.entries()) {
+        if ((nowMs - Number(ts || 0)) > (LIVE_ALERT_COOLDOWN_MS * 5)) {
+            lastAlertedLiveOpAtRef.current.delete(key);
+        }
     }
 
     prevLiveOpsIdsRef.current = currentIds;
-  }, [liveOps]);
+    }, [liveOps, portfolio?.activeBets, bookyAccount?.history]);
 
     const realBalanceAmount = Number(bookyAccount?.balance?.amount);
     const realBalanceCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
@@ -1031,6 +1259,7 @@ function App() {
 
   const handlePlaceBet = async (opportunity) => {
     const id = getOpportunityId(opportunity); // ID único por selección (eventId + selection)
+        const optimisticIsSnipe = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE';
     
         // Evitar doble clic (lock inmediato con ref para evitar race de setState)
         if (processingBetsRef.current.has(id)) return;
@@ -1044,6 +1273,10 @@ function App() {
     pendingBetDetailsRef.current[id] = {
         ...opportunity,
         optimisticCreatedAt: Date.now(),
+        optimisticTtlMs: optimisticIsSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS,
+        optimisticIsSnipe,
+        optimisticInFlight: true,
+        optimisticFlow: 'preparing',
         optimisticConfirmedAt: null,
         optimisticMissingRemoteChecks: 0
     };
@@ -1098,6 +1331,10 @@ function App() {
             ...opportunity,
             ...(ticket?.opportunity || {}),
             optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
+            optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (optimisticIsSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
+            optimisticIsSnipe,
+            optimisticInFlight: true,
+            optimisticFlow: 'prepared',
             optimisticConfirmedAt: null,
             optimisticMissingRemoteChecks: 0
         };
@@ -1130,6 +1367,16 @@ function App() {
 
         const isLiveSnipe = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase() === 'LIVE_SNIPE';
         const confirmMode = isLiveSnipe ? 'confirm-fast' : 'confirm';
+
+        if (pendingBetDetailsRef.current[id]) {
+            pendingBetDetailsRef.current[id] = {
+                ...pendingBetDetailsRef.current[id],
+                optimisticInFlight: true,
+                optimisticFlow: 'confirming'
+            };
+            forceUpdate();
+        }
+
         const confirmRes = await axios.post(`/api/booky/real/${confirmMode}/${ticket.id}`, undefined, { timeout: 30000 });
         if (confirmRes.data?.success) {
             const providerBetId =
@@ -1194,6 +1441,10 @@ function App() {
                 confirmedAt: new Date().toISOString(),
                 providerBetId: hasProviderBetId ? providerBetId : (pendingBetDetailsRef.current[id]?.providerBetId || null),
                 optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
+                optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (isLiveSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
+                optimisticIsSnipe: pendingBetDetailsRef.current[id]?.optimisticIsSnipe ?? isLiveSnipe,
+                optimisticInFlight: false,
+                optimisticFlow: 'confirmed',
                 optimisticConfirmedAt: new Date().toISOString(),
                 optimisticMissingRemoteChecks: 0
             };
@@ -1268,6 +1519,15 @@ function App() {
                     forceUpdate();
                 }
     } finally {
+        if (pendingBetDetailsRef.current[id]) {
+            const hasConfirmedMark = Boolean(pendingBetDetailsRef.current[id]?.optimisticConfirmedAt);
+            pendingBetDetailsRef.current[id] = {
+                ...pendingBetDetailsRef.current[id],
+                optimisticInFlight: false,
+                optimisticFlow: hasConfirmedMark ? 'confirmed' : 'idle'
+            };
+        }
+
         setTimeout(() => {
              processingBetsRef.current.delete(id);
              setProcessingBets(prev => {
@@ -1443,6 +1703,20 @@ function App() {
 
   const getOpenBookyRemoteBets = () => {
         const remoteRows = Array.isArray(bookyAccount?.history) ? bookyAccount.history : [];
+        remoteRows.forEach(rememberStickyPinnacleReference);
+
+        const activeByProviderBetId = new Map(
+            (Array.isArray(portfolio?.activeBets) ? portfolio.activeBets : [])
+                .filter(row => row && row.providerBetId)
+                .map(row => [String(row.providerBetId), row])
+        );
+
+        const historyByProviderBetId = new Map(
+            (Array.isArray(portfolio?.history) ? portfolio.history : [])
+                .filter(row => row && row.providerBetId)
+                .map(row => [String(row.providerBetId), row])
+        );
+
         return remoteRows
             .filter(row => isBookyOpenStatus(row?.status))
             .map((row, idx) => {
@@ -1452,19 +1726,60 @@ function App() {
                 const eventDate = row?.selections?.[0]?.eventDate || rawSelection?.eventDate || null;
                 const odd = Number(row?.odd);
                 const stake = Number(row?.stake);
+                const providerBetId = row?.providerBetId || null;
+                const providerKey = providerBetId !== null && providerBetId !== undefined ? String(providerBetId) : null;
+                const linkedActive = providerKey ? (activeByProviderBetId.get(providerKey) || null) : null;
+                const linkedHistory = providerKey ? (historyByProviderBetId.get(providerKey) || null) : null;
+                const linked = linkedActive || linkedHistory || null;
+                const sticky = getStickyPinnacleReference({
+                    ...row,
+                    pick: row?.pick || resolveBookySelectionTypePick(row) || linked?.pick || null,
+                    providerBetId,
+                    eventId: row?.eventId || linked?.eventId || null
+                });
+                const pick = row?.pick || resolveBookySelectionTypePick(row) || linked?.pick || null;
+                const evRaw = Number(row?.ev ?? linked?.ev ?? linked?.realPlacement?.ev ?? linked?.opportunity?.ev);
+                const realProbRaw = Number(row?.realProb ?? linked?.realProb ?? linked?.opportunity?.realProb);
+                const kellyStakeRaw = Number(row?.kellyStake ?? linked?.kellyStake ?? linked?.stake ?? stake);
+                const pinnacleInfo = mergePinnacleInfoCandidates(row?.pinnacleInfo, linked?.pinnacleInfo, sticky?.pinnacleInfo);
+                const rowType = String(row?.type || row?.strategy || row?.opportunityType || linked?.type || '').toUpperCase();
+                const allowPrematchReferenceFallback = rowType.includes('PREMATCH');
+                const derivedPinnacleReference = derivePinnacleReferencePrice({
+                    pinnacleInfo,
+                    pick,
+                    market: row?.market || linked?.market || null,
+                    selection: row?.selection || linked?.selection || null
+                });
+                const pinnaclePriceCandidate = Number(
+                    row?.pinnaclePrice ??
+                    linked?.pinnaclePrice ??
+                    linked?.realPlacement?.requested?.odd ??
+                    sticky?.pinnaclePrice ??
+                    (allowPrematchReferenceFallback ? derivedPinnacleReference : null)
+                );
+                const pinnaclePriceNormalized = sanitizePinnaclePriceForOrigin({
+                    price: pinnaclePriceCandidate,
+                    pinnacleInfo,
+                    isPrematchOrigin: allowPrematchReferenceFallback
+                });
                 return {
-                    id: row?.providerBetId ? `booky_open_${row.providerBetId}` : `booky_open_${idx}`,
-                    providerBetId: row?.providerBetId || null,
+                    id: providerBetId ? `booky_open_${providerBetId}` : `booky_open_${idx}`,
+                    providerBetId,
                     eventId: row?.eventId || null,
                     match: row?.match || '-',
                     league: row?.league || '-',
                     market: row?.market || '-',
                     selection: row?.selection || '-',
+                    pick,
                     type: String(row?.type || row?.strategy || row?.opportunityType || 'BOOKY_REAL').toUpperCase(),
                     odd: Number.isFinite(odd) ? odd : null,
                     price: Number.isFinite(odd) ? odd : null,
                     stake: Number.isFinite(stake) ? stake : null,
-                    kellyStake: Number.isFinite(stake) ? stake : null,
+                    kellyStake: Number.isFinite(kellyStakeRaw) ? kellyStakeRaw : (Number.isFinite(stake) ? stake : null),
+                    ev: Number.isFinite(evRaw) ? evRaw : null,
+                    realProb: Number.isFinite(realProbRaw) ? realProbRaw : null,
+                    pinnacleInfo,
+                    pinnaclePrice: pinnaclePriceNormalized,
                     date: row?.placedAt || eventDate || new Date().toISOString(),
                     matchDate: eventDate || row?.placedAt || null,
                     liveTime: gameTime,
@@ -1482,7 +1797,7 @@ function App() {
     
     if (activeTab === 'LIVE') {
         // 1. Oportunidades detectadas (Scanner)
-        const ops = [...liveOps];
+        const ops = [...liveOps].filter(hasMinBookyStake);
 
         // 2. Apuestas EN JUEGO (Portfolio Active Bets)
         // Queremos mostrar aquí las apuestas que ya hicimos pero cuyo partido se está jugando.
@@ -1575,6 +1890,7 @@ function App() {
 
         const dayPrematch = prematchOps.filter(op => {
                if (isLiveOriginOpportunity(op)) return false;
+                        if (!hasMinBookyStake(op)) return false;
              if (!isSameDay(new Date(op.date), dateFilter)) return false;
 
              // Evitar duplicados por selección exacta (eventId + pick),
@@ -1646,13 +1962,24 @@ function App() {
         .filter(row => isBookyOpenStatus(row?.status));
 
     const remoteOpenBookyByKey = new Map();
+    const remoteOpenBookyByProvider = new Map();
     const remoteOpenBookyIds = new Set();
     for (const row of remoteOpenBookyRows) {
         const key = getBookyOpenBetKey(row);
-        if (!key) continue;
-        remoteOpenBookyIds.add(key);
-        if (!remoteOpenBookyByKey.has(key)) {
-            remoteOpenBookyByKey.set(key, row);
+        const providerBetId = row?.providerBetId;
+        const providerKey = providerBetId !== null && providerBetId !== undefined && String(providerBetId).trim() !== ''
+            ? String(providerBetId).trim()
+            : null;
+
+        if (providerKey && !remoteOpenBookyByProvider.has(providerKey)) {
+            remoteOpenBookyByProvider.set(providerKey, row);
+        }
+
+        if (key) {
+            remoteOpenBookyIds.add(key);
+            if (!remoteOpenBookyByKey.has(key)) {
+                remoteOpenBookyByKey.set(key, row);
+            }
         }
     }
 
@@ -1661,6 +1988,38 @@ function App() {
             .map(getBookyOpenEventId)
             .filter(Boolean)
     );
+
+    const entryOrderByTicketId = new Map();
+    {
+        const groups = new Map();
+        for (const row of filteredOps) {
+            const ticketId = resolveOpTicketId(row);
+            if (!ticketId) continue;
+            const key = getOpportunityId(row);
+            if (!key) continue;
+
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(row);
+        }
+
+        for (const [, list] of groups.entries()) {
+            list.sort((a, b) => {
+                const aTs = new Date(resolveOpBetTimeIso(a, a) || 0).getTime();
+                const bTs = new Date(resolveOpBetTimeIso(b, b) || 0).getTime();
+                return aTs - bTs;
+            });
+
+            list.forEach((row, idx) => {
+                const ticketId = resolveOpTicketId(row);
+                if (!ticketId) return;
+                entryOrderByTicketId.set(String(ticketId), {
+                    index: idx + 1,
+                    total: list.length
+                });
+            });
+        }
+    }
+
     const finishedTabCount = getFinishedDataForSelectedDate().length;
 
     const finishedSubtotal = activeTab === 'FINISHED'
@@ -1924,18 +2283,71 @@ function App() {
                                     // Búsqueda en historial para ver si esta operación fue ejecutada
                                     // Fix: Linkeo robusto por eventId + selection (manejo de fallback)
                                     const opSelection = op.selection || op.action;
-                                    const historyMatch = portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
-                                    const activeMatch = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
+                                    const providerBetIdForLookup = String(resolveOpTicketId(op) || op?.providerBetId || '').trim();
+
+                                    const historyMatchByProvider = providerBetIdForLookup
+                                        ? portfolio.history.find(h => String(resolveOpTicketId(h) || h?.providerBetId || '').trim() === providerBetIdForLookup)
+                                        : null;
+                                    const activeMatchByProvider = providerBetIdForLookup
+                                        ? portfolio.activeBets.find(b => String(resolveOpTicketId(b) || b?.providerBetId || '').trim() === providerBetIdForLookup)
+                                        : null;
+
+                                    const historyMatchBySelection = portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
+                                    const activeMatchBySelection = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
+
+                                    const historyMatch = historyMatchByProvider || historyMatchBySelection;
+                                    const activeMatch = activeMatchByProvider || activeMatchBySelection;
                                     
                                     const opBetKey = getOpportunityId(op);
-                                    const remoteOpenRow = opBetKey ? (remoteOpenBookyByKey.get(opBetKey) || null) : null;
+                                    const remoteOpenRowByProvider = providerBetIdForLookup
+                                        ? (remoteOpenBookyByProvider.get(providerBetIdForLookup) || null)
+                                        : null;
+                                    const remoteOpenRowBySelection = opBetKey ? (remoteOpenBookyByKey.get(opBetKey) || null) : null;
+                                    const remoteOpenRow = remoteOpenRowByProvider || remoteOpenRowBySelection;
                                     const activeInRemoteBooky = Boolean(remoteOpenRow);
                                     const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : ((activeMatch || activeInRemoteBooky || op.isBookyRemoteOpen) ? 'ACTIVE' : 'PENDING'));
                                     const betData = op.isBookyHistory ? op : (historyMatch || activeMatch || remoteOpenRow || op);
+                                    const stickyPinnacleFromBet = getStickyPinnacleReference(betData || {});
+                                    const stickyPinnacleFromOp = getStickyPinnacleReference(op || {});
+                                    const liveCandidate = opBetKey ? (latestLiveCandidatesByKeyRef.current.get(opBetKey) || null) : null;
+                                    const pendingSnapshot = opBetKey ? (pendingBetDetailsRef.current[opBetKey] || null) : null;
+                                    const effectivePinnacleInfo =
+                                        mergePinnacleInfoCandidates(
+                                        betData?.pinnacleInfo,
+                                        op?.pinnacleInfo,
+                                        stickyPinnacleFromBet?.pinnacleInfo,
+                                        stickyPinnacleFromOp?.pinnacleInfo,
+                                        liveCandidate?.pinnacleInfo,
+                                        pendingSnapshot?.pinnacleInfo
+                                        ) || null;
+                                    const effectivePinnaclePriceRaw = Number(
+                                        betData?.pinnaclePrice ??
+                                        op?.pinnaclePrice ??
+                                        stickyPinnacleFromBet?.pinnaclePrice ??
+                                        stickyPinnacleFromOp?.pinnaclePrice ??
+                                        liveCandidate?.pinnaclePrice ??
+                                        pendingSnapshot?.pinnaclePrice
+                                    );
+                                    const allowPrematchReferenceFallback = isPrematchOriginOpportunity(betData || op);
+                                    const derivedPinnacleReference = derivePinnacleReferencePrice({
+                                        pinnacleInfo: effectivePinnacleInfo,
+                                        pick: betData?.pick || op?.pick || null,
+                                        market: betData?.market || op?.market || null,
+                                        selection: betData?.selection || op?.selection || op?.action || null
+                                    });
+                                    const effectivePinnaclePriceCandidate = Number.isFinite(effectivePinnaclePriceRaw)
+                                        ? effectivePinnaclePriceRaw
+                                        : (allowPrematchReferenceFallback ? derivedPinnacleReference : null);
+                                    const effectivePinnaclePrice = sanitizePinnaclePriceForOrigin({
+                                        price: effectivePinnaclePriceCandidate,
+                                        pinnacleInfo: effectivePinnacleInfo,
+                                        isPrematchOrigin: allowPrematchReferenceFallback,
+                                        preserveForPending: executionStatus === 'PENDING'
+                                    });
                                     const visualLiveSignal =
                                         op?.liveTime ||
                                         op?.time ||
-                                        op?.pinnacleInfo?.time ||
+                                        effectivePinnacleInfo?.time ||
                                         betData?.liveTime ||
                                         betData?.time ||
                                         betData?.raw?.selections?.[0]?.gameTime ||
@@ -1951,6 +2363,7 @@ function App() {
                                         (isReallyLiveType || hasTrustedVisualLiveClock);
                                     const eventStartIso = op.isBookyHistory ? (resolveBookyEventStartIso(op) || resolveOpEventStartIso(op)) : resolveOpEventStartIso(op);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
+                                    const entryMeta = ticketIdForRow ? (entryOrderByTicketId.get(String(ticketIdForRow)) || null) : null;
                                     const betTimeIso = resolveOpBetTimeIso(betData, op);
                                     const marketLabel = normalizeMarketLabel(op.market);
                                     const eventStartMs = eventStartIso ? new Date(eventStartIso).getTime() : NaN;
@@ -1991,7 +2404,9 @@ function App() {
                                         betData?.ev ??
                                         op?.ev ??
                                         historyMatch?.ev ??
-                                        activeMatch?.ev
+                                        activeMatch?.ev ??
+                                        liveCandidate?.ev ??
+                                        pendingSnapshot?.ev
                                     );
                                     const hasEv = Number.isFinite(evRaw);
                                     const selectionCanonical = resolveCanonicalSelectionLabel(betData || op);
@@ -2018,6 +2433,19 @@ function App() {
                                             ? (op?.price || op?.odd || 0)
                                             : (betData?.price || betData?.odd || op?.price || op?.odd || 0)
                                     );
+                                    const acceptedOdd = Number(betData?.price || betData?.odd || op?.price || op?.odd || 0);
+                                    const candidateOdd = Number(liveCandidate?.price || liveCandidate?.odd || 0);
+                                    const candidateEv = Number(liveCandidate?.ev);
+                                    const candidateStake = Number(liveCandidate?.kellyStake || 0);
+                                    const oddImprovementPct = (Number.isFinite(candidateOdd) && candidateOdd > 1 && Number.isFinite(acceptedOdd) && acceptedOdd > 1)
+                                        ? ((candidateOdd / acceptedOdd) - 1) * 100
+                                        : 0;
+                                    const reentryBaseChecks = executionStatus === 'ACTIVE' && liveCandidate && isLiveOriginOpportunity(liveCandidate);
+                                    const reentryMeetsPrice = oddImprovementPct >= REENTRY_MIN_ODD_IMPROVEMENT_PCT;
+                                    const reentryMeetsEv = Number.isFinite(candidateEv) && candidateEv >= REENTRY_MIN_EV_PERCENT;
+                                    const reentryMeetsStake = Number.isFinite(candidateStake) && candidateStake >= REENTRY_MIN_STAKE_SOL;
+                                    const reentryAvailable = Boolean(reentryBaseChecks && reentryMeetsPrice && reentryMeetsEv && reentryMeetsStake);
+                                    const reentryBelowMinStake = Boolean(reentryBaseChecks && reentryMeetsPrice && reentryMeetsEv && !reentryMeetsStake);
                                     const previewStake = Number(op?.kellyStake || 0);
                                     const isFastModePreview = String(op?.type || '').toUpperCase() === 'LIVE_SNIPE';
                                     const betButtonTitle = [
@@ -2040,13 +2468,13 @@ function App() {
                                                     <span className="flex items-center gap-1 text-red-500 animate-pulse font-bold bg-red-500/10 px-2 py-0.5 rounded w-fit text-[10px]">
                                                        <Clock className="w-3 h-3" />
                                                        {/* Live Timer - Prioridad a liveTime (actualizado en tiempo real) */}
-                                                       {op.liveTime || op.pinnacleInfo?.time || op.time || (
+                                                       {op.liveTime || effectivePinnacleInfo?.time || op.time || (
                                                             (minutesElapsed > 90 ? `90'+` : `${minutesElapsed}'`)
                                                        )}
                                                     </span>
                                                     {/* SCORE con Prioridad a lastKnownScore (actualizado en tiempo real) */}
                                                     <span className="font-mono font-bold text-white text-xs pl-0.5">
-                                                        {op.lastKnownScore || op.pinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
+                                                        {op.lastKnownScore || effectivePinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
                                                     </span>
                                                     <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
                                                         {formatTimeSafe(eventStartIso || op.matchDate || op.date)}
@@ -2094,21 +2522,31 @@ function App() {
                                         </td>
                                         <td className="p-3">
                                             {/* STRATEGY BADGE */}
-                                            {(isLive || showFinished || executionStatus === 'FINISHED') && (
-                                                <div className="mb-1">
-                                                    {showValueBadge ? (
-                                                        <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                            VALUE BET
+                                            {((isLive || showFinished || executionStatus === 'FINISHED') || (entryMeta && entryMeta.total > 1)) && (
+                                                <div className="mb-1 flex items-center gap-1.5 flex-wrap">
+                                                    {(isLive || showFinished || executionStatus === 'FINISHED') && (
+                                                        <>
+                                                            {showValueBadge ? (
+                                                                <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                                    VALUE BET
+                                                                </span>
+                                                            ) : showSnipeBadge ? (
+                                                                <span className="text-[9px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                                    SNIPE
+                                                                </span>
+                                                            ) : showPrematchBadge ? (
+                                                                <span className="text-[9px] font-bold bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                                    PRE-MATCH
+                                                                </span>
+                                                            ) : null}
+                                                        </>
+                                                    )}
+
+                                                    {entryMeta && entryMeta.total > 1 && (
+                                                        <span className="text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                            ENTRY #{entryMeta.index}/{entryMeta.total}
                                                         </span>
-                                                    ) : showSnipeBadge ? (
-                                                        <span className="text-[9px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                            SNIPE
-                                                        </span>
-                                                    ) : showPrematchBadge ? (
-                                                        <span className="text-[9px] font-bold bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                            PRE-MATCH
-                                                        </span>
-                                                    ) : null}
+                                                    )}
                                                 </div>
                                             )}
                                             <div className="text-slate-200 font-bold text-sm text-wrap max-w-50 md:max-w-none">{op.match}</div>
@@ -2135,29 +2573,37 @@ function App() {
                                             )}
 
                                             {/* PRE-MATCH CONTEXT BADGES */}
-                                            {(op.pinnacleInfo?.prematchContext) && (
+                                            {(effectivePinnacleInfo?.prematchContext) && (
                                                 <div className="flex flex-wrap gap-1 mt-1.5 opacity-90">
                                                     {/* 1x2 Badge */}
-                                                    {(op.pinnacleInfo.prematchContext.home || op.pinnacleInfo.prematchContext.draw || op.pinnacleInfo.prematchContext.away) && (
+                                                    {(effectivePinnacleInfo.prematchContext.home || effectivePinnacleInfo.prematchContext.draw || effectivePinnacleInfo.prematchContext.away) && (
                                                         <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match 1x2 Odds (Pinnacle)">
                                                             <span className="text-blue-400 font-sans font-bold">1x2</span>
-                                                            <span className={op.pinnacleInfo.prematchContext.home < 2.0 ? "text-blue-300 font-bold" : ""}>{op.pinnacleInfo.prematchContext.home?.toFixed(2) || '-'}</span>
+                                                            <span className={effectivePinnacleInfo.prematchContext.home < 2.0 ? "text-blue-300 font-bold" : ""}>{effectivePinnacleInfo.prematchContext.home?.toFixed(2) || '-'}</span>
                                                             <span className="text-slate-600">|</span>
-                                                            <span className={op.pinnacleInfo.prematchContext.draw < 3.0 ? "text-amber-400" : ""}>{op.pinnacleInfo.prematchContext.draw?.toFixed(2) || '-'}</span>
+                                                            <span className={effectivePinnacleInfo.prematchContext.draw < 3.0 ? "text-amber-400" : ""}>{effectivePinnacleInfo.prematchContext.draw?.toFixed(2) || '-'}</span>
                                                             <span className="text-slate-600">|</span>
-                                                            <span className={op.pinnacleInfo.prematchContext.away < 2.0 ? "text-blue-300 font-bold" : ""}>{op.pinnacleInfo.prematchContext.away?.toFixed(2) || '-'}</span>
+                                                            <span className={effectivePinnacleInfo.prematchContext.away < 2.0 ? "text-blue-300 font-bold" : ""}>{effectivePinnacleInfo.prematchContext.away?.toFixed(2) || '-'}</span>
                                                         </div>
                                                     )}
                                                     
                                                     {/* Totals 2.5 Badge */}
-                                                    {(op.pinnacleInfo.prematchContext.over25 || op.pinnacleInfo.prematchContext.under25) && (
+                                                    {(effectivePinnacleInfo.prematchContext.over25 || effectivePinnacleInfo.prematchContext.under25) && (
                                                         <div className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-slate-700/50 border border-slate-600/50 text-[9px] font-mono text-slate-300" title="Pre-Match Over/Under 2.5 (Pinnacle)">
                                                             <span className="text-blue-400 font-sans font-bold">2.5</span>
-                                                            <span className={op.pinnacleInfo.prematchContext.over25 < 1.8 ? "text-blue-300 font-bold" : ""}>O:{op.pinnacleInfo.prematchContext.over25?.toFixed(2) || '-'}</span>
+                                                            <span className={effectivePinnacleInfo.prematchContext.over25 < 1.8 ? "text-blue-300 font-bold" : ""}>O:{effectivePinnacleInfo.prematchContext.over25?.toFixed(2) || '-'}</span>
                                                             <span className="text-slate-600">|</span>
-                                                            <span className={op.pinnacleInfo.prematchContext.under25 < 1.8 ? "text-blue-300 font-bold" : ""}>U:{op.pinnacleInfo.prematchContext.under25?.toFixed(2) || '-'}</span>
+                                                            <span className={effectivePinnacleInfo.prematchContext.under25 < 1.8 ? "text-blue-300 font-bold" : ""}>U:{effectivePinnacleInfo.prematchContext.under25?.toFixed(2) || '-'}</span>
                                                         </div>
                                                     )}
+                                                </div>
+                                            )}
+
+                                            {executionStatus === 'ACTIVE' && (reentryAvailable || reentryBelowMinStake) && (
+                                                <div className="mt-1">
+                                                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border uppercase tracking-wide ${reentryAvailable ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' : 'bg-amber-500/15 text-amber-300 border-amber-500/30'}`}>
+                                                        RE-ENTRY CANDIDATE
+                                                    </span>
                                                 </div>
                                             )}
                                         </td>
@@ -2183,17 +2629,17 @@ function App() {
                                                 <div className="flex flex-col items-center min-h-[2.5em] justify-center relative gap-1">
                                                     
                                                     {/* SOLO MOSTRAR SI HAY CUOTA LIVE DE PINNACLE */}
-                                                    {(op.pinnaclePrice && op.pinnaclePrice > 1) ? (
+                                                    {(effectivePinnaclePrice && effectivePinnaclePrice > 1) ? (
                                                         <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-blue-500/10 border border-blue-500/20 w-fit relative overflow-visible shadow-[0_0_10px_rgba(59,130,246,0.05)]" title="Pinnacle (Cuota en Vivo - Snapshot)">
                                                             <span className="text-[9px] font-bold text-blue-400 tracking-tighter">PIN</span>
-                                                            <span className="font-mono font-bold text-sm text-blue-300 leading-none">{op.pinnaclePrice.toFixed(2)}</span>
+                                                            <span className="font-mono font-bold text-sm text-blue-300 leading-none">{effectivePinnaclePrice.toFixed(2)}</span>
                                                             
                                                             {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) - Modificado para parpadear igual que Altenar */}
-                                                            {op.trend === 'UP' ? (
+                                                            {(executionStatus === 'PENDING' && op.trend === 'UP') ? (
                                                                 <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
                                                                     ▲
                                                                 </span>
-                                                            ) : op.trend === 'DOWN' ? (
+                                                            ) : (executionStatus === 'PENDING' && op.trend === 'DOWN') ? (
                                                                 <span className="absolute -top-1 -right-1 text-red-500 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
                                                                     ▼
                                                                 </span>
@@ -2221,7 +2667,7 @@ function App() {
                                                     </span>
                                                     
                                                     {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) */}
-                                                    {isLive && (
+                                                    {isLive && executionStatus === 'PENDING' && (
                                                         op.trend === 'UP' ? (
                                                             // Flecha Arriba (Verde) - Sin círculo
                                                             <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
@@ -2285,6 +2731,50 @@ function App() {
                                                                 >
                                                                     AJUSTE BOOKY
                                                                 </span>
+                                                            )}
+                                                        </div>
+                                                     )}
+
+                                                     {executionStatus === 'ACTIVE' && (reentryAvailable || reentryBelowMinStake) && (
+                                                        <div className="mt-2 w-full max-w-55 rounded border border-emerald-500/30 bg-emerald-500/10 px-2 py-2 text-left">
+                                                            <div className="text-[9px] uppercase tracking-wide text-emerald-300 font-bold mb-1">Re-Snipe disponible</div>
+                                                            <div className="text-[10px] text-slate-300 flex justify-between">
+                                                                <span>Cuota actual</span>
+                                                                <span className="font-mono text-emerald-300">{Number.isFinite(candidateOdd) && candidateOdd > 1 ? candidateOdd.toFixed(2) : '--'}</span>
+                                                            </div>
+                                                            <div className="text-[10px] text-slate-300 flex justify-between">
+                                                                <span>Mejora</span>
+                                                                <span className="font-mono text-emerald-300">+{oddImprovementPct.toFixed(1)}%</span>
+                                                            </div>
+                                                            <div className="text-[10px] text-slate-300 flex justify-between">
+                                                                <span>EV</span>
+                                                                <span className="font-mono text-emerald-300">{Number.isFinite(candidateEv) ? `${candidateEv >= 0 ? '+' : ''}${candidateEv.toFixed(1)}%` : '--'}</span>
+                                                            </div>
+                                                            <div className="text-[10px] text-slate-300 flex justify-between mb-1.5">
+                                                                <span>Stake sugerido</span>
+                                                                <span className={`font-mono ${reentryMeetsStake ? 'text-emerald-300' : 'text-amber-300'}`}>S/. {Number.isFinite(candidateStake) ? candidateStake.toFixed(2) : '--'}</span>
+                                                            </div>
+                                                            {reentryAvailable ? (
+                                                                <button
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        const reentryOp = {
+                                                                            ...liveCandidate,
+                                                                            isReentry: true,
+                                                                            reentryParentTicketId: ticketIdForRow || betData?.providerBetId || null,
+                                                                            reentryParentBetId: betData?.id || null
+                                                                        };
+                                                                        handlePlaceBet(reentryOp);
+                                                                    }}
+                                                                    className="w-full rounded bg-emerald-600/25 hover:bg-emerald-600/35 border border-emerald-400/40 text-emerald-100 text-[10px] font-bold py-1"
+                                                                    title="Reapostar esta misma selección con cuota mejorada"
+                                                                >
+                                                                    REAPOSTAR (S/. {candidateStake.toFixed(2)})
+                                                                </button>
+                                                            ) : (
+                                                                <div className="text-[9px] text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded px-1.5 py-1">
+                                                                    Bloqueado: Booky no acepta apuestas &lt; S/. {REENTRY_MIN_STAKE_SOL.toFixed(2)}
+                                                                </div>
                                                             )}
                                                         </div>
                                                      )}
