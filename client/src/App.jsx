@@ -1944,16 +1944,17 @@ function App() {
         }));
 
         const openBookyLiveBets = getOpenBookyRemoteBets().filter(bet => {
-            const type = String(bet?.type || '').toUpperCase();
-            const isPrematchOrigin = type.includes('PREMATCH');
-            if (isPrematchOrigin) return false;
-
             const timingOrigin = resolvePlacementTimingOrigin(bet);
-            if (timingOrigin.inferredPrematchByTiming) return false;
-
             const liveSignal = bet.liveTime || bet.time || '';
             const hasTrustedLiveClock = hasLiveClockSignal(liveSignal);
             const isLiveOrigin = isLiveOriginOpportunity(bet);
+
+            // Si la apuesta fue realmente prematch y aún no hay señal de partido en juego,
+            // no debe entrar a LIVE.
+            if (timingOrigin.inferredPrematchByTiming && !hasTrustedLiveClock && !isLiveOrigin) return false;
+
+            // Si ya hay señal live (timing o reloj), mostrarla en LIVE aunque el origen
+            // histórico sea PREMATCH para evitar que "desaparezca" entre pestañas.
             return timingOrigin.inferredLiveByTiming || hasTrustedLiveClock || isLiveOrigin;
         }).filter(bet => {
             const byProvider = String(bet.providerBetId || '');
