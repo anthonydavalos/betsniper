@@ -1,4 +1,4 @@
-import db, { initDB } from '../db/database.js';
+import db, { initDB, writeDBWithRetry } from '../db/database.js';
 import altenarClient from '../config/axiosClient.js';
 import { refreshOpportunity } from './oddsService.js';
 import { placeAutoBet } from './paperTradingService.js';
@@ -19,6 +19,8 @@ const LIVE_MAX_ODD_DRIFT = 0.08;
 const PREMATCH_MAX_ODD_DRIFT = 0.2;
 const PLACE_WIDGET_URL = 'https://sb2betgateway-altenar2.biahosted.com/api/widget/placeWidget';
 const DEFAULT_MIN_TOKEN_MINUTES = 2;
+const prepareTicketInFlight = new Map();
+const ticketMutationInFlight = new Map();
 
 const nowIso = () => new Date().toISOString();
 
@@ -380,6 +382,26 @@ const getTicketById = (ticketId) => {
   const idx = db.data.booky.pendingTickets.findIndex(t => String(t.id) === String(ticketId));
   if (idx < 0) throw new Error('Ticket no encontrado.');
   return { idx, ticket: db.data.booky.pendingTickets[idx] };
+};
+
+const findBookyHistoryTicketById = (ticketId) => {
+  const history = Array.isArray(db.data?.booky?.history) ? db.data.booky.history : [];
+  return history.find((t) => String(t?.id) === String(ticketId)) || null;
+};
+
+const withTicketMutationLock = async (ticketId, action) => {
+  const lockKey = String(ticketId || 'na');
+  const inFlight = ticketMutationInFlight.get(lockKey);
+  if (inFlight) return inFlight;
+
+  const run = Promise.resolve()
+    .then(() => action())
+    .finally(() => {
+      ticketMutationInFlight.delete(lockKey);
+    });
+
+  ticketMutationInFlight.set(lockKey, run);
+  return run;
 };
 
 const createBookyError = (message, { statusCode = 400, code = 'BOOKY_ERROR', diagnostic = null } = {}) => {
@@ -794,30 +816,42 @@ export const prepareSemiAutoTicket = async (opportunity) => {
   const ticketKey = buildTicketKey(refreshed);
   const expiresAt = new Date(Date.now() + getExpiryMs(refreshed)).toISOString();
 
-  const existingIdx = db.data.booky.pendingTickets.findIndex(t => t.ticketKey === ticketKey && t.status === 'DRAFT');
-
-  const ticket = {
-    id: `bk_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-    ticketKey,
-    status: 'DRAFT',
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-    expiresAt,
-    opportunity: cloneForStorage(refreshed),
-    payload: buildPayload(refreshed, 'draft')
-  };
-
-  if (existingIdx >= 0) {
-    const old = db.data.booky.pendingTickets[existingIdx];
-    ticket.id = old.id;
-    ticket.createdAt = old.createdAt;
-    db.data.booky.pendingTickets[existingIdx] = ticket;
-  } else {
-    db.data.booky.pendingTickets.push(ticket);
+  const inFlightPrepare = prepareTicketInFlight.get(ticketKey);
+  if (inFlightPrepare) {
+    return inFlightPrepare;
   }
 
-  await db.write();
-  return ticket;
+  const preparePromise = (async () => {
+    const existingIdx = db.data.booky.pendingTickets.findIndex(t => t.ticketKey === ticketKey && t.status === 'DRAFT');
+
+    const ticket = {
+      id: `bk_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+      ticketKey,
+      status: 'DRAFT',
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      expiresAt,
+      opportunity: cloneForStorage(refreshed),
+      payload: buildPayload(refreshed, 'draft')
+    };
+
+    if (existingIdx >= 0) {
+      const old = db.data.booky.pendingTickets[existingIdx];
+      ticket.id = old.id;
+      ticket.createdAt = old.createdAt;
+      db.data.booky.pendingTickets[existingIdx] = ticket;
+    } else {
+      db.data.booky.pendingTickets.push(ticket);
+    }
+
+    await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
+    return ticket;
+  })().finally(() => {
+    prepareTicketInFlight.delete(ticketKey);
+  });
+
+  prepareTicketInFlight.set(ticketKey, preparePromise);
+  return preparePromise;
 };
 
 export const confirmSemiAutoTicket = async (ticketId) => {
@@ -840,7 +874,7 @@ export const confirmSemiAutoTicket = async (ticketId) => {
     ticket.updatedAt = nowIso();
     db.data.booky.history.push(ticket);
     db.data.booky.pendingTickets.splice(idx, 1);
-    await db.write();
+    await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
     throw new Error('Ticket expirado. Preparar nuevamente.');
   }
 
@@ -864,7 +898,7 @@ export const confirmSemiAutoTicket = async (ticketId) => {
     };
     db.data.booky.history.push(ticket);
     db.data.booky.pendingTickets.splice(idx, 1);
-    await db.write();
+    await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
     throw new Error(`Cuota cambió demasiado (${oldOdd} -> ${newOdd}). Re-quote requerido.`);
   }
 
@@ -883,7 +917,7 @@ export const confirmSemiAutoTicket = async (ticketId) => {
 
   db.data.booky.history.push(ticket);
   db.data.booky.pendingTickets.splice(idx, 1);
-  await db.write();
+  await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
 
   return { ticket, bet: placedBet };
 };
@@ -902,7 +936,7 @@ export const cancelSemiAutoTicket = async (ticketId) => {
 
   db.data.booky.history.push(ticket);
   db.data.booky.pendingTickets.splice(idx, 1);
-  await db.write();
+  await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
 
   return ticket;
 };
@@ -966,7 +1000,7 @@ const archiveUncertainRealPlacement = async ({ idx, ticket, draft, fastMode = fa
 
   db.data.booky.history.push(ticket);
   db.data.booky.pendingTickets.splice(idx, 1);
-  await db.write();
+  await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
 };
 
 const extractAcceptedPlacementMeta = (providerResponse = {}) => {
@@ -1066,6 +1100,7 @@ export const getRealPlacementDryRun = async (ticketId) => {
 };
 
 export const confirmRealPlacement = async (ticketId) => {
+  return withTicketMutationLock(ticketId, async () => {
   const enabled = getRuntimeEnvValue('BOOKY_REAL_PLACEMENT_ENABLED', '').toLowerCase() === 'true';
   if (!enabled) {
     throw new Error('BOOKY_REAL_PLACEMENT_ENABLED=false. Actívalo en .env para enviar apuesta real.');
@@ -1076,7 +1111,24 @@ export const confirmRealPlacement = async (ticketId) => {
   ensureBookyStore();
   ensureTokenFreshOrThrow();
 
-  const { idx, ticket } = getTicketById(ticketId);
+  let lookup;
+  try {
+    lookup = getTicketById(ticketId);
+  } catch (_) {
+    const recovered = findBookyHistoryTicketById(ticketId);
+    if (recovered && (recovered.status === 'REAL_CONFIRMED' || recovered.status === 'REAL_CONFIRMED_FAST')) {
+      return {
+        ticket: recovered,
+        mirroredBet: null,
+        mirrorResolvedFromExisting: true,
+        providerResponse: recovered?.realPlacement?.response || null,
+        idempotentReplay: true
+      };
+    }
+    throw _;
+  }
+
+  const { idx, ticket } = lookup;
   if (ticket.status !== 'DRAFT') throw new Error(`Ticket en estado no válido: ${ticket.status}`);
 
   const draft = await prepareRealPlacementDraftInternal(ticketId);
@@ -1139,7 +1191,7 @@ export const confirmRealPlacement = async (ticketId) => {
 
   db.data.booky.history.push(ticket);
   db.data.booky.pendingTickets.splice(idx, 1);
-  await db.write();
+  await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
 
   return {
     ticket,
@@ -1147,9 +1199,11 @@ export const confirmRealPlacement = async (ticketId) => {
     mirrorResolvedFromExisting: Boolean(mirroredBet),
     providerResponse: data
   };
+  });
 };
 
 export const confirmRealPlacementFast = async (ticketId) => {
+  return withTicketMutationLock(ticketId, async () => {
   const enabled = getRuntimeEnvValue('BOOKY_REAL_PLACEMENT_ENABLED', '').toLowerCase() === 'true';
   if (!enabled) {
     throw new Error('BOOKY_REAL_PLACEMENT_ENABLED=false. Actívalo en .env para enviar apuesta real.');
@@ -1160,7 +1214,24 @@ export const confirmRealPlacementFast = async (ticketId) => {
   ensureBookyStore();
   ensureTokenFreshOrThrow();
 
-  const { idx, ticket } = getTicketById(ticketId);
+  let lookup;
+  try {
+    lookup = getTicketById(ticketId);
+  } catch (_) {
+    const recovered = findBookyHistoryTicketById(ticketId);
+    if (recovered && (recovered.status === 'REAL_CONFIRMED' || recovered.status === 'REAL_CONFIRMED_FAST')) {
+      return {
+        ticket: recovered,
+        mirroredBet: null,
+        mirrorResolvedFromExisting: true,
+        providerResponse: recovered?.realPlacement?.response || null,
+        idempotentReplay: true
+      };
+    }
+    throw _;
+  }
+
+  const { idx, ticket } = lookup;
   if (ticket.status !== 'DRAFT') throw new Error(`Ticket en estado no válido: ${ticket.status}`);
 
   const draft = await prepareRealPlacementDraftInternal(ticketId, { skipTicketDrift: true });
@@ -1223,7 +1294,7 @@ export const confirmRealPlacementFast = async (ticketId) => {
 
   db.data.booky.history.push(ticket);
   db.data.booky.pendingTickets.splice(idx, 1);
-  await db.write();
+  await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
 
   return {
     ticket,
@@ -1231,4 +1302,5 @@ export const confirmRealPlacementFast = async (ticketId) => {
     mirrorResolvedFromExisting: Boolean(mirroredBet),
     providerResponse: data
   };
+  });
 };
