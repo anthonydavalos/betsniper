@@ -590,8 +590,19 @@ function App() {
           const stickyPinnacleByKeyRef = useRef(new Map());
         const lastAlertedLiveOpAtRef = useRef(new Map());
     const fetchInFlightRef = useRef(false);
+    const prematchFetchInFlightRef = useRef(false);
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
+    const lastPrematchFetchAtRef = useRef(0);
+    const latestPortfolioActiveBetsRef = useRef([]);
+    const latestBookyHistoryRef = useRef([]);
+    const blockedBetIdsRef = useRef(new Set());
+    const remoteOpenBetIdsRef = useRef(new Set());
+    const remoteOpenEventIdsRef = useRef(new Set());
+
+    const CORE_POLL_MS = 2000;
+    const PREMATCH_POLL_MS = 30000;
+    const BOOKY_HISTORY_LIMIT = 120;
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
   const localDiscardedIdsRef = useRef(new Set());
@@ -720,339 +731,351 @@ function App() {
         }
     };
 
+    const buildBlockingSets = ({ activeBets = null, remoteHistory = null } = {}) => {
+        const safeActiveBets = Array.isArray(activeBets)
+            ? activeBets
+            : (Array.isArray(latestPortfolioActiveBetsRef.current) ? latestPortfolioActiveBetsRef.current : []);
+
+        const safeRemoteHistory = Array.isArray(remoteHistory)
+            ? remoteHistory
+            : (Array.isArray(latestBookyHistoryRef.current) ? latestBookyHistoryRef.current : []);
+
+        const serverActiveBetIds = new Set(
+            safeActiveBets.map(b => {
+                const eventId = String(b?.eventId || '');
+                return `${eventId}_${normalizePick(b || {})}`;
+            })
+        );
+
+        const openRows = safeRemoteHistory.filter(row => isBookyOpenStatus(row?.status));
+        const remoteOpenBetIds = new Set(
+            openRows
+                .map(getBookyOpenBetKey)
+                .filter(Boolean)
+        );
+        const remoteOpenEventIds = new Set(
+            openRows
+                .map(getBookyOpenEventId)
+                .filter(Boolean)
+        );
+
+        return {
+            blockedBetIds: new Set([...serverActiveBetIds, ...remoteOpenBetIds]),
+            remoteOpenBetIds,
+            remoteOpenEventIds
+        };
+    };
+
   // --- API CALLS ---
 
-    const fetchData = async ({ forceBookyRefresh = false } = {}) => {
-    if (fetchInFlightRef.current) return;
-    fetchInFlightRef.current = true;
-    setLoading(true);
-    try {
-                        const nowMs = Date.now();
-                        const shouldFetchBooky = forceBookyRefresh || (nowMs - lastBookyAccountFetchAtRef.current) >= 15000;
-                        const shouldFetchKellyDiagnostics = forceBookyRefresh || (nowMs - lastKellyDiagnosticsFetchAtRef.current) >= 60000;
-                        const bookyHistoryLimit = 300;
-                        const bookyAccountUrl = forceBookyRefresh
-                            ? `/api/booky/account?refresh=1&historyLimit=${bookyHistoryLimit}`
-                            : `/api/booky/account?historyLimit=${bookyHistoryLimit}`;
+        const fetchData = async ({ forceBookyRefresh = false } = {}) => {
+        if (fetchInFlightRef.current) return;
+        fetchInFlightRef.current = true;
+        setLoading(true);
 
-            const baseRequests = [
+        try {
+            const nowMs = Date.now();
+            const shouldFetchBooky = forceBookyRefresh || (nowMs - lastBookyAccountFetchAtRef.current) >= 15000;
+            const shouldFetchKellyDiagnostics = forceBookyRefresh || (nowMs - lastKellyDiagnosticsFetchAtRef.current) >= 60000;
+            const bookyAccountUrl = forceBookyRefresh
+                ? `/api/booky/account?refresh=1&historyLimit=${BOOKY_HISTORY_LIMIT}`
+                : `/api/booky/account?historyLimit=${BOOKY_HISTORY_LIMIT}`;
+
+            const settled = await Promise.allSettled([
                 axios.get('/api/opportunities/live'),
-                axios.get('/api/opportunities/prematch'),
                 axios.get('/api/portfolio')
-            ];
+            ]);
+            const [liveReq, portfolioReq] = settled;
 
-            const requests = shouldFetchBooky
-                ? [...baseRequests, axios.get(bookyAccountUrl, { timeout: forceBookyRefresh ? 30000 : 12000 })]
-                : baseRequests;
+            if (shouldFetchBooky) {
+                void axios
+                    .get(bookyAccountUrl, { timeout: forceBookyRefresh ? 30000 : 12000 })
+                    .then((bookyRes) => {
+                        if (!bookyRes?.data?.success) return;
+                        setBookyAccount(bookyRes.data);
+                        latestBookyHistoryRef.current = Array.isArray(bookyRes.data?.history) ? bookyRes.data.history : [];
+                        lastBookyAccountFetchAtRef.current = Date.now();
 
-            const settled = await Promise.allSettled(requests);
-            const [liveReq, prematchReq, portfolioReq] = settled;
-            const bookyReq = shouldFetchBooky ? settled[3] : null;
-
-            if (bookyReq?.status === 'fulfilled' && bookyReq.value?.data?.success) {
-                    setBookyAccount(bookyReq.value.data);
-                    lastBookyAccountFetchAtRef.current = Date.now();
+                        const refreshedBlockingSets = buildBlockingSets({
+                            activeBets: latestPortfolioActiveBetsRef.current,
+                            remoteHistory: latestBookyHistoryRef.current
+                        });
+                        blockedBetIdsRef.current = refreshedBlockingSets.blockedBetIds;
+                        remoteOpenBetIdsRef.current = refreshedBlockingSets.remoteOpenBetIds;
+                        remoteOpenEventIdsRef.current = refreshedBlockingSets.remoteOpenEventIds;
+                    })
+                    .catch((error) => {
+                        console.warn('⚠️ Booky account fetch falló. Se mantiene snapshot previo.', error?.message || error);
+                    });
             }
 
-            if (liveReq.status !== 'fulfilled' || prematchReq.status !== 'fulfilled' || portfolioReq.status !== 'fulfilled') {
-                    throw new Error('No se pudieron cargar los datos principales del dashboard.');
+            const blockingSets = buildBlockingSets({
+                activeBets: portfolioReq?.status === 'fulfilled' ? portfolioReq.value?.data?.activeBets : null,
+                remoteHistory: null
+            });
+
+            blockedBetIdsRef.current = blockingSets.blockedBetIds;
+            remoteOpenBetIdsRef.current = blockingSets.remoteOpenBetIds;
+            remoteOpenEventIdsRef.current = blockingSets.remoteOpenEventIds;
+
+            if (liveReq?.status === 'fulfilled' && liveReq.value?.data?.data) {
+                const serverOps = liveReq.value.data.data;
+
+                const latestByKey = new Map();
+                serverOps.forEach(op => {
+                    const key = getOpportunityId(op);
+                    if (key) latestByKey.set(key, op);
+                    rememberStickyPinnacleReference(op);
+                });
+                latestLiveCandidatesByKeyRef.current = latestByKey;
+
+                const cleanOps = serverOps.filter(op => {
+                    const id = getOpportunityId(op);
+                    if (localDiscardedIdsRef.current.has(id)) return false;
+                    if (localPlacedBetIdsRef.current.has(id)) return false;
+                    if (blockingSets.blockedBetIds.has(id)) return false;
+                    if (blockingSets.remoteOpenEventIds.has(String(op?.eventId || '').trim())) return false;
+                    if (!hasMinBookyStake(op)) return false;
+                    return true;
+                });
+
+                const enrichedOps = cleanOps.map(op => {
+                    const currentOdd = parseFloat(op.price || op.odd);
+                    if (!currentOdd) return op;
+
+                    const opKey = `${op.eventId}-${op.selection || op.action}`;
+                    const prevData = prevOddsRef.current[opKey];
+                    let trend = 'SAME';
+
+                    if (prevData) {
+                        if (currentOdd > prevData.odd) trend = 'UP';
+                        else if (currentOdd < prevData.odd) trend = 'DOWN';
+                        else trend = prevData.trend;
+                    }
+
+                    if (!prevData || currentOdd !== prevData.odd) {
+                        prevOddsRef.current[opKey] = { odd: currentOdd, trend, timestamp: Date.now() };
+                    }
+
+                    return { ...op, trend: prevOddsRef.current[opKey].trend };
+                });
+
+                setLiveOps(enrichedOps);
+            } else if (liveReq?.status === 'rejected') {
+                console.warn('⚠️ Live opportunities fetch falló. Se mantiene snapshot previo.', liveReq.reason?.message || liveReq.reason);
             }
 
-            const liveRes = liveReq.value;
-            const prematchRes = prematchReq.value;
-            const portfolioRes = portfolioReq.value;
+            if (portfolioReq?.status === 'fulfilled' && portfolioReq.value?.data) {
+                const portfolioResData = portfolioReq.value.data;
+                const serverActiveBets = Array.isArray(portfolioResData.activeBets) ? portfolioResData.activeBets : [];
+                const serverHistory = Array.isArray(portfolioResData.history) ? portfolioResData.history : [];
 
-            try {
-                    const tokenRes = await axios.get('/api/booky/token-health');
+                latestPortfolioActiveBetsRef.current = serverActiveBets;
+
+                serverActiveBets.forEach(rememberStickyPinnacleReference);
+                serverHistory.forEach(rememberStickyPinnacleReference);
+
+                const serverIds = new Set(
+                    serverActiveBets.map(b => {
+                        const eventId = String(b.eventId);
+                        return `${eventId}_${normalizePick(b)}`;
+                    })
+                );
+
+                const stillPendingLocalIds = [];
+                localPlacedBetIdsRef.current.forEach(id => {
+                    if (serverIds.has(id) || blockingSets.remoteOpenBetIds.has(id)) {
+                        localPlacedBetIdsRef.current.delete(id);
+                        delete pendingBetDetailsRef.current[id];
+                        optimisticWarnedIdsRef.current.delete(id);
+                        return;
+                    }
+
+                    const optimisticMeta = pendingBetDetailsRef.current[id] || {};
+                    const createdAtMs = Number(optimisticMeta?.optimisticCreatedAt || 0);
+                    const ageMs = Number.isFinite(createdAtMs) && createdAtMs > 0
+                        ? (Date.now() - createdAtMs)
+                        : Number.POSITIVE_INFINITY;
+
+                    const optimisticTtlMs = resolveOptimisticTtlMs(optimisticMeta);
+                    const isInFlight = Boolean(optimisticMeta?.optimisticInFlight);
+                    const hasFreshRemoteCheck = (Date.now() - Number(lastBookyAccountFetchAtRef.current || 0)) <= 25000;
+
+                    const confirmedAtMs = new Date(optimisticMeta?.optimisticConfirmedAt || 0).getTime();
+                    const hasConfirmedMark = Number.isFinite(confirmedAtMs) && confirmedAtMs > 0;
+                    const shouldExpireByTtl = ageMs >= optimisticTtlMs;
+
+                    if (isInFlight) {
+                        stillPendingLocalIds.push(id);
+                        return;
+                    }
+
+                    if (hasConfirmedMark) {
+                        if (!hasFreshRemoteCheck) {
+                            stillPendingLocalIds.push(id);
+                            return;
+                        }
+
+                        const currentMisses = Number(optimisticMeta?.optimisticMissingRemoteChecks || 0);
+                        const nextMisses = Number.isFinite(currentMisses) ? (currentMisses + 1) : 1;
+                        pendingBetDetailsRef.current[id] = {
+                            ...optimisticMeta,
+                            optimisticMissingRemoteChecks: nextMisses
+                        };
+
+                        if (nextMisses < 3) {
+                            stillPendingLocalIds.push(id);
+                            return;
+                        }
+
+                        localPlacedBetIdsRef.current.delete(id);
+                        delete pendingBetDetailsRef.current[id];
+
+                        if (!optimisticWarnedIdsRef.current.has(id)) {
+                            optimisticWarnedIdsRef.current.add(id);
+                            const reasonText = 'Booky no reportó la apuesta tras múltiples chequeos de sincronización.';
+                            alert(
+                                `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
+                                'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
+                                'Verifica Open Bets en Booky antes de reintentar.'
+                            );
+                        }
+                        return;
+                    }
+
+                    if (shouldExpireByTtl) {
+                        if (!hasFreshRemoteCheck) {
+                            stillPendingLocalIds.push(id);
+                            return;
+                        }
+
+                        localPlacedBetIdsRef.current.delete(id);
+                        delete pendingBetDetailsRef.current[id];
+
+                        if (!optimisticWarnedIdsRef.current.has(id)) {
+                            optimisticWarnedIdsRef.current.add(id);
+                            const reasonText = 'no apareció en Booky dentro de la ventana de gracia extendida.';
+                            alert(
+                                `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
+                                'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
+                                'Verifica Open Bets en Booky antes de reintentar.'
+                            );
+                        }
+                        return;
+                    }
+
+                    stillPendingLocalIds.push(id);
+                });
+
+                setPortfolio({
+                    ...portfolioResData,
+                    activeBets: [
+                        ...serverActiveBets,
+                        ...stillPendingLocalIds.map(id => {
+                            const originalOp = pendingBetDetailsRef.current[id];
+                            return {
+                                eventId: id,
+                                match: originalOp ? originalOp.match : 'Procesando...',
+                                league: originalOp ? originalOp.league : '...',
+                                selection: originalOp?.selection || originalOp?.action || '...',
+                                market: originalOp?.market || '...',
+                                type: originalOp?.type || 'LIVE_SNIPE',
+                                odd: originalOp?.odd || originalOp?.price || 0,
+                                price: originalOp?.price || originalOp?.odd || 0,
+                                stake: originalOp?.kellyStake || 0,
+                                kellyStake: originalOp?.kellyStake || 0,
+                                ev: originalOp?.ev || 0,
+                                realProb: originalOp?.realProb || 0,
+                                potentialReturn: (originalOp?.kellyStake || 0) * (originalOp?.odd || originalOp?.price || 1),
+                                isOptimistic: true,
+                                liveTime: originalOp?.time || originalOp?.liveTime || 'Live',
+                                score: originalOp?.score,
+                                pinnacleInfo: originalOp?.pinnacleInfo,
+                                pinnaclePrice: originalOp?.pinnaclePrice,
+                                createdAt: new Date().toISOString()
+                            };
+                        })
+                    ]
+                });
+            } else if (portfolioReq?.status === 'rejected') {
+                console.warn('⚠️ Portfolio fetch falló. Se mantiene snapshot previo.', portfolioReq.reason?.message || portfolioReq.reason);
+            }
+
+            void axios
+                .get('/api/booky/token-health')
+                .then((tokenRes) => {
                     if (tokenRes?.data?.success) setTokenHealth(tokenRes.data.token);
-            } catch (_) {
+                })
+                .catch(() => {
                     setTokenHealth(null);
-            }
+                });
 
             if (shouldFetchKellyDiagnostics) {
-                try {
-                    const kellyRes = await axios.get('/api/booky/kelly-diagnostics?horizonBets=200&simulations=400&ruinThreshold=0.5', {
+                void axios
+                    .get('/api/booky/kelly-diagnostics?horizonBets=200&simulations=400&ruinThreshold=0.5', {
                         timeout: forceBookyRefresh ? 12000 : 8000
+                    })
+                    .then((kellyRes) => {
+                        if (kellyRes?.data?.success) {
+                            setKellyDiagnostics(kellyRes.data);
+                            lastKellyDiagnosticsFetchAtRef.current = Date.now();
+                        }
+                    })
+                    .catch(() => {
+                        // Mantener último snapshot válido en UI para evitar parpadeos
                     });
-                    if (kellyRes?.data?.success) {
-                        setKellyDiagnostics(kellyRes.data);
-                        lastKellyDiagnosticsFetchAtRef.current = Date.now();
-                    }
-                } catch (_) {
-                    // Mantener último snapshot válido en UI para evitar parpadeos
-                }
             }
 
-      // 1. First capture server active bets to use in filtering
-      // Crear Set de IDs con formato único (eventId_selection) para filtrado granular
-      let serverActiveBetIds = new Set();
-      if (portfolioRes.data?.activeBets) {
-          serverActiveBetIds = new Set(
-              portfolioRes.data.activeBets.map(b => {
-                  const eventId = String(b.eventId);
-                  return `${eventId}_${normalizePick(b)}`;
-              })
-          );
-      }
-
-      // [NEW] También bloquear oportunidades que ya están abiertas en Booky remoto
-      // para evitar que el botón "Apostar" aparezca en selecciones ya colocadas.
-      let remoteOpenBetIds = new Set();
-      let remoteOpenEventIds = new Set();
-      {
-          const remoteRows = Array.isArray(
-              bookyReq?.status === 'fulfilled' && bookyReq.value?.data?.success
-                  ? bookyReq.value.data?.history
-                  : bookyAccount?.history
-          )
-              ? (bookyReq?.status === 'fulfilled' && bookyReq.value?.data?.success
-                  ? bookyReq.value.data.history
-                  : bookyAccount?.history)
-              : [];
-          const openRows = remoteRows.filter(row => isBookyOpenStatus(row?.status));
-          remoteOpenBetIds = new Set(
-              openRows
-                  .map(getBookyOpenBetKey)
-                  .filter(Boolean)
-          );
-          remoteOpenEventIds = new Set(
-              openRows
-                  .map(getBookyOpenEventId)
-                  .filter(Boolean)
-          );
-    }
-
-      const blockedBetIds = new Set([...serverActiveBetIds, ...remoteOpenBetIds]);
-
-      if (liveRes.data?.data) {
-          // [FIX] Filtrar con blacklist local para evitar parpadeo
-          // Si el servidor aun trae un evento que acabamos de descartar o apostar, lo ocultamos
-          const serverOps = liveRes.data.data;
-
-          // Mantener snapshot completo por selección para detectar re-snipe en filas ya apostadas.
-          const latestByKey = new Map();
-          serverOps.forEach(op => {
-              const key = getOpportunityId(op);
-              if (key) latestByKey.set(key, op);
-              rememberStickyPinnacleReference(op);
-          });
-          latestLiveCandidatesByKeyRef.current = latestByKey;
-
-          const cleanOps = serverOps.filter(op => {
-              const id = getOpportunityId(op); // ID único por selección
-              
-              // A. Si está descartado localmente
-              if (localDiscardedIdsRef.current.has(id)) return false;
-              
-              // B. Si está apostado localmente (optimistic)
-              if (localPlacedBetIdsRef.current.has(id)) return false;
-              
-              // C. Si YA está en el portfolio del servidor (real)
-              // Comparar ID completo (eventId + selection) para filtrado granular
-              if (blockedBetIds.has(id)) return false;
-              if (remoteOpenEventIds.has(String(op?.eventId || '').trim())) return false;
-
-              // Regla Booky: no mostrar oportunidades con stake sugerido < S/. 1
-              if (!hasMinBookyStake(op)) return false;
-
-              return true;
-          });
-
-          // [NEW] Calcular Tendencias de Cuotas (Flechas Arriba/Abajo)
-          const enrichedOps = cleanOps.map(op => {
-              const currentOdd = parseFloat(op.price || op.odd);
-              if (!currentOdd) return op;
-
-              const opKey = `${op.eventId}-${op.selection || op.action}`;
-              const prevData = prevOddsRef.current[opKey];
-              
-              let trend = 'SAME'; // Valores: 'UP', 'DOWN', 'SAME'
-              
-              if (prevData) {
-                  if (currentOdd > prevData.odd) trend = 'UP';
-                  else if (currentOdd < prevData.odd) trend = 'DOWN';
-                  else trend = prevData.trend; // Mantener estado anterior visualmente si no cambia
-              }
-
-              // Actualizar cache solo si cambió el valor o es nuevo
-              if (!prevData || currentOdd !== prevData.odd) {
-                  prevOddsRef.current[opKey] = { odd: currentOdd, trend, timestamp: Date.now() };
-              }
-
-              return { ...op, trend: prevOddsRef.current[opKey].trend };
-          });
-
-          setLiveOps(enrichedOps);
-      }
-      
-      if (prematchRes.data?.data) {
-           const serverOps = prematchRes.data.data;
-           const cleanOps = serverOps.filter(op => {
-              if (isLiveOriginOpportunity(op)) return false;
-
-                  // Regla Booky: no mostrar oportunidades con stake sugerido < S/. 1
-                  if (!hasMinBookyStake(op)) return false;
-
-              const id = getOpportunityId(op); // ID único por selección
-              
-              if (localDiscardedIdsRef.current.has(id)) return false;
-              if (localPlacedBetIdsRef.current.has(id)) return false;
-                    if (blockedBetIds.has(id)) return false; // Comparar ID completo
-              return true;
-           });
-           setPrematchOps(cleanOps);
-      }
-
-      if (portfolioRes.data) {
-          (portfolioRes.data.activeBets || []).forEach(rememberStickyPinnacleReference);
-          (portfolioRes.data.history || []).forEach(rememberStickyPinnacleReference);
-
-          // [MOD] Optimistic merge: Si tenemos apuestas locales pendientes que aun no estan en el server, las mantenemos
-          const serverActiveBets = portfolioRes.data.activeBets || [];
-          
-          // Crear Set de IDs con formato único (eventId_selection) para matching correcto
-          const serverIds = new Set(
-              serverActiveBets.map(b => {
-                  const eventId = String(b.eventId);
-                  return `${eventId}_${normalizePick(b)}`;
-              })
-          );
-          
-          // Mantener locales solo si NO han llegado del server aun
-          const stillPendingLocalIds = [];
-          localPlacedBetIdsRef.current.forEach(id => {
-              if (serverIds.has(id) || remoteOpenBetIds.has(id)) {
-                  localPlacedBetIdsRef.current.delete(id); // Ya está en servidor/remoto
-                  delete pendingBetDetailsRef.current[id];
-                  optimisticWarnedIdsRef.current.delete(id);
-                  return;
-              }
-
-              const optimisticMeta = pendingBetDetailsRef.current[id] || {};
-              const createdAtMs = Number(optimisticMeta?.optimisticCreatedAt || 0);
-              const ageMs = Number.isFinite(createdAtMs) && createdAtMs > 0
-                  ? (Date.now() - createdAtMs)
-                  : Number.POSITIVE_INFINITY;
-
-              const optimisticTtlMs = resolveOptimisticTtlMs(optimisticMeta);
-              const isInFlight = Boolean(optimisticMeta?.optimisticInFlight);
-              const hasFreshRemoteCheck = Boolean(
-                  shouldFetchBooky &&
-                  bookyReq?.status === 'fulfilled' &&
-                  bookyReq?.value?.data?.success
-              );
-
-              const confirmedAtMs = new Date(optimisticMeta?.optimisticConfirmedAt || 0).getTime();
-              const hasConfirmedMark = Number.isFinite(confirmedAtMs) && confirmedAtMs > 0;
-              const shouldExpireByTtl = ageMs >= optimisticTtlMs;
-
-              // Si la confirmación real sigue en vuelo, no expirar por TTL.
-              if (isInFlight) {
-                  stillPendingLocalIds.push(id);
-                  return;
-              }
-
-              if (hasConfirmedMark) {
-                  if (!hasFreshRemoteCheck) {
-                      stillPendingLocalIds.push(id);
-                      return;
-                  }
-
-                  const currentMisses = Number(optimisticMeta?.optimisticMissingRemoteChecks || 0);
-                  const nextMisses = Number.isFinite(currentMisses) ? (currentMisses + 1) : 1;
-                  pendingBetDetailsRef.current[id] = {
-                      ...optimisticMeta,
-                      optimisticMissingRemoteChecks: nextMisses
-                  };
-
-                  // Recién tras 3 chequeos remotos fallidos consecutivos asumimos no colocada.
-                  if (nextMisses < 3) {
-                      stillPendingLocalIds.push(id);
-                      return;
-                  }
-
-                  localPlacedBetIdsRef.current.delete(id);
-                  delete pendingBetDetailsRef.current[id];
-
-                  if (!optimisticWarnedIdsRef.current.has(id)) {
-                      optimisticWarnedIdsRef.current.add(id);
-                      const reasonText = 'Booky no reportó la apuesta tras múltiples chequeos de sincronización.';
-                      alert(
-                          `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
-                          'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
-                          'Verifica Open Bets en Booky antes de reintentar.'
-                      );
-                  }
-                  return;
-              }
-
-              if (shouldExpireByTtl) {
-                  // Evitar falso negativo: solo expirar cuando hubo chequeo remoto fresco.
-                  if (!hasFreshRemoteCheck) {
-                      stillPendingLocalIds.push(id);
-                      return;
-                  }
-
-                  localPlacedBetIdsRef.current.delete(id);
-                  delete pendingBetDetailsRef.current[id];
-
-                  if (!optimisticWarnedIdsRef.current.has(id)) {
-                      optimisticWarnedIdsRef.current.add(id);
-                      const reasonText = 'no apareció en Booky dentro de la ventana de gracia extendida.';
-                      alert(
-                          `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
-                          'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
-                          'Verifica Open Bets en Booky antes de reintentar.'
-                      );
-                  }
-                  return;
-              }
-
-              stillPendingLocalIds.push(id);
-          });
-          
-          setPortfolio(prevPortfolio => ({
-              ...portfolioRes.data,
-              // Fucionar las apuestas reales con las "fantasma" locales para que sigan apareciendo en la UI como "Apostadas"
-              activeBets: [
-                  ...serverActiveBets,
-                  // Reconstruir objetos "Fake/Optimistic" para la UI
-                  ...stillPendingLocalIds.map(id => {
-                        // Intentar recuperar la data original del evento si es posible
-                        const originalOp = pendingBetDetailsRef.current[id];
-                        return {
-                            eventId: id,
-                            match: originalOp ? originalOp.match : "Procesando...",
-                            league: originalOp ? originalOp.league : "...",
-                            selection: originalOp?.selection || originalOp?.action || "...",
-                            market: originalOp?.market || "...",
-                            type: originalOp?.type || "LIVE_SNIPE",
-                            odd: originalOp?.odd || originalOp?.price || 0,
-                            price: originalOp?.price || originalOp?.odd || 0,
-                            stake: originalOp?.kellyStake || 0,
-                            kellyStake: originalOp?.kellyStake || 0,
-                            ev: originalOp?.ev || 0,
-                            realProb: originalOp?.realProb || 0,
-                            potentialReturn: (originalOp?.kellyStake || 0) * (originalOp?.odd || originalOp?.price || 1),
-                            isOptimistic: true, // Flag para UI
-                            liveTime: originalOp?.time || originalOp?.liveTime || "Live",
-                            score: originalOp?.score,
-                            pinnacleInfo: originalOp?.pinnacleInfo,
-                            pinnaclePrice: originalOp?.pinnaclePrice,
-                            createdAt: new Date().toISOString()
-                        };
-                  })
-              ]
-          }));
-      }
-
-    } catch (err) {
-      console.error("Error fetching data", err);
-    } finally {
+            if (forceBookyRefresh) {
+                fetchPrematchData();
+            }
+        } catch (err) {
+            console.error('Error fetching core data', err);
+        } finally {
             fetchInFlightRef.current = false;
-      setLoading(false);
-    }
-  };
+            setLoading(false);
+        }
+    };
+
+    const fetchPrematchData = async ({ force = false } = {}) => {
+        if (prematchFetchInFlightRef.current) return;
+
+        const nowMs = Date.now();
+        if (!force && (nowMs - lastPrematchFetchAtRef.current) < PREMATCH_POLL_MS - 300) return;
+
+        prematchFetchInFlightRef.current = true;
+        try {
+            const prematchUrl = force
+                ? '/api/opportunities/prematch?refresh=1'
+                : '/api/opportunities/prematch';
+            const prematchRes = await axios.get(prematchUrl, { timeout: 20000 });
+
+            if (prematchRes?.data?.data) {
+                const blockedBetIds = blockedBetIdsRef.current instanceof Set
+                    ? blockedBetIdsRef.current
+                    : new Set();
+
+                const cleanOps = prematchRes.data.data.filter(op => {
+                    if (isLiveOriginOpportunity(op)) return false;
+                    if (!hasMinBookyStake(op)) return false;
+
+                    const id = getOpportunityId(op);
+                    if (localDiscardedIdsRef.current.has(id)) return false;
+                    if (localPlacedBetIdsRef.current.has(id)) return false;
+                    if (blockedBetIds.has(id)) return false;
+                    return true;
+                });
+
+                setPrematchOps(cleanOps);
+            }
+
+            lastPrematchFetchAtRef.current = Date.now();
+        } catch (err) {
+            console.warn('⚠️ Prematch fetch falló. Se mantiene snapshot previo.', err?.message || err);
+        } finally {
+            prematchFetchInFlightRef.current = false;
+        }
+    };
 
   const resetPortfolio = async () => {
     if (!window.confirm("¿Seguro de reiniciar la simulación?")) return;
@@ -1065,9 +1088,29 @@ function App() {
   };
 
   useEffect(() => {
-    fetchData(); // Initial load
-    const interval = setInterval(fetchData, 2000); // UI Polling rapido (2s) para recibir data del backend
-    return () => clearInterval(interval);
+    let isUnmounted = false;
+
+    const bootstrap = async () => {
+        await fetchData();
+        if (isUnmounted) return;
+        fetchPrematchData();
+    };
+
+    bootstrap();
+
+    const coreInterval = setInterval(() => {
+        fetchData();
+    }, CORE_POLL_MS);
+
+    const prematchInterval = setInterval(() => {
+        fetchPrematchData();
+    }, PREMATCH_POLL_MS);
+
+    return () => {
+        isUnmounted = true;
+        clearInterval(coreInterval);
+        clearInterval(prematchInterval);
+    };
   }, []);
 
     useEffect(() => {

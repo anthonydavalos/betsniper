@@ -83,3 +83,15 @@ Cuando se trabaja en el flujo de apuesta real (`src/services/bookySemiAutoServic
 4.  **ESTADO INCIERTO:** Si el request a `placeWidget` devuelve timeout/error de red SIN confirmación, llamar a `archiveUncertainRealPlacement()`. **NUNCA reintentar ciegamente.** Primero verificar via `GET /api/booky/account?refresh=1` si la apuesta ya existe.
 5.  **PERFIL ANTES DE TOKEN:** El perfil (`BOOK_PROFILE`, `ALTENAR_INTEGRATION`, `ALTENAR_ORIGIN`) debe estar correcto ANTES de extraer el JWT. Usa `npm run book:dorado` o `npm run book:acity` primero, luego `npm run token:booky:wait-close`.
 6.  **BASE KELLEY:** El stake real se calcula sobre `getKellyBankrollBase()` que tiene 3 niveles de fallback: balance real `booky-real` → `portfolio` → `config.bankroll`. Nunca hardcodear el NAV.
+
+## 8. OPERACIÓN EN ALTA CARGA (SÁBADOS)
+
+Cuando haya freeze intermitente o timeouts en `portfolio/live/prematch`:
+
+1.  **NO** desactivar todo por defecto. Prioriza flags granulares en `.env`:
+  - `DISABLE_LIVE_SCANNER=false`
+  - `DISABLE_PREMATCH_SCHEDULER=true`
+  - `DISABLE_PINNACLE_INGEST_CRON=true`
+2.  Mantén `DISABLE_BACKGROUND_WORKERS=false` salvo emergencia total.
+3.  Valida impacto con `npm run health:latency` antes/después del cambio.
+4.  Si se toca polling del frontend, separar ciclos core y prematch, y permitir degradación parcial sin bloquear el dashboard completo.

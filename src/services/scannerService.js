@@ -3,7 +3,6 @@ import db, { initDB } from '../db/database.js';
 // [MOD] Importamos AMBAS estrategias
 import { scanLiveOpportunities as performValueScan, getLiveOverview } from './liveValueScanner.js';
 import { scanLiveOpportunities as performTurnaroundScan } from './liveScannerService.js'; 
-import { scanPrematchOpportunities } from './prematchScannerService.js';
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 
 // =====================================================================
@@ -157,29 +156,20 @@ export const startBackgroundScanner = () => {
             pruneQuoteStabilityCache();
             
             // ---------------------------------------------------------
-            // 1. ESCANEAR PRE-MATCH (Al inicio y cada 4 ciclos ~2 min)
-            // (PRIORIDAD ALTA: Para poblar Cache de "Ignorados en Live")
+            // 1. REFRESCO LIVIANO PRE-MATCH (sin scan pesado)
             // ---------------------------------------------------------
-            if (ticks === 1 || ticks % 4 === 0) {
-                 // console.log("   🔎 Ejecutando escaneo Pre-Match...");
-                 const prematchOps = await scanPrematchOpportunities();
-                 
-                 // Actulizar Cache de IDs ignorados
-                 if (prematchOps) {
-                     prematchOps.forEach(op => {
-                         if (op.eventId) cachedPrematchIds.add(String(op.eventId));
-                         if (op.altenarId) cachedPrematchIds.add(String(op.altenarId));
-                     });
+            // En picos de sábados, scanPrematchOpportunities() puede bloquear el event loop.
+            // Aquí solo refrescamos IDs desde DB para evitar duplicados Live vs Prematch.
+            if (ticks === 1 || ticks % 30 === 0) {
+                 const nextPrematchIds = new Set();
+                 const dbUpcoming = Array.isArray(db.data?.upcomingMatches) ? db.data.upcomingMatches : [];
+                 for (const row of dbUpcoming) {
+                     if (row?.id != null) nextPrematchIds.add(String(row.id));
+                     if (row?.altenarId != null) nextPrematchIds.add(String(row.altenarId));
                  }
-
-                 if (prematchOps && prematchOps.length > 0) {
-                    console.log(`   🔎 Detectadas ${prematchOps.length} Oportunidades Pre-Match (Disponibles en UI).`);
-                    // [MOD] Auto-Bet DESHABILITADO para Pre-Match. El usuario debe decidir.
-                    /* 
-                    for (const op of prematchOps) {
-                        await placeAutoBet(op);
-                    }
-                    */
+                 cachedPrematchIds = nextPrematchIds;
+                 if (ticks % 60 === 0) {
+                     console.log(`   🧠 Prematch IDs cache refrescado: ${cachedPrematchIds.size}`);
                  }
             }
 
