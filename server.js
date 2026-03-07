@@ -29,6 +29,7 @@ const backgroundWorkersEnabled = process.env.DISABLE_BACKGROUND_WORKERS !== 'tru
 const liveScannerEnabled = process.env.DISABLE_LIVE_SCANNER !== 'true';
 const prematchSchedulerEnabled = process.env.DISABLE_PREMATCH_SCHEDULER !== 'true';
 const pinnacleIngestCronEnabled = process.env.DISABLE_PINNACLE_INGEST_CRON !== 'true';
+const monitorDashboardEnabled = process.env.DISABLE_MONITOR_DASHBOARD !== 'true';
 
 if (backgroundWorkersEnabled) {
   if (liveScannerEnabled) {
@@ -102,7 +103,18 @@ import bookyRouter from './src/routes/booky.js';
 app.use('/api/opportunities', opportunitiesRouter);
 app.use('/api/portfolio', portfolioRouter);
 app.use('/api/matcher', matcherRouter);
-app.use('/api/monitor', monitorRouter);
+if (monitorDashboardEnabled) {
+  app.use('/api/monitor', monitorRouter);
+} else {
+  console.log('⏸️ Monitor dashboard desactivado (DISABLE_MONITOR_DASHBOARD=true).');
+  app.use('/api/monitor', (_req, res) => {
+    res.status(503).json({
+      success: false,
+      code: 'MONITOR_DISABLED',
+      message: 'Monitor desactivado por configuración (DISABLE_MONITOR_DASHBOARD=true).'
+    });
+  });
+}
 app.use('/api/booky', bookyRouter);
 
 // Rutas Básicas (API Health Check)
