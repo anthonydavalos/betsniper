@@ -521,6 +521,7 @@ DISABLE_BACKGROUND_WORKERS=false
 DISABLE_LIVE_SCANNER=false
 DISABLE_PREMATCH_SCHEDULER=false
 DISABLE_PINNACLE_INGEST_CRON=false
+DISABLE_MONITOR_DASHBOARD=false
 ```
 > Pon `true` solo para depurar el servidor Express sin que los scanners consuman CPU.
 
@@ -1259,6 +1260,7 @@ DISABLE_BACKGROUND_WORKERS=false
 DISABLE_LIVE_SCANNER=false
 DISABLE_PREMATCH_SCHEDULER=true
 DISABLE_PINNACLE_INGEST_CRON=true
+DISABLE_MONITOR_DASHBOARD=true
 ```
 
 Luego, reinicia backend. En días normales vuelve ambos flags a `false`.
@@ -1646,7 +1648,7 @@ npm run health:latency
 ```
 
 **Si aparecen timeouts intermitentes:**
-1. Activa modo de alta carga (`DISABLE_PREMATCH_SCHEDULER=true`, `DISABLE_PINNACLE_INGEST_CRON=true`).
+1. Activa modo de alta carga (`DISABLE_PREMATCH_SCHEDULER=true`, `DISABLE_PINNACLE_INGEST_CRON=true`; opcional `DISABLE_MONITOR_DASHBOARD=true` si el monitor está abierto).
 2. Reinicia backend.
 3. Repite `npm run health:latency` y confirma que `portfolio/live` quedan estables.
 

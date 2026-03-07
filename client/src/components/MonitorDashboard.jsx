@@ -7,9 +7,11 @@ export default function MonitorDashboard() {
     const [loading, setLoading] = useState(false);
     const [lastUpdate, setLastUpdate] = useState(null);
     const [error, setError] = useState(null);
+    const [monitorDisabled, setMonitorDisabled] = useState(false);
     const prevOddsRef = useRef({}); // Store previous odds for trend calculation
 
     const fetchData = async () => {
+        if (monitorDisabled) return;
         setLoading(true);
         try {
             const res = await axios.get('/api/monitor/live-odds');
@@ -78,7 +80,13 @@ export default function MonitorDashboard() {
             }
         } catch (err) {
             console.error(err);
-            setError("Error conectando con el servidor Monitor.");
+            const code = err?.response?.data?.code;
+            if (code === 'MONITOR_DISABLED') {
+                setMonitorDisabled(true);
+                setError('Monitor desactivado por configuración (DISABLE_MONITOR_DASHBOARD=true).');
+            } else {
+                setError("Error conectando con el servidor Monitor.");
+            }
         } finally {
             setLoading(false);
         }
@@ -86,9 +94,10 @@ export default function MonitorDashboard() {
 
     useEffect(() => {
         fetchData();
+        if (monitorDisabled) return undefined;
         const interval = setInterval(fetchData, 5000); // Poll every 5s (Standard Live)
         return () => clearInterval(interval);
-    }, []);
+    }, [monitorDisabled]);
 
     // Helper to format price
     const fmt = (p) => p ? p.toFixed(2) : '-';
