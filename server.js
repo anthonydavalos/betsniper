@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { initDB } from './src/db/database.js';
+import { initDB, pruneStaleEventCaches } from './src/db/database.js';
 
 // Cargar variables de entorno
 dotenv.config();
@@ -68,6 +68,29 @@ if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
 if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
   setInterval(runPinnacleIngest, 2 * 60 * 60 * 1000);
 }
+
+// --- TAREA PROGRAMADA: PODA DE CACHES (anti-saturación db.json) ---
+const runCachePrune = async () => {
+  try {
+    const result = await pruneStaleEventCaches({
+      upcomingGraceMinutes: Number(process.env.DB_UPCOMING_RETENTION_MINUTES || 180),
+      altenarGraceMinutes: Number(process.env.DB_ALTENAR_RETENTION_MINUTES || 180),
+      persist: true
+    });
+
+    if (result.changed) {
+      console.log(
+        `🧹 Cache prune: upcoming -${result.removedUpcoming}, altenar -${result.removedAltenar}. ` +
+        `Restante: upcoming=${result.remainingUpcoming}, altenar=${result.remainingAltenar}`
+      );
+    }
+  } catch (err) {
+    console.error(`❌ Error en cache prune: ${err.message}`);
+  }
+};
+
+setTimeout(runCachePrune, 7000);
+setInterval(runCachePrune, 15 * 60 * 1000);
 
 // Rutas de API
 import opportunitiesRouter from './src/routes/opportunities.js';

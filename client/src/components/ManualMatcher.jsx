@@ -128,7 +128,7 @@ const ManualMatcher = () => {
                 altenarName: selectedAlt.name
             };
 
-            const doLink = () => axios.post('http://localhost:3000/api/matcher/link', payload, { timeout: 15000 });
+            const doLink = () => axios.post('http://localhost:3000/api/matcher/link', payload, { timeout: 45000 });
 
             try {
                 await doLink();
@@ -139,7 +139,7 @@ const ManualMatcher = () => {
                 const isRace409 = status === 409;
                 if (!isTimeout && !isRace409) throw linkError;
 
-                await new Promise(resolve => setTimeout(resolve, 700));
+                await new Promise(resolve => setTimeout(resolve, 900));
                 await doLink();
             }
 
