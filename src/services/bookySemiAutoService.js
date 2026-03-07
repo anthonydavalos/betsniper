@@ -561,7 +561,34 @@ const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = fals
           Origin: altenarClient.defaults.headers?.Origin || altenarClient.defaults.headers?.common?.Origin
         }
       });
-      return response?.data;
+      const body = response?.data || {};
+      const hasAcceptedBets = Array.isArray(body?.bets) && body.bets.length > 0;
+
+      if (!hasAcceptedBets) {
+        const statusCode = Number(response?.status) || 409;
+        const providerError = body?.error || null;
+
+        throw createBookyError(
+          providerError
+            ? `placeWidget rechazó la apuesta (provider error)${fastMode ? ' [fast]' : ''}.`
+            : `placeWidget respondió sin confirmar apuesta (sin bets)${fastMode ? ' [fast]' : ''}.`,
+          {
+            statusCode,
+            code: 'BOOKY_PLACEWIDGET_REJECTED',
+            diagnostic: {
+              ticketId,
+              requestId: draft?.payload?.requestId || null,
+              endpoint: draft?.endpoint || null,
+              fastMode,
+              providerError,
+              responseHasBets: hasAcceptedBets,
+              observedAt: nowIso()
+            }
+          }
+        );
+      }
+
+      return body;
     } catch (error) {
       lastError = error;
       const transient = isTransientProviderError(error);

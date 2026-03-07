@@ -17,6 +17,8 @@ const DEFAULT_HISTORY_RETENTION_DAYS = 30;
 const DEFAULT_PROFILE_HISTORY_MAX_ITEMS = 500;
 const LEAGUE_MISS_LOG_THROTTLE_MS = 5 * 60 * 1000;
 const BOOKY_SETTLED_PROVIDER_STATUSES = new Set([1, 2, 4, 8, 18]);
+const DEFAULT_ORPHAN_ACTIVE_GRACE_MS = 2 * 60 * 1000;
+const DEFAULT_ORPHAN_ACTIVE_HARD_MAX_MS = 20 * 60 * 1000;
 
 const memoryBalanceCacheByProfile = new Map();
 const memoryHistoryCacheByProfile = new Map();
@@ -587,17 +589,97 @@ const selectionTypeIdToPick = (selectionTypeId, selection = null) => {
   return null;
 };
 
-const reconcilePortfolioActiveBetsFromRemote = (remoteRows = []) => {
+const getOrphanActiveGraceMs = () => {
+  const value = Number(getRuntimeEnvValue('BOOKY_ORPHAN_ACTIVE_GRACE_MS', String(DEFAULT_ORPHAN_ACTIVE_GRACE_MS)));
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_ORPHAN_ACTIVE_GRACE_MS;
+};
+
+const getOrphanActiveHardMaxMs = () => {
+  const value = Number(getRuntimeEnvValue('BOOKY_ORPHAN_ACTIVE_HARD_MAX_MS', String(DEFAULT_ORPHAN_ACTIVE_HARD_MAX_MS)));
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_ORPHAN_ACTIVE_HARD_MAX_MS;
+};
+
+const getBetFreshnessMs = (bet = {}) => {
+  const ts = new Date(
+    bet?.providerAcceptedAt || bet?.lastUpdate || bet?.createdAt || bet?.matchDate || 0
+  ).getTime();
+  if (!Number.isFinite(ts)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, Date.now() - ts);
+};
+
+const buildBookyHistoryByPortfolioBetId = () => {
+  const out = new Map();
+  const legacyRows = Array.isArray(db.data?.booky?.history) ? db.data.booky.history : [];
+  const profileStores = db.data?.booky?.byProfile && typeof db.data.booky.byProfile === 'object'
+    ? Object.values(db.data.booky.byProfile)
+    : [];
+
+  const ingestRows = (rows = []) => {
+    for (const ticket of rows) {
+      const betId = String(ticket?.portfolioBetId || '').trim();
+      if (!betId) continue;
+      out.set(betId, ticket);
+    }
+  };
+
+  ingestRows(legacyRows);
+
+  for (const store of profileStores) {
+    const rows = Array.isArray(store?.history) ? store.history : [];
+    ingestRows(rows);
+  }
+
+  return out;
+};
+
+const hasTicketConfirmationIssue = (ticket = null) => {
+  if (!ticket || typeof ticket !== 'object') return false;
+  const status = String(ticket?.status || '').toUpperCase();
+  if (status.includes('UNKNOWN') || status.includes('UNCERTAIN') || status.includes('REJECT')) return true;
+  const acceptedProviderBetId = ticket?.realPlacement?.accepted?.providerBetId;
+  if (acceptedProviderBetId === null || acceptedProviderBetId === undefined || acceptedProviderBetId === '') {
+    const hasProviderError = Boolean(ticket?.realPlacement?.response?.error);
+    if (hasProviderError) return true;
+  }
+  return false;
+};
+
+const archiveRemovedOrphanActiveBet = (bet = {}, reason = '') => {
+  if (!db.data?.portfolio) return;
+  if (!Array.isArray(db.data.portfolio.history)) db.data.portfolio.history = [];
+
+  const archiveRow = {
+    ...bet,
+    status: 'CANCELLED_UNCONFIRMED',
+    settlementReason: reason || 'orphan_active_not_found_remote_open',
+    settledAt: nowIso(),
+    orphanCleanedAt: nowIso()
+  };
+
+  db.data.portfolio.history.unshift(archiveRow);
+};
+
+const reconcilePortfolioActiveBetsFromRemote = (remoteRows = [], { integration = null } = {}) => {
   const rows = Array.isArray(remoteRows) ? remoteRows : [];
   const activeBets = Array.isArray(db.data?.portfolio?.activeBets) ? db.data.portfolio.activeBets : [];
-  if (rows.length === 0 || activeBets.length === 0) return 0;
+  if (activeBets.length === 0) {
+    return {
+      touchedCount: 0,
+      patchedCount: 0,
+      removedCount: 0,
+      removedIds: []
+    };
+  }
 
   const byProviderBetId = new Map();
   const byEventPick = new Map();
+  const historyByPortfolioBetId = buildBookyHistoryByPortfolioBetId();
+  const orphanGraceMs = getOrphanActiveGraceMs();
+  const orphanHardMaxMs = getOrphanActiveHardMaxMs();
 
   for (const row of rows) {
     const status = Number(row?.status);
-    if (BOOKY_SETTLED_PROVIDER_STATUSES.has(status)) continue;
+    if (status !== 0) continue;
 
     const providerBetId = row?.providerBetId;
     if (providerBetId !== null && providerBetId !== undefined && providerBetId !== '') {
@@ -612,11 +694,21 @@ const reconcilePortfolioActiveBetsFromRemote = (remoteRows = []) => {
     }
   }
 
-  if (byProviderBetId.size === 0 && byEventPick.size === 0) return 0;
+  let patchedCount = 0;
+  const removeIndexes = [];
+  const removedIds = [];
 
-  let updates = 0;
-  for (const bet of activeBets) {
+  for (let idx = 0; idx < activeBets.length; idx += 1) {
+    const bet = activeBets[idx];
     if (!bet || typeof bet !== 'object') continue;
+
+    if (integration) {
+      const rawBetIntegration = String(bet?.integration || '').trim();
+      if (rawBetIntegration) {
+        const betIntegration = normalizeBookProfile(rawBetIntegration);
+        if (betIntegration !== normalizeBookProfile(integration)) continue;
+      }
+    }
 
     const localProviderBetId = bet?.providerBetId;
     const providerKey = (localProviderBetId !== null && localProviderBetId !== undefined && localProviderBetId !== '')
@@ -632,7 +724,32 @@ const reconcilePortfolioActiveBetsFromRemote = (remoteRows = []) => {
       }
     }
 
-    if (!remote) continue;
+    if (!remote) {
+      const hasProviderId = providerKey !== null;
+      if (hasProviderId) continue;
+
+      const pick = String(bet?.pick || '').toLowerCase().trim();
+      const betEventId = Number(bet?.eventId);
+      const hasEventPick = Number.isFinite(betEventId) && Boolean(pick);
+      if (hasEventPick && byEventPick.has(`${betEventId}_${pick}`)) continue;
+
+      const freshnessMs = getBetFreshnessMs(bet);
+      if (freshnessMs < orphanGraceMs) continue;
+
+      const relatedTicket = historyByPortfolioBetId.get(String(bet?.id || '')) || null;
+      const ticketLooksBroken = hasTicketConfirmationIssue(relatedTicket);
+      const isTooOld = freshnessMs >= orphanHardMaxMs;
+
+      if (ticketLooksBroken || isTooOld) {
+        const reason = ticketLooksBroken
+          ? 'orphan_active_confirmation_issue_no_remote_open'
+          : 'orphan_active_stale_no_remote_open';
+        archiveRemovedOrphanActiveBet(bet, reason);
+        removeIndexes.push(idx);
+        removedIds.push(String(bet?.id || ''));
+      }
+      continue;
+    }
 
     const remoteOdd = Number(remote?.odd);
     const remoteStake = Number(remote?.stake);
@@ -671,11 +788,21 @@ const reconcilePortfolioActiveBetsFromRemote = (remoteRows = []) => {
 
     if (changed) {
       bet.providerSyncedAt = nowIso();
-      updates += 1;
+      patchedCount += 1;
     }
   }
 
-  return updates;
+  const removedCount = removeIndexes.length;
+  for (let i = removeIndexes.length - 1; i >= 0; i -= 1) {
+    activeBets.splice(removeIndexes[i], 1);
+  }
+
+  return {
+    touchedCount: patchedCount + removedCount,
+    patchedCount,
+    removedCount,
+    removedIds
+  };
 };
 
 const resolveLeagueNameFromCaches = ({ eventId, champId = null, catId = null, fallbackLeague = null } = {}) => {
@@ -1682,8 +1809,10 @@ export const getBookyHistory = async (limit = 60) => {
   const remote = await syncRemoteBookyHistory({ forceRefresh: false, limit: 0, profileKey: ctx.key, fetchAll: true });
   const remoteRows = Array.isArray(remote?.items) ? remote.items : [];
 
-  const reconciledActiveBetsCount = reconcilePortfolioActiveBetsFromRemote(remoteRows);
-  if (reconciledActiveBetsCount > 0) {
+  const reconcileStats = reconcilePortfolioActiveBetsFromRemote(remoteRows, {
+    integration: ctx.integration
+  });
+  if (Number(reconcileStats?.touchedCount || 0) > 0) {
     await db.write();
   }
 
@@ -1891,6 +2020,51 @@ export const getBookyHistory = async (limit = 60) => {
   await db.write();
 
   return enrichedRows.slice(0, max);
+};
+
+export const cleanupBookyOrphanActiveBets = async ({
+  profileKey = null,
+  forceRefresh = true,
+  historyLimit = 0,
+  fetchAll = true
+} = {}) => {
+  await initDB();
+  await db.read();
+  ensureBookyStore();
+
+  const ctx = getActiveProfileContext();
+  const key = normalizeBookProfile(profileKey || ctx.key);
+  const activeBefore = Array.isArray(db.data?.portfolio?.activeBets) ? db.data.portfolio.activeBets.length : 0;
+
+  const remote = await syncRemoteBookyHistory({
+    forceRefresh,
+    limit: historyLimit,
+    profileKey: key,
+    fetchAll
+  });
+
+  const remoteRows = Array.isArray(remote?.items) ? remote.items : [];
+  const stats = reconcilePortfolioActiveBetsFromRemote(remoteRows, {
+    integration: ctx.integration
+  });
+
+  if (Number(stats?.touchedCount || 0) > 0) {
+    await db.write();
+  }
+
+  const activeAfter = Array.isArray(db.data?.portfolio?.activeBets) ? db.data.portfolio.activeBets.length : 0;
+
+  return {
+    profile: key,
+    integration: ctx.integration,
+    remoteRows: remoteRows.length,
+    activeBefore,
+    activeAfter,
+    ...stats,
+    fetchedAt: nowIso(),
+    source: remote?.source || null,
+    remoteError: remote?.error || null
+  };
 };
 
 export const cleanupBookyHistoricalData = async ({ retentionDays, maxPerProfile } = {}) => {

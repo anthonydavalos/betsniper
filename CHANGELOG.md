@@ -7,6 +7,62 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.3] — 2026-03-07 — Sprint: Prematch Refresh + Booky Orphan Cleanup
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Saneo manual de apuestas activas huérfanas
+- **`scripts/cleanup-booky-orphans.js`**:
+  - Nuevo script CLI para reconciliar y limpiar `portfolio.activeBets` huérfanas bajo demanda.
+  - Soporta flags `--profile`, `--refresh`, `--history-limit`, `--fetch-all`, `--json` y `--help`.
+  - Reporta métricas operativas (`activeBefore/After`, `removedCount`, `patchedCount`, `removedIds`).
+- **`package.json`**:
+  - Nuevo comando `npm run cleanup:booky:orphans`.
+
+#### Booky account reconciliation (hardening)
+- **`src/services/bookyAccountService.js`**:
+  - Nuevo export `cleanupBookyOrphanActiveBets()` para ejecutar saneo on-demand desde backend.
+  - Reconciliación de `activeBets` ampliada con:
+    - detección de apuestas sin `providerBetId` no presentes en Open Bets remotas,
+    - archivado automático a `portfolio.history` como `CANCELLED_UNCONFIRMED`,
+    - razón de liquidación (`orphan_active_*`) y timestamp de limpieza.
+  - Nuevos knobs por entorno:
+    - `BOOKY_ORPHAN_ACTIVE_GRACE_MS`
+    - `BOOKY_ORPHAN_ACTIVE_HARD_MAX_MS`
+
+### 🔄 Changed
+
+#### Confirmación real Booky más estricta
+- **`src/services/bookySemiAutoService.js`**:
+  - `placeWidget` ahora exige `response.bets[]` para considerar aceptación real.
+  - Si la respuesta viene con `error` o sin `bets`, se clasifica como `BOOKY_PLACEWIDGET_REJECTED` y no confirma espejo local.
+
+#### Re-cálculo prematch en caliente antes de apostar
+- **`src/services/oddsService.js`**:
+  - `refreshOpportunity()` recalcula `realProb` para prematch consultando feed Pinnacle en caliente (con caché TTL).
+  - Enriquecimiento del snapshot con `fairProbSource`, `pinnacleRefreshedAt`, `realPrice` y ajuste de EV/Kelly en tiempo real.
+
+#### UX de confirmación y desbloqueo por estado incierto
+- **`client/src/App.jsx`**:
+  - Modal de confirmación muestra deltas instantáneos de cuota, EV, stake y probabilidad real.
+  - En `BOOKY_REAL_CONFIRMATION_UNCERTAIN`, se fuerza refresh de Booky y se libera lock optimista local si no hay apuesta abierta real.
+
+#### Configuración, aliases y documentación
+- **`src/utils/dynamicAliases.json`**:
+  - Nuevos aliases dinámicos para mejorar matching de nombres en ligas con naming heterogéneo.
+- **`README.md`** y **`.env.example`**:
+  - Documentación del script de saneo de huérfanas y de variables `BOOKY_ORPHAN_ACTIVE_*`.
+  - Documentación de recálculo prematch en caliente (`PREMATCH_REFRESH_RECALCULATE_PINNACLE`, `PREMATCH_PINNACLE_CACHE_TTL_MS`).
+
+### 🐛 Fixed
+
+#### Apuestas fantasma bloqueando oportunidades LIVE
+- Se corrige el escenario donde una confirmación incompleta (sin `providerBetId`) dejaba una apuesta en `portfolio.activeBets` sin existir en Open Bets remotas, bloqueando re-apuesta en frontend.
+
+---
+
 ## [v3.4.2] — 2026-03-07 — Sprint: Throughput Hardening + Worker Isolation
 
 > Rama: `master`

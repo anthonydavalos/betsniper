@@ -2,6 +2,15 @@ import altenarClient from '../config/axiosClient.js';
 import { getEventDetails } from './liveValueScanner.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { getKellyBankrollBase } from './bookyAccountService.js';
+import { getAllPinnaclePrematchOdds } from './pinnacleService.js';
+
+const PREMATCH_REFRESH_RECALCULATE_PINNACLE = String(process.env.PREMATCH_REFRESH_RECALCULATE_PINNACLE || 'true').toLowerCase() !== 'false';
+const PREMATCH_PINNACLE_CACHE_TTL_MS = Math.max(3000, Number(process.env.PREMATCH_PINNACLE_CACHE_TTL_MS || 15000));
+
+let prematchPinnacleCache = {
+    atMs: 0,
+    oddsMap: null
+};
 
 const normalizeMarketText = (value = '') => String(value)
     .toLowerCase()
@@ -55,6 +64,171 @@ const parseTotalsHint = (marketName = '', selectionName = '') => {
         : (Number.isFinite(lineFromSelection) ? 'selection' : (hasAmbiguousSelectionLine ? 'ambiguous' : 'none'));
 
     return { side, line, lineFrom, rawSelection, rawMarket };
+};
+
+const normalizeTeamText = (value = '') => String(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+const splitMatchSides = (value = '') => {
+    const parts = String(value || '').split(/\s+vs\.?\s+/i);
+    return {
+        home: String(parts[0] || '').trim(),
+        away: String(parts[1] || '').trim()
+    };
+};
+
+const isPrematchOpportunity = (opportunity = {}) => {
+    const type = String(opportunity.type || opportunity.strategy || '').toUpperCase();
+    if (type.includes('PREMATCH')) return true;
+    const timeValue = String(opportunity.time || opportunity.liveTime || '').toUpperCase();
+    return !timeValue || timeValue === 'PRE' || timeValue.includes('PREMATCH');
+};
+
+const getSelectionToken = (selection = '') => normalizeMarketText(selection).replace(/\s+/g, '');
+
+const getCachedPinnaclePrematchMap = async () => {
+    const now = Date.now();
+    if (prematchPinnacleCache.oddsMap && (now - prematchPinnacleCache.atMs) <= PREMATCH_PINNACLE_CACHE_TTL_MS) {
+        return prematchPinnacleCache.oddsMap;
+    }
+
+    const oddsMap = await getAllPinnaclePrematchOdds();
+    prematchPinnacleCache = {
+        atMs: now,
+        oddsMap: oddsMap instanceof Map ? oddsMap : null
+    };
+    return prematchPinnacleCache.oddsMap;
+};
+
+const findPinnaclePrematchEntry = async (opportunity = {}) => {
+    const map = await getCachedPinnaclePrematchMap();
+    if (!map || map.size === 0) return null;
+
+    const pinId = opportunity.pinnacleId ?? opportunity.pinnacleInfo?.id;
+    if (pinId !== undefined && pinId !== null && String(pinId).trim() !== '') {
+        const byRaw = map.get(pinId);
+        const byNum = map.get(Number(pinId));
+        const byStr = map.get(String(pinId));
+        const direct = byRaw || byNum || byStr;
+        if (direct) return direct;
+    }
+
+    const { home, away } = splitMatchSides(opportunity.match || '');
+    const nHome = normalizeTeamText(home);
+    const nAway = normalizeTeamText(away);
+    if (!nHome || !nAway) return null;
+
+    for (const item of map.values()) {
+        const candHome = normalizeTeamText(item?.home || '');
+        const candAway = normalizeTeamText(item?.away || '');
+        if (candHome === nHome && candAway === nAway) {
+            return item;
+        }
+    }
+
+    return null;
+};
+
+const normalizeFairFromOdds = (targetOdd, allOdds = []) => {
+    const validOdds = allOdds.map(Number).filter(v => Number.isFinite(v) && v > 1);
+    const target = Number(targetOdd);
+    if (!Number.isFinite(target) || target <= 1 || validOdds.length === 0) return null;
+
+    const totalImplied = validOdds.reduce((acc, odd) => acc + (1 / odd), 0);
+    if (!Number.isFinite(totalImplied) || totalImplied <= 0) return null;
+
+    const fairProb = (1 / target) / totalImplied;
+    if (!Number.isFinite(fairProb) || fairProb <= 0 || fairProb >= 1) return null;
+
+    return fairProb;
+};
+
+const resolvePrematchFairProbFromPinnacle = (opportunity = {}, pinEntry = null, marketName = '', selectionName = '', totalsHint = null) => {
+    if (!pinEntry) return null;
+
+    const marketNorm = normalizeMarketText(marketName || opportunity.market || '');
+    const selectionToken = getSelectionToken(selectionName || opportunity.selection || '');
+
+    // 1x2
+    if (is1x2MarketName(marketName || opportunity.market || '')) {
+        const ml = pinEntry.moneyline || {};
+        const home = Number(ml.home);
+        const draw = Number(ml.draw);
+        const away = Number(ml.away);
+
+        let targetOdd = null;
+        if (selectionToken === 'home' || selectionToken === '1' || selectionToken.includes('local')) targetOdd = home;
+        else if (selectionToken === 'draw' || selectionToken === 'x' || selectionToken.includes('empate')) targetOdd = draw;
+        else if (selectionToken === 'away' || selectionToken === '2' || selectionToken.includes('visita')) targetOdd = away;
+
+        const fairProb = normalizeFairFromOdds(targetOdd, [home, draw, away]);
+        if (!fairProb) return null;
+
+        return { fairProb, pinnaclePrice: targetOdd, source: 'pinnacle-prematch-1x2' };
+    }
+
+    // Double Chance
+    if (marketNorm.includes('double chance') || marketNorm.includes('doble')) {
+        const dc = pinEntry.doubleChance || {};
+        const p1x = Number(dc.homeDraw);
+        const p12 = Number(dc.homeAway);
+        const px2 = Number(dc.drawAway);
+
+        let targetOdd = null;
+        if (selectionToken === '1x') targetOdd = p1x;
+        else if (selectionToken === '12') targetOdd = p12;
+        else if (selectionToken === 'x2') targetOdd = px2;
+
+        const fairProb = normalizeFairFromOdds(targetOdd, [p1x, p12, px2]);
+        if (!fairProb) return null;
+
+        return { fairProb, pinnaclePrice: targetOdd, source: 'pinnacle-prematch-dc' };
+    }
+
+    // Totales
+    if (marketNorm.includes('total')) {
+        const totals = Array.isArray(pinEntry.totals) ? pinEntry.totals : [];
+        const side = totalsHint?.side || null;
+        const targetLine = Number.isFinite(Number(totalsHint?.line)) ? Number(totalsHint.line) : NaN;
+        if (!side || totals.length === 0) return null;
+
+        const lineObj = totals.find(t => {
+            if (!Number.isFinite(targetLine)) return true;
+            return Math.abs(Number(t.line) - targetLine) < 0.11;
+        });
+
+        if (!lineObj) return null;
+        const over = Number(lineObj.over);
+        const under = Number(lineObj.under);
+        const targetOdd = side === 'over' ? over : under;
+        const fairProb = normalizeFairFromOdds(targetOdd, [over, under]);
+        if (!fairProb) return null;
+
+        return { fairProb, pinnaclePrice: targetOdd, source: 'pinnacle-prematch-total' };
+    }
+
+    // BTTS (si existe en contexto)
+    if (marketNorm.includes('btts') || marketNorm.includes('ambos')) {
+        const btts = pinEntry.btts || opportunity?.pinnacleInfo?.prematchContext?.btts || null;
+        if (!btts) return null;
+        const yes = Number(btts.yes);
+        const no = Number(btts.no);
+
+        let targetOdd = null;
+        if (selectionToken.includes('yes') || selectionToken.includes('si') || selectionToken.includes('sí')) targetOdd = yes;
+        else if (selectionToken.includes('no')) targetOdd = no;
+
+        const fairProb = normalizeFairFromOdds(targetOdd, [yes, no]);
+        if (!fairProb) return null;
+
+        return { fairProb, pinnaclePrice: targetOdd, source: 'pinnacle-prematch-btts' };
+    }
+
+    return null;
 };
 
 /**
@@ -155,9 +329,29 @@ export const refreshOpportunity = async (opportunity) => {
         const oldPrice = opportunity.price;
         const newPrice = targetOdd.price;
         
-        // Asumimos que la Real Prob (Fair Price) se mantiene constante en el micro-segundo
-        // (Sería ideal refrescar Pinnacle también, pero es mucho overhead. Confiamos en que la cuota de valor de Altenar es la variable rápida)
-        const fairProb = opportunity.realProb ? (opportunity.realProb / 100) : (1 / (opportunity.realPrice || opportunity.pinnaclePrice));
+        // Recalcular fairProb en caliente para prematch consultando Pinnacle antes de confirmar.
+        // Si falla el refresh de Pinnacle, fallback a probabilidad previa de la oportunidad.
+        let fairProb = opportunity.realProb ? (opportunity.realProb / 100) : (1 / (opportunity.realPrice || opportunity.pinnaclePrice));
+        let fairProbSource = 'opportunity-snapshot';
+        let refreshedPinnaclePrice = null;
+
+        if (PREMATCH_REFRESH_RECALCULATE_PINNACLE && isPrematchOpportunity(opportunity)) {
+            try {
+                const pinEntry = await findPinnaclePrematchEntry(opportunity);
+                const resolved = resolvePrematchFairProbFromPinnacle(opportunity, pinEntry, marketName, selectionName, totalsHint);
+                if (resolved?.fairProb && Number.isFinite(resolved.fairProb)) {
+                    fairProb = resolved.fairProb;
+                    fairProbSource = resolved.source || 'pinnacle-prematch-refresh';
+                    refreshedPinnaclePrice = Number.isFinite(Number(resolved.pinnaclePrice)) ? Number(resolved.pinnaclePrice) : null;
+                }
+            } catch (pinErr) {
+                console.warn(`⚠️ Pinnacle prematch refresh falló (${opportunity?.match}): ${pinErr.message}`);
+            }
+        }
+
+        if (!Number.isFinite(fairProb) || fairProb <= 0 || fairProb >= 1) {
+            throw new Error('No se pudo calcular probabilidad real válida para refresh.');
+        }
         
         const newEV = (fairProb * newPrice) - 1;
         
@@ -185,6 +379,11 @@ export const refreshOpportunity = async (opportunity) => {
         updatedOp.price = newPrice;
         updatedOp.ev = Number((newEV * 100).toFixed(2));
         updatedOp.kellyStake = Number(safeStake.toFixed(2));
+        updatedOp.realProb = Number((fairProb * 100).toFixed(4));
+        updatedOp.realPrice = Number((1 / fairProb).toFixed(4));
+        updatedOp.fairProbSource = fairProbSource;
+        updatedOp.pinnaclePrice = refreshedPinnaclePrice || updatedOp.pinnaclePrice || null;
+        updatedOp.pinnacleRefreshedAt = fairProbSource.startsWith('pinnacle-') ? new Date().toISOString() : (updatedOp.pinnacleRefreshedAt || null);
         updatedOp.kellyBankrollSource = bankrollBase?.source || null;
         updatedOp.lastUpdate = new Date().toISOString();
 

@@ -105,6 +105,7 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 - Captura payload placeWidget: `npm run capture:booky:*`.
 - Spy de historial/endpoints: `npm run spy:booky:history`.
 - Smoke test API booky: `npm run smoke:booky` y `npm run smoke:booky:live`.
+- Saneo manual de huérfanas en `portfolio.activeBets`: `npm run cleanup:booky:orphans`.
 - Ingesta Pinnacle manual: `npm run ingest:pinnacle:force` (normal) y `npm run ingest:pinnacle:safe` (sin flush incremental, recomendado en OneDrive).
 - Plantilla de experimento matcher: `MATCH_DIAG_TEMPLATE.md` (guía A/B para ajustar `MATCH_TIME_TOLERANCE_MINUTES` con baseline prefilled).
 
@@ -535,12 +536,18 @@ LIVE_VALUE_STABILITY_MIN_HITS=2
 LIVE_VALUE_STABILITY_MIN_AGE_MS=4000
 LIVE_GLOBAL_STABILITY_ENABLED=true
 LIVE_GLOBAL_STABILITY_MIN_HITS=2
+
+# Recalculo prematch en caliente al apostar
+PREMATCH_REFRESH_RECALCULATE_PINNACLE=true
+PREMATCH_PINNACLE_CACHE_TTL_MS=15000
 ```
 > Pon `true` solo para depurar el servidor Express sin que los scanners consuman CPU.
 
 > `LIVE_SNIPE_REQUIRE_PINNACLE_LIVE=true` mantiene modo estricto (solo entra si hay cuota live PIN). Si estás en día de feed incompleto, puedes bajarlo temporalmente a `false`.
 
 > `LIVE_VALUE_REQUIRE_SCORE_SYNC=true` + `LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF=0` exige marcador idéntico Altenar/Pinnacle. Para no quedarte sin señales, usa `LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF=1` o desactiva la guard con `LIVE_VALUE_REQUIRE_SCORE_SYNC=false`.
+
+> `PREMATCH_REFRESH_RECALCULATE_PINNACLE=true` fuerza recálculo de `realProb` prematch justo antes de confirmar/apostar, consultando el feed de Pinnacle. El frontend mostrará el delta instantáneo de cuota/EV/stake/probabilidad en el modal de confirmación.
 
 ---
 
@@ -710,6 +717,16 @@ BOOKY_PROFILE_HISTORY_MAX_ITEMS=500
 ```
 > Límite de entradas de historial por perfil en DB. Evita que `db.json` crezca indefinidamente.
 
+```env
+BOOKY_ORPHAN_ACTIVE_GRACE_MS=120000
+```
+> Ventana de gracia (ms) antes de considerar huérfana una apuesta activa sin `providerBetId`. Evita falsos positivos por latencia de sincronización.
+
+```env
+BOOKY_ORPHAN_ACTIVE_HARD_MAX_MS=1200000
+```
+> Límite duro (ms) para forzar saneo de activas huérfanas aunque no haya señal fuerte de error en el ticket.
+
 ---
 
 ### Paso 3: Resumen — ¿qué es obligatorio vs opcional?
@@ -871,6 +888,9 @@ npm run capture:booky
 
 # 4) Ver salud de token y flujo seguro (sin apostar real)
 npm run smoke:booky
+
+# 5) Saneo manual de activas huérfanas (si UI muestra EN JUEGO fantasma)
+npm run cleanup:booky:orphans
 ```
 
 Para pruebas con envío real controlado (solo si habilitas `BOOKY_REAL_PLACEMENT_ENABLED=true`):
@@ -880,6 +900,19 @@ npm run smoke:booky:live
 ```
 
 > Recomendación: mantener `BOOKY_REAL_PLACEMENT_ENABLED=false` en desarrollo normal.
+
+Opciones útiles del script de saneo:
+
+```bash
+# Solo salida JSON
+npm run cleanup:booky:orphans -- --json
+
+# Limpiar para un perfil concreto
+npm run cleanup:booky:orphans -- --profile=acity
+
+# Usar cache remoto (sin refresh forzado)
+npm run cleanup:booky:orphans -- --refresh=false
+```
 
 #### Scanner Manual (Modo Observador)
 
