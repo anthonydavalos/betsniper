@@ -17,6 +17,34 @@ function parseEnvBoolean(value, defaultValue = false) {
     return defaultValue;
 }
 
+function parsePositiveNumber(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getPrematchHybridWindow() {
+    const now = new Date();
+    const primaryHours = parsePositiveNumber(process.env.PREMATCH_WINDOW_PRIMARY_HOURS, 6);
+    const prefetchHours = parsePositiveNumber(process.env.PREMATCH_WINDOW_PREFETCH_HOURS, 6);
+    const overlapMinutes = parsePositiveNumber(process.env.PREMATCH_WINDOW_OVERLAP_MINUTES, 30);
+    const totalHours = primaryHours + prefetchHours;
+
+    const startDate = new Date(now.getTime() - (overlapMinutes * 60 * 1000));
+    const primaryEndDate = new Date(now.getTime() + (primaryHours * 60 * 60 * 1000));
+    const endDate = new Date(now.getTime() + (totalHours * 60 * 60 * 1000));
+
+    return {
+        now,
+        startDate,
+        primaryEndDate,
+        endDate,
+        overlapMinutes,
+        primaryHours,
+        prefetchHours,
+        totalHours
+    };
+}
+
 async function fetchMarketsForMatch(matchId) {
     try {
         return await pinnacleClient.get(`/matchups/${matchId}/markets/related/straight`);
@@ -165,27 +193,16 @@ export const ingestPinnaclePrematch = async (force = false, options = {}) => {
         return;
     }
 
-    // 2. Define Date Range (HORIZONTE DINÁMICO)
-    // Estrategia:
-    // - Mañana (< 12:00 PM Perú): Descargar solo hasta el final de HOY.
-    // - Tarde   (>= 12:00 PM Perú): Descargar hasta el final de MAÑANA.
-    const now = new Date();
-    const peruTime = new Date().toLocaleString("en-US", { timeZone: "America/Lima" });
-    const currentHourPeru = new Date(peruTime).getHours();
-    
-    // CAMBIO A 6 PM (18:00): Antes de eso, foco total en liquidar el día.
-    const futureLimit = new Date();
-    if (currentHourPeru >= 18) {
-        // Noche: Extender hasta el final de MAÑANA (para preparar sesión de madrugada)
-        futureLimit.setDate(futureLimit.getDate() + 1);
-        console.log(`🕒 Modo Noche (${currentHourPeru}:00 PE): Extendiendo búsqueda hasta mañana.`);
-    } else {
-        // Día: Buscando solo partidos de hoy (sin ruido futuro)
-        console.log(`🕒 Modo Operativo (${currentHourPeru}:00 PE): Buscando solo partidos de hoy.`);
-    }
-    futureLimit.setHours(23, 59, 59, 999);
-    
-    console.log(`📅 Filtrando partidos desde AHORA hasta: ${futureLimit.toISOString()}`);
+    // 2. Define Date Range (ventana híbrida deslizante)
+    const windowCfg = getPrematchHybridWindow();
+    const now = windowCfg.now;
+    const futureStart = windowCfg.startDate;
+    const futureLimit = windowCfg.endDate;
+
+    console.log(
+        `🧭 Ventana híbrida Pinnacle: ${futureStart.toISOString()} -> ${futureLimit.toISOString()} ` +
+        `(primaria +${windowCfg.primaryHours}h, precarga +${windowCfg.prefetchHours}h, overlap ${windowCfg.overlapMinutes}m).`
+    );
 
     let refinedMatches = [];
     let processedLeagues = 0;
@@ -209,7 +226,7 @@ export const ingestPinnaclePrematch = async (force = false, options = {}) => {
                 const date = new Date(m.startTime);
                 // Debug log for first few matches
                 // if (Math.random() < 0.05) console.log(`Debug Match Date: ${date.toISOString()} vs Limit: ${futureLimit.toISOString()}`);
-                return date >= now && date <= futureLimit && m.type === 'matchup' && m.parentId === null; 
+                return date >= futureStart && date <= futureLimit && m.type === 'matchup' && m.parentId === null; 
             });
 
             if (matches.length > 0 && relevant.length === 0) {
@@ -286,13 +303,14 @@ export const ingestPinnaclePrematch = async (force = false, options = {}) => {
         if (shouldFlushIncremental) {
             try {
                 const existing = db.data.upcomingMatches || [];
-                const getPeruDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
-                const todayStr = getPeruDate(new Date());
+                const preserveStartMs = futureStart.getTime() - (windowCfg.overlapMinutes * 60 * 1000);
+                const preserveEndMs = futureLimit.getTime();
 
                 const kept = existing.filter(old => {
-                    const dStr = getPeruDate(old.date);
+                    const oldTs = new Date(old.date).getTime();
                     const replaced = refinedMatches.some(newM => newM.id === old.id);
-                    return dStr === todayStr && !replaced;
+                    const inWindow = Number.isFinite(oldTs) && oldTs >= preserveStartMs && oldTs <= preserveEndMs;
+                    return inWindow && !replaced;
                 });
 
                 const merged = [...kept, ...refinedMatches].sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -311,25 +329,21 @@ export const ingestPinnaclePrematch = async (force = false, options = {}) => {
     // 1. Cargar partidos existentes
     const existingMatchesFinal = db.data.upcomingMatches || [];
     
-    // 2. Definir ventana de preservación: DÍA CALENDARIO ACTUAL (PERÚ UTC-5)
-    // Usamos 'en-CA' para obtener formato YYYY-MM-DD ajustado a la zona horaria
-    const getPeruDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Lima' });
-    const todayStr = getPeruDate(new Date());
+    // 2. Definir ventana de preservación: horizonte híbrido activo
+    const preserveStartMs = futureStart.getTime() - (windowCfg.overlapMinutes * 60 * 1000);
+    const preserveEndMs = futureLimit.getTime();
 
     const keptMatches = existingMatchesFinal.filter(oldMatch => {
-        // Extraer fecha base (YYYY-MM-DD) del partido según Perú
-        const matchDateStr = getPeruDate(oldMatch.date);
-        
-        // Criterio 1: Pertenece al día de HOY
-        const belongsToToday = matchDateStr === todayStr;
+        const oldTs = new Date(oldMatch.date).getTime();
+        const inWindow = Number.isFinite(oldTs) && oldTs >= preserveStartMs && oldTs <= preserveEndMs;
         
         // Criterio 2: Aún no ha sido reemplazado por la nueva descarga
         const isReplacedByNew = refinedMatches.some(newMatch => newMatch.id === oldMatch.id);
         
-        return belongsToToday && !isReplacedByNew;
+        return inWindow && !isReplacedByNew;
     });
 
-    console.log(`   ♻️  Preservando ${keptMatches.length} partidos previos de HOY (Perú).`);
+    console.log(`   ♻️  Preservando ${keptMatches.length} partidos previos de ventana híbrida.`);
     console.log(`   🆕 Insertando/Actualizando ${refinedMatches.length} partidos frescos desde API.`);
 
     // 3. Fusionar Listas

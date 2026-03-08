@@ -233,6 +233,12 @@ const formatTimeSafe = (candidate) => {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
+const formatTimeWithSecondsSafe = (candidate) => {
+    const date = candidate ? new Date(candidate) : null;
+    if (!date || !Number.isFinite(date.getTime())) return '--:--:--';
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+};
+
 const formatDateSafe = (candidate) => {
     const date = candidate ? new Date(candidate) : null;
     if (!date || !Number.isFinite(date.getTime())) return '--/--/----';
@@ -2460,8 +2466,12 @@ function App() {
                                         ? portfolio.activeBets.find(b => String(resolveOpTicketId(b) || b?.providerBetId || '').trim() === providerBetIdForLookup)
                                         : null;
 
-                                    const historyMatchBySelection = portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
-                                    const activeMatchBySelection = portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
+                                    const historyMatchBySelection = providerBetIdForLookup
+                                        ? null
+                                        : portfolio.history.find(h => h.eventId === op.eventId && h.selection === opSelection);
+                                    const activeMatchBySelection = providerBetIdForLookup
+                                        ? null
+                                        : portfolio.activeBets.find(b => b.eventId === op.eventId && b.selection === opSelection);
 
                                     const historyMatch = historyMatchByProvider || historyMatchBySelection;
                                     const activeMatch = activeMatchByProvider || activeMatchBySelection;
@@ -2470,7 +2480,9 @@ function App() {
                                     const remoteOpenRowByProvider = providerBetIdForLookup
                                         ? (remoteOpenBookyByProvider.get(providerBetIdForLookup) || null)
                                         : null;
-                                    const remoteOpenRowBySelection = opBetKey ? (remoteOpenBookyByKey.get(opBetKey) || null) : null;
+                                    const remoteOpenRowBySelection = providerBetIdForLookup
+                                        ? null
+                                        : (opBetKey ? (remoteOpenBookyByKey.get(opBetKey) || null) : null);
                                     const remoteOpenRow = remoteOpenRowByProvider || remoteOpenRowBySelection;
                                     const activeInRemoteBooky = Boolean(remoteOpenRow);
                                     const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : ((activeMatch || activeInRemoteBooky || op.isBookyRemoteOpen) ? 'ACTIVE' : 'PENDING'));
@@ -2722,7 +2734,7 @@ function App() {
                                                 <div className="text-slate-500 text-[10px] flex gap-2 flex-wrap items-center">
                                                     <span>{op.league || '-'}</span>
                                                     <span className="text-slate-600">|</span>
-                                                    <span>{formatTimeSafe(betTimeIso || op.date)}</span>
+                                                    <span>{(entryMeta && entryMeta.total > 1) ? formatTimeWithSecondsSafe(betTimeIso || op.date) : formatTimeSafe(betTimeIso || op.date)}</span>
                                                     {ticketIdForRow && (
                                                         <>
                                                             <span className="text-slate-600">|</span>

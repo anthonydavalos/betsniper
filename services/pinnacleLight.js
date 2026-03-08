@@ -22,8 +22,9 @@ const API_URL_PREMATCH_ODDS = "https://api.arcadia.pinnacle.com/0.1/sports/29/ma
 const API_URL_PREMATCH_FIXTURES = "https://api.arcadia.pinnacle.com/0.1/sports/29/matchups";
 const BASE_MIN_HTTP_GAP_MS = 600; // ~1.6 RPS global en este proceso
 const MAX_HTTP_GAP_MS = 3500;
-const NIGHT_MODE_START_HOUR_PE = 18;
-const NEXT_DAY_CUTOFF_HOUR_PE = 6;
+const DEFAULT_PREMATCH_PRIMARY_HOURS = 6;
+const DEFAULT_PREMATCH_PREFETCH_HOURS = 6;
+const DEFAULT_PREMATCH_OVERLAP_MINUTES = 30;
 const EXCLUDED_MATCH_TERMS = [
     'corners',
     'corner',
@@ -47,43 +48,21 @@ const isExcludedMarketVariant = ({ home = '', away = '', league = '', units = ''
     return EXCLUDED_MATCH_TERMS.some(term => blob.includes(term));
 };
 
+const parsePositiveNumber = (rawValue, fallbackValue) => {
+    const parsed = Number(rawValue);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
+};
+
 const getPrematchWindowUtc = () => {
     const nowUtcMs = Date.now();
-    const peruOffsetMs = -5 * 60 * 60 * 1000;
+    const primaryHours = parsePositiveNumber(process.env.PREMATCH_WINDOW_PRIMARY_HOURS, DEFAULT_PREMATCH_PRIMARY_HOURS);
+    const prefetchHours = parsePositiveNumber(process.env.PREMATCH_WINDOW_PREFETCH_HOURS, DEFAULT_PREMATCH_PREFETCH_HOURS);
+    const overlapMinutes = parsePositiveNumber(process.env.PREMATCH_WINDOW_OVERLAP_MINUTES, DEFAULT_PREMATCH_OVERLAP_MINUTES);
 
-    // Representación "local Perú" usando reloj UTC del objeto Date
-    const nowPeru = new Date(nowUtcMs + peruOffsetMs);
-    const hourPeru = nowPeru.getUTCHours();
+    const startUtcMs = nowUtcMs - Math.max(0, overlapMinutes) * 60 * 1000;
+    const endUtcMs = nowUtcMs + (primaryHours + prefetchHours) * 60 * 60 * 1000;
 
-    let endPeruMs;
-    if (hourPeru >= NIGHT_MODE_START_HOUR_PE) {
-        // Después de 18:00 PE: incluir hasta mañana 06:00 PE
-        endPeruMs = Date.UTC(
-            nowPeru.getUTCFullYear(),
-            nowPeru.getUTCMonth(),
-            nowPeru.getUTCDate() + 1,
-            NEXT_DAY_CUTOFF_HOUR_PE,
-            0,
-            0,
-            0
-        );
-    } else {
-        // Antes de 18:00 PE: solo hoy
-        endPeruMs = Date.UTC(
-            nowPeru.getUTCFullYear(),
-            nowPeru.getUTCMonth(),
-            nowPeru.getUTCDate(),
-            23,
-            59,
-            59,
-            999
-        );
-    }
-
-    // Convertir de timeline Perú a UTC real
-    const endUtcMs = endPeruMs - peruOffsetMs;
-
-    return { nowUtcMs, endUtcMs, hourPeru };
+    return { nowUtcMs, startUtcMs, endUtcMs, primaryHours, prefetchHours, overlapMinutes };
 };
 
 class PinnacleLight {
@@ -474,7 +453,7 @@ class PinnacleLight {
             const { data } = await this.arcadiaGet(API_URL_PREMATCH_FIXTURES, { headers: this.headers });
             if (!Array.isArray(data)) return;
 
-            const { nowUtcMs, endUtcMs, hourPeru } = getPrematchWindowUtc();
+            const { nowUtcMs, startUtcMs, endUtcMs, primaryHours, prefetchHours, overlapMinutes } = getPrematchWindowUtc();
             const activeIds = new Set();
 
             data.forEach(fix => {
@@ -486,7 +465,8 @@ class PinnacleLight {
 
                 // PREMATCH ONLY: excluir live y partidos vencidos
                 if (looksLive) return;
-                if (!startTs || startTs < nowUtcMs - 10 * 60 * 1000) return;
+                if (!startTs || startTs < startUtcMs) return;
+                if (startTs < nowUtcMs) return;
                 if (startTs > endUtcMs) return;
                 if (isExcludedMarketVariant({ home, away, league: leagueName, units: fix.units })) return;
 
@@ -515,7 +495,7 @@ class PinnacleLight {
 
             const count = activeIds.size;
             if (deletedCount > 0 || !this.lastPreFixCount || Math.abs(this.lastPreFixCount - count) > 20) {
-                console.log(`🗓️ Prematch Fixtures: ${count} activos. (🗑️ Limpiados: ${deletedCount}) [PE ${hourPeru}:00 window]`);
+                console.log(`🗓️ Prematch Fixtures: ${count} activos. (🗑️ Limpiados: ${deletedCount}) [window ${primaryHours}h+${prefetchHours}h, overlap ${overlapMinutes}m]`);
                 this.lastPreFixCount = count;
             }
         } catch (e) {
