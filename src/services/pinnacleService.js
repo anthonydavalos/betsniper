@@ -8,8 +8,9 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_DATA_PATH = path.join(__dirname, '../../data/pinnacle_live.json');
 const LOCAL_PREMATCH_DATA_PATH = path.join(__dirname, '../../data/pinnacle_prematch.json');
-const NIGHT_MODE_START_HOUR_PE = 18;
-const NEXT_DAY_CUTOFF_HOUR_PE = 6;
+const DEFAULT_PREMATCH_PRIMARY_HOURS = 6;
+const DEFAULT_PREMATCH_PREFETCH_HOURS = 6;
+const DEFAULT_PREMATCH_OVERLAP_MINUTES = 30;
 const EXCLUDED_MATCH_TERMS = [
     'corners',
     'corner',
@@ -34,36 +35,20 @@ const isExcludedMarketVariant = ({ home = '', away = '', league = '', units = ''
 };
 
 const getPrematchWindowUtc = () => {
+    const parsePositive = (value, fallback) => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    };
+
     const nowUtcMs = Date.now();
-    const peruOffsetMs = -5 * 60 * 60 * 1000;
-    const nowPeru = new Date(nowUtcMs + peruOffsetMs);
-    const hourPeru = nowPeru.getUTCHours();
+    const primaryHours = parsePositive(process.env.PREMATCH_WINDOW_PRIMARY_HOURS, DEFAULT_PREMATCH_PRIMARY_HOURS);
+    const prefetchHours = parsePositive(process.env.PREMATCH_WINDOW_PREFETCH_HOURS, DEFAULT_PREMATCH_PREFETCH_HOURS);
+    const overlapMinutes = parsePositive(process.env.PREMATCH_WINDOW_OVERLAP_MINUTES, DEFAULT_PREMATCH_OVERLAP_MINUTES);
+    const totalHours = primaryHours + prefetchHours;
 
-    let endPeruMs;
-    if (hourPeru >= NIGHT_MODE_START_HOUR_PE) {
-        endPeruMs = Date.UTC(
-            nowPeru.getUTCFullYear(),
-            nowPeru.getUTCMonth(),
-            nowPeru.getUTCDate() + 1,
-            NEXT_DAY_CUTOFF_HOUR_PE,
-            0,
-            0,
-            0
-        );
-    } else {
-        endPeruMs = Date.UTC(
-            nowPeru.getUTCFullYear(),
-            nowPeru.getUTCMonth(),
-            nowPeru.getUTCDate(),
-            23,
-            59,
-            59,
-            999
-        );
-    }
-
-    const endUtcMs = endPeruMs - peruOffsetMs;
-    return { nowUtcMs, endUtcMs, hourPeru };
+    const startUtcMs = nowUtcMs - (overlapMinutes * 60 * 1000);
+    const endUtcMs = nowUtcMs + (totalHours * 60 * 60 * 1000);
+    return { nowUtcMs, startUtcMs, endUtcMs, primaryHours, prefetchHours, overlapMinutes };
 };
 
 // Conversor de American Odds a Decimal (Pinnacle usa American)
@@ -491,14 +476,14 @@ export const getAllPinnaclePrematchOdds = async () => {
             pinnacleClient.get('/sports/29/matchups', { brandId: 0, _: Date.now() })
         ]);
 
-        const { nowUtcMs, endUtcMs } = getPrematchWindowUtc();
+        const { nowUtcMs, startUtcMs, endUtcMs } = getPrematchWindowUtc();
         const metaMap = new Map();
 
         (matchupData || []).forEach(m => {
             const startTs = m.startTime ? new Date(m.startTime).getTime() : 0;
             const isLikelyLive = !!m.liveMode || m.state?.minutes !== undefined;
 
-            if (!startTs || startTs < nowUtcMs - 10 * 60 * 1000 || startTs > endUtcMs) return;
+            if (!startTs || startTs < startUtcMs || startTs > endUtcMs) return;
             if (isLikelyLive) return;
 
             const home = m.participants?.find(p => p.alignment === 'home');

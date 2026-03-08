@@ -540,6 +540,11 @@ LIVE_GLOBAL_STABILITY_MIN_HITS=2
 # Recalculo prematch en caliente al apostar
 PREMATCH_REFRESH_RECALCULATE_PINNACLE=true
 PREMATCH_PINNACLE_CACHE_TTL_MS=15000
+
+# Ventana híbrida de descarga prematch (deslizante + precarga)
+PREMATCH_WINDOW_PRIMARY_HOURS=6
+PREMATCH_WINDOW_PREFETCH_HOURS=6
+PREMATCH_WINDOW_OVERLAP_MINUTES=30
 ```
 > Pon `true` solo para depurar el servidor Express sin que los scanners consuman CPU.
 
@@ -548,6 +553,8 @@ PREMATCH_PINNACLE_CACHE_TTL_MS=15000
 > `LIVE_VALUE_REQUIRE_SCORE_SYNC=true` + `LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF=0` exige marcador idéntico Altenar/Pinnacle. Para no quedarte sin señales, usa `LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF=1` o desactiva la guard con `LIVE_VALUE_REQUIRE_SCORE_SYNC=false`.
 
 > `PREMATCH_REFRESH_RECALCULATE_PINNACLE=true` fuerza recálculo de `realProb` prematch justo antes de confirmar/apostar, consultando el feed de Pinnacle. El frontend mostrará el delta instantáneo de cuota/EV/stake/probabilidad en el modal de confirmación.
+
+> Ventana híbrida recomendada para ingestas prematch: `PREMATCH_WINDOW_PRIMARY_HOURS=6` + `PREMATCH_WINDOW_PREFETCH_HOURS=6` con `PREMATCH_WINDOW_OVERLAP_MINUTES=30`. En la práctica descarga una ventana deslizante `now-30m -> now+12h`, priorizando el próximo bloque sin quedarte ciego en cambios de hora/latencia.
 
 ---
 

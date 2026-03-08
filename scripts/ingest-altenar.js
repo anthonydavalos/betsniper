@@ -3,6 +3,34 @@ import db, { initDB } from '../src/db/database.js';
 
 import { fileURLToPath } from 'url';
 
+const parsePositiveNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const getPrematchHybridWindow = () => {
+  const now = new Date();
+  const primaryHours = parsePositiveNumber(process.env.PREMATCH_WINDOW_PRIMARY_HOURS, 6);
+  const prefetchHours = parsePositiveNumber(process.env.PREMATCH_WINDOW_PREFETCH_HOURS, 6);
+  const overlapMinutes = parsePositiveNumber(process.env.PREMATCH_WINDOW_OVERLAP_MINUTES, 30);
+  const totalHours = primaryHours + prefetchHours;
+
+  const startDate = new Date(now.getTime() - (overlapMinutes * 60 * 1000));
+  const primaryEndDate = new Date(now.getTime() + (primaryHours * 60 * 60 * 1000));
+  const finalEndDate = new Date(now.getTime() + (totalHours * 60 * 60 * 1000));
+
+  return {
+    now,
+    startDate,
+    primaryEndDate,
+    endDate: finalEndDate,
+    overlapMinutes,
+    primaryHours,
+    prefetchHours,
+    totalHours
+  };
+};
+
 export const ingestAltenarPrematch = async (force = false) => {
   await initDB();
 
@@ -23,26 +51,14 @@ export const ingestAltenarPrematch = async (force = false) => {
   console.log(`🚀 INICIANDO INGESTA MASIVA PRE-MATCH ALTENAR (${activeIntegration})...`);
 
   try {
-    // Calcular rango de fechas (SOLO HOY para optimizar tráfico)
-    const now = new Date();
-    
-    // --- HORIZONTE DINÁMICO (Estrategia AM/PM) ---
-    const peruTime = new Date().toLocaleString("en-US", { timeZone: "America/Lima" });
-    const currentHourPeru = new Date(peruTime).getHours();
-    
-    // CAMBIO A 6 PM (18:00)
-    const endDate = new Date();
-    if (currentHourPeru >= 18) {
-        // Noche: Buscar hasta fin de MAÑANA
-        endDate.setDate(endDate.getDate() + 1);
-        console.log(`🕒 Modo Noche (${currentHourPeru}:00 PE): Extendiendo Altenar hasta mañana.`);
-    } else {
-        // Día: Solo HOY
-        console.log(`🕒 Modo Operativo (${currentHourPeru}:00 PE): Altenar solo hoy.`);
-    }
-    endDate.setHours(23, 59, 59, 999); // Final del día seleccionado
+    const windowCfg = getPrematchHybridWindow();
+    const { now, startDate, primaryEndDate, endDate } = windowCfg;
 
-    console.log(`📡 Consultando API Altenar /GetUpcoming (Hasta: ${endDate.toISOString()})...`);
+    console.log(
+      `🧭 Ventana híbrida Altenar: ${startDate.toISOString()} -> ${endDate.toISOString()} ` +
+      `(primaria +${windowCfg.primaryHours}h, precarga +${windowCfg.prefetchHours}h, overlap ${windowCfg.overlapMinutes}m).`
+    );
+    console.log(`📡 Consultando API Altenar /GetUpcoming (objetivo hasta: ${endDate.toISOString()})...`);
 
     // Re-aplicamos headers/params explícitos en ESTA llamada para reforzar comportamiento anti-bot,
     // pero tomados del perfil activo del axiosClient (BOOK_PROFILE / .env), NO hardcodeados.
@@ -107,10 +123,10 @@ export const ingestAltenarPrematch = async (force = false) => {
     const cleanEvents = [];
 
     for (const event of events) {
-      // 🟢 FILTRO DE FECHAS (Solo próximos 2 días)
+      // 🟢 FILTRO DE FECHAS (ventana híbrida deslizante)
       if (!event.startDate) continue;
       const eventDate = new Date(event.startDate);
-      if (eventDate < now || eventDate > endDate) continue;
+      if (eventDate < startDate || eventDate > endDate) continue;
 
       // Extract League and Country names
       const leagueName = champsMap.get(event.champId) || "Unknown League";
@@ -161,30 +177,25 @@ export const ingestAltenarPrematch = async (force = false) => {
     
     const existingEvents = db.data.altenarUpcoming || [];
     
-    // Definir límites del día de hoy
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const endOfToday = new Date();
-    endOfToday.setHours(23, 59, 59, 999);
-
     const nowMs = Date.now();
     const NEAR_LIVE_GRACE_MS = 10 * 60 * 1000;
+    const preserveStartMs = startDate.getTime() - NEAR_LIVE_GRACE_MS;
+    const preserveEndMs = endDate.getTime();
 
     const keptEvents = existingEvents.filter(oldEv => {
       const oldDate = new Date(oldEv.startDate);
       const oldTs = oldDate.getTime();
 
-      // Criterio revisado:
-      // - Solo conservar eventos de HOY que YA iniciaron o están por iniciar en <= 10 min
-      // - Evitar mantener partidos futuros removidos por GetUpcoming (ghost prematch)
-      const isToday = oldDate >= startOfToday && oldDate <= endOfToday;
+      // Conservamos eventos de la ventana activa (con un pequeño margen hacia atrás)
+      // para evitar huecos entre barridos y no resucitar ghost prematch lejanos.
+      const inHybridWindow = Number.isFinite(oldTs) && oldTs >= preserveStartMs && oldTs <= preserveEndMs;
       const isReplaced = cleanEvents.some(newEv => newEv.id === oldEv.id);
       const isNearLiveOrPast = Number.isFinite(oldTs) && oldTs <= (nowMs + NEAR_LIVE_GRACE_MS);
 
-      return isToday && isNearLiveOrPast && !isReplaced;
+      return inHybridWindow && isNearLiveOrPast && !isReplaced;
     });
 
-    console.log(`   ♻️  Preservando ${keptEvents.length} eventos Altenar previos (pasaron a Live/Recientes).`);
+    console.log(`   ♻️  Preservando ${keptEvents.length} eventos Altenar previos (ventana híbrida activa).`);
     console.log(`   🆕 Insertando/Actualizando ${cleanEvents.length} eventos frescos.`);
 
     const finalEventList = [...keptEvents, ...cleanEvents];
