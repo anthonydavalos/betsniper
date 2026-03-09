@@ -893,12 +893,19 @@ npm run token:booky:wait-close
 # 3) Capturar payloads placeWidget/betslip
 npm run capture:booky
 
-# 4) Ver salud de token y flujo seguro (sin apostar real)
+# 4) Verificar que existe captura latest (OBLIGATORIO en clone nuevo/dispositivo nuevo)
+# PowerShell / Bash (Git Bash)
+curl -sS --compressed http://localhost:3000/api/booky/capture/latest
+# Debe devolver: {"success":true,"found":true,...}
+
+# 5) Ver salud de token y flujo seguro (sin apostar real)
 npm run smoke:booky
 
-# 5) Saneo manual de activas huérfanas (si UI muestra EN JUEGO fantasma)
+# 6) Saneo manual de activas huérfanas (si UI muestra EN JUEGO fantasma)
 npm run cleanup:booky:orphans
 ```
+
+> Importante: `data/` está en `.gitignore`, por lo que `capture-*.latest.json` no viaja con Git. En cada instalación nueva debes ejecutar la captura al menos una vez.
 
 Para pruebas con envío real controlado (solo si habilitas `BOOKY_REAL_PLACEMENT_ENABLED=true`):
 
@@ -907,6 +914,15 @@ npm run smoke:booky:live
 ```
 
 > Recomendación: mantener `BOOKY_REAL_PLACEMENT_ENABLED=false` en desarrollo normal.
+
+#### Checklist rápido: activar real en 20s
+
+1. Confirma token vigente: `GET /api/booky/token-health` (sin `expired`, con minutos restantes > 2).
+2. Confirma captura lista: `GET /api/booky/capture/latest` con `found: true`.
+3. Ejecuta dry-run de la oportunidad antes de enviar real: `POST /api/booky/real/dryrun/:id`.
+4. Recién ahí habilita `BOOKY_REAL_PLACEMENT_ENABLED=true`.
+5. Mantén `BOOKY_KEEP_REAL_PLACEMENT_ON_TOKEN_REFRESH=false` para operación conservadora.
+6. Al terminar sesión, vuelve a `BOOKY_REAL_PLACEMENT_ENABLED=false`.
 
 Opciones útiles del script de saneo:
 
@@ -1424,6 +1440,8 @@ Necesario para entender qué envía el bookie cuando colocas una apuesta real (p
 
 El payload capturado se guarda en `data/booky/capture-*.json` y queda disponible en `GET /api/booky/capture/latest`.
 
+> Requisito operativo: antes de usar `/api/booky/real/*` valida que `GET /api/booky/capture/latest` devuelva `found: true`. Si devuelve `found: false`, ejecuta de nuevo `npm run capture:booky:acity` o `npm run capture:booky:dorado` según perfil.
+
 ---
 
 #### Spy de Historial y Perfil
@@ -1757,6 +1775,22 @@ npm run health:latency
 1. Cambia al perfil correcto: `npm run book:acity` o `npm run book:dorado`.
 2. Renueva token: `npm run token:booky:wait-close`.
 3. Verifica estado: `GET /api/booky/token-health`.
+
+---
+
+### Problema: "No hay captura latest disponible"
+
+**Síntoma:** al intentar `APOSTAR` o usar `/api/booky/real/*` aparece el error `No hay captura latest disponible`.
+
+**Causa:** en ese equipo no existe `data/booky/capture-<perfil>.latest.json` (normal en clones nuevos porque `data/` no se versiona).
+
+**Solución:**
+1. Verifica el perfil activo: `npm run book:acity` o `npm run book:dorado`.
+2. Ejecuta captura para ese perfil:
+  - `npm run capture:booky:acity`
+  - o `npm run capture:booky:dorado`
+3. Confirma que existe latest: `GET /api/booky/capture/latest` debe devolver `found: true`.
+4. Reintenta el flujo de apuesta.
 
 ---
 

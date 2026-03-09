@@ -774,7 +774,11 @@ const prepareRealPlacementDraftInternal = async (ticketId, options = {}) => {
   }
 
   const capture = await getLatestBookyCaptureRaw();
-  if (!capture) throw new Error('No hay captura latest disponible.');
+  if (!capture) {
+    const profile = (process.env.BOOK_PROFILE || 'doradobet').toLowerCase();
+    const hint = getCaptureCommandForProfile(profile);
+    throw new Error(`No hay captura latest disponible para perfil ${profile}. Ejecuta: ${hint}`);
+  }
 
   const template = getPlaceWidgetTemplateFromCapture(capture);
   if (!template) throw new Error('No se encontró template placeWidget en la captura latest.');
@@ -1011,6 +1015,13 @@ const getLatestBookyCaptureRaw = async () => {
   const latestPath = path.join(projectRoot, 'data', 'booky', `capture-${profile}.latest.json`);
   if (!fs.existsSync(latestPath)) return null;
   return JSON.parse(fs.readFileSync(latestPath, 'utf8'));
+};
+
+const getCaptureCommandForProfile = (profile = '') => {
+  const normalized = String(profile || '').toLowerCase();
+  if (normalized === 'acity') return 'npm run capture:booky:acity';
+  if (normalized === 'doradobet' || normalized === 'dorado') return 'npm run capture:booky:dorado';
+  return 'npm run capture:booky';
 };
 
 const archiveUncertainRealPlacement = async ({ idx, ticket, draft, fastMode = false, error }) => {

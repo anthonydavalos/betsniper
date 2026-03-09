@@ -24,6 +24,13 @@ const PINNACLE_PROFILE_DIR = process.env.PINNACLE_CHROME_PROFILE_DIR
         : path.join(projectRoot, process.env.PINNACLE_CHROME_PROFILE_DIR))
     : DEFAULT_SHARED_BOOKY_PROFILE_DIR;
 
+function ensureDirForFile(filePath) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+}
+
 class PinnacleGateway {
     constructor() {
         this.browser = null;
@@ -201,6 +208,7 @@ class PinnacleGateway {
                         updatedAt: new Date().toISOString()
                     };
 
+                    ensureDirForFile(TOKEN_FILE);
                     fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData, null, 2));
                     console.log("💾 Token actualizado en disco... (Sigue navegando/logueándote)");
                     this.sessionDetected = true;
@@ -463,6 +471,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 
         // 2. Create Lock and Start
         try {
+            ensureDirForFile(LOCK_FILE);
             fs.writeFileSync(LOCK_FILE, Date.now().toString());
             
             const gateway = new PinnacleGateway();
