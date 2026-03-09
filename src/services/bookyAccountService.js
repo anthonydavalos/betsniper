@@ -899,7 +899,14 @@ const mapRemoteHistoryItem = (entry = {}, integrationKey = null) => {
 const getCachedRemoteHistory = (limit = 60, profileKey = null) => {
   const key = normalizeBookProfile(profileKey || getActiveProfileContext().key);
   const profileStore = getProfileStore(key, false) || {};
-  const cache = profileStore.remoteHistory || db.data?.booky?.remoteHistory || {};
+  const profileCache = profileStore.remoteHistory || {};
+  const legacyCache = db.data?.booky?.remoteHistory || {};
+  const legacySource = normalizeBookProfile(String(legacyCache?.source || '').trim());
+
+  // Evita mezclar historial de otro perfil cuando no hay token/sync remoto.
+  const cache = (Array.isArray(profileCache.items) && profileCache.items.length > 0)
+    ? profileCache
+    : (legacySource && legacySource === key ? legacyCache : profileCache);
   const items = Array.isArray(cache.items) ? cache.items : [];
   const updatedAt = cache.updatedAt || null;
   const max = Number.isFinite(Number(limit))
@@ -1649,7 +1656,14 @@ const requestProviderBalance = async (auth) => {
 
 const getCachedDbBalance = (profileKey = null) => {
   const key = normalizeBookProfile(profileKey || getActiveProfileContext().key);
-  const account = getProfileStore(key, false)?.account || db.data?.booky?.account || {};
+  const profileAccount = getProfileStore(key, false)?.account || {};
+  const legacyAccount = db.data?.booky?.account || {};
+  const legacySource = normalizeBookProfile(String(legacyAccount?.source || '').trim());
+
+  // Evita usar balance legacy de otro perfil (ej: doradobet mostrado en acity).
+  const account = Number.isFinite(Number(profileAccount?.amount))
+    ? profileAccount
+    : (legacySource && legacySource === key ? legacyAccount : {});
   const amount = safeNumber(account.amount, NaN);
   if (!Number.isFinite(amount)) return null;
 
@@ -2258,7 +2272,8 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
   const pnlByBalance = hasBalanceAnchoredPnl
     ? Number((balanceAmount - pnlBase.amount).toFixed(2))
     : null;
-  const pnlNetAfterOpenStake = Number.isFinite(pnlByBalance) ? pnlByBalance : pnlHistoryNet;
+  // Si no hay base capital anclada, usamos caja neta del historial (realizado - stake abierto).
+  const pnlNetAfterOpenStake = Number.isFinite(pnlByBalance) ? pnlByBalance : pnlCashAfterOpenStake;
   const pnlSource = 'profile-history-extended-db';
 
   const profile = ctx.profile;
