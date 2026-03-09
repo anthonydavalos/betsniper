@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
 import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
 
@@ -19,10 +20,12 @@ const LEAGUE_MISS_LOG_THROTTLE_MS = 5 * 60 * 1000;
 const BOOKY_SETTLED_PROVIDER_STATUSES = new Set([1, 2, 4, 8, 18]);
 const DEFAULT_ORPHAN_ACTIVE_GRACE_MS = 2 * 60 * 1000;
 const DEFAULT_ORPHAN_ACTIVE_HARD_MAX_MS = 20 * 60 * 1000;
+const TOKEN_RENEW_COOLDOWN_MS = 15000;
 
 const memoryBalanceCacheByProfile = new Map();
 const memoryHistoryCacheByProfile = new Map();
 const lastLeagueMissLogByProfile = new Map();
+let lastSyncTokenRenewLaunchAt = 0;
 
 const nowIso = () => new Date().toISOString();
 
@@ -318,6 +321,154 @@ const getActiveAuthHeader = () => {
   const token = getRuntimeEnvValue('ALTENAR_BOOKY_AUTH_TOKEN', '');
   if (!token) return null;
   return token.toLowerCase().startsWith('bearer ') ? token : `Bearer ${token}`;
+};
+
+const decodeJwtPayload = (jwt = '') => {
+  const parts = String(jwt).split('.');
+  if (parts.length < 2) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    const parsed = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+};
+
+const getSyncTokenHealth = () => {
+  const auth = getActiveAuthHeader();
+  if (!auth) {
+    return {
+      exists: false,
+      jwtValid: false,
+      expIso: null,
+      remainingMinutes: null,
+      expired: true
+    };
+  }
+
+  const raw = auth.replace(/^Bearer\s+/i, '').trim();
+  const payload = decodeJwtPayload(raw);
+  const jwtValid = Boolean(payload);
+  const expUnix = Number(payload?.exp);
+
+  if (!Number.isFinite(expUnix)) {
+    return {
+      exists: true,
+      jwtValid,
+      expIso: null,
+      remainingMinutes: null,
+      expired: true
+    };
+  }
+
+  const expMs = expUnix * 1000;
+  const remainingMinutes = Number(((expMs - Date.now()) / 60000).toFixed(2));
+  return {
+    exists: true,
+    jwtValid,
+    expIso: new Date(expMs).toISOString(),
+    remainingMinutes,
+    expired: remainingMinutes <= 0
+  };
+};
+
+const isSyncTokenAutoRefreshEnabled = () => {
+  return getRuntimeEnvValue('BOOKY_AUTO_TOKEN_REFRESH_SYNC_ENABLED', 'false').toLowerCase() === 'true';
+};
+
+const getSyncTokenMinRemainingMinutes = () => {
+  const raw = Number(
+    getRuntimeEnvValue(
+      'BOOKY_SYNC_TOKEN_MIN_REMAINING_MINUTES',
+      getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', '2')
+    )
+  );
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+};
+
+const triggerSyncTokenRenewal = () => {
+  const now = Date.now();
+  const elapsed = now - lastSyncTokenRenewLaunchAt;
+  const profile = getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase();
+  const renewalCommand = `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${profile}`;
+
+  if (lastSyncTokenRenewLaunchAt > 0 && elapsed < TOKEN_RENEW_COOLDOWN_MS) {
+    return {
+      triggered: false,
+      busy: true,
+      profile,
+      renewalCommand,
+      retryAfterSeconds: Math.max(1, Math.ceil((TOKEN_RENEW_COOLDOWN_MS - elapsed) / 1000))
+    };
+  }
+
+  const scriptPath = path.join(projectRoot, 'scripts', 'extract-booky-auth-token.js');
+  const args = ['--headed', '--wait-close', `--require-profile=${profile}`];
+
+  try {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      cwd: projectRoot,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false,
+      env: {
+        ...process.env,
+        ...readRuntimeEnv()
+      }
+    });
+    child.unref();
+    lastSyncTokenRenewLaunchAt = now;
+    return {
+      triggered: true,
+      busy: false,
+      profile,
+      renewalCommand,
+      retryAfterSeconds: 0
+    };
+  } catch (_) {
+    return {
+      triggered: false,
+      busy: false,
+      profile,
+      renewalCommand,
+      retryAfterSeconds: 0
+    };
+  }
+};
+
+const maybeAutoRefreshSyncToken = ({ reason = 'unknown' } = {}) => {
+  const enabled = isSyncTokenAutoRefreshEnabled();
+  const health = getSyncTokenHealth();
+  const minRemaining = getSyncTokenMinRemainingMinutes();
+  const lowRemaining = Number.isFinite(health.remainingMinutes) && health.remainingMinutes < minRemaining;
+  const mustRenew = !health.exists || !health.jwtValid || health.expired || lowRemaining || reason === 'provider-401-403';
+
+  if (!enabled || !mustRenew) {
+    return {
+      enabled,
+      mustRenew,
+      triggered: false,
+      health,
+      reason,
+      minRemaining,
+      renewalCommand: null
+    };
+  }
+
+  const renewal = triggerSyncTokenRenewal();
+  return {
+    enabled,
+    mustRenew,
+    triggered: renewal.triggered,
+    busy: renewal.busy,
+    health,
+    reason,
+    minRemaining,
+    renewalCommand: renewal.renewalCommand,
+    retryAfterSeconds: renewal.retryAfterSeconds
+  };
 };
 
 const ensureBookyStore = () => {
@@ -1508,10 +1659,15 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
 
   const auth = getActiveAuthHeader();
   if (!auth) {
+    const renewal = maybeAutoRefreshSyncToken({ reason: 'missing-token' });
+    const suffix = renewal.triggered
+      ? ' Se lanzó auto-renovación interactiva de token.'
+      : '';
     return {
       ...cached,
       source: 'cache-no-token',
-      error: 'Sin ALTENAR_BOOKY_AUTH_TOKEN para sincronizar historial remoto.'
+      error: `Sin ALTENAR_BOOKY_AUTH_TOKEN para sincronizar historial remoto.${suffix}`,
+      tokenRenewal: renewal
     };
   }
 
@@ -1598,10 +1754,16 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
       items: max === null ? normalized.items : normalized.items.slice(0, max)
     };
   } catch (error) {
+    const status = Number(error?.response?.status || 0);
+    const renewal = (status === 401 || status === 403)
+      ? maybeAutoRefreshSyncToken({ reason: 'provider-401-403' })
+      : null;
+    const suffix = renewal?.triggered ? ' Se lanzó auto-renovación interactiva de token.' : '';
     return {
       ...cached,
       source: cached.items?.length ? 'cache-fallback' : 'unavailable',
-      error: error?.message || 'Fallo sincronizando historial remoto de Booky.'
+      error: `${error?.message || 'Fallo sincronizando historial remoto de Booky.'}${suffix}`,
+      tokenRenewal: renewal
     };
   }
 };
@@ -1708,6 +1870,10 @@ export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = nul
 
   const auth = getActiveAuthHeader();
   if (!auth) {
+    const renewal = maybeAutoRefreshSyncToken({ reason: 'missing-token' });
+    const suffix = renewal.triggered
+      ? ' Se lanzó auto-renovación interactiva de token.'
+      : '';
     return {
       ...(cached || {
         amount: null,
@@ -1716,7 +1882,8 @@ export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = nul
         source: 'unavailable',
         stale: true
       }),
-      error: 'Sin ALTENAR_BOOKY_AUTH_TOKEN para consultar balance real.'
+      error: `Sin ALTENAR_BOOKY_AUTH_TOKEN para consultar balance real.${suffix}`,
+      tokenRenewal: renewal
     };
   }
 
@@ -1754,6 +1921,11 @@ export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = nul
 
     return normalized;
   } catch (error) {
+    const status = Number(error?.response?.status || 0);
+    const renewal = (status === 401 || status === 403)
+      ? maybeAutoRefreshSyncToken({ reason: 'provider-401-403' })
+      : null;
+    const suffix = renewal?.triggered ? ' Se lanzó auto-renovación interactiva de token.' : '';
     return {
       ...(cached || {
         amount: null,
@@ -1762,7 +1934,8 @@ export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = nul
         source: 'unavailable',
         stale: true
       }),
-      error: error?.message || 'Fallo consultando balance real en provider.'
+      error: `${error?.message || 'Fallo consultando balance real en provider.'}${suffix}`,
+      tokenRenewal: renewal
     };
   }
 };
