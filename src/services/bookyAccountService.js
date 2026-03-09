@@ -2288,14 +2288,21 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
   };
 };
 
-export const getKellyBankrollBase = async () => {
-  await initDB();
-  await db.read();
+export const getKellyBankrollBase = async ({ skipDbRefresh = false, useCachedOnly = false } = {}) => {
+  if (!skipDbRefresh) {
+    await initDB();
+    await db.read();
+  } else if (!db.data) {
+    // Si el llamador pide no refrescar, al menos aseguramos estructura cargada.
+    await initDB();
+  }
   ensureBookyStore();
   const ctx = getActiveProfileContext();
   const baseMode = getKellyBaseMode();
 
-  const real = await fetchBookyBalance({ forceRefresh: false });
+  const real = useCachedOnly
+    ? getCachedDbBalance(ctx.key)
+    : await fetchBookyBalance({ forceRefresh: false });
   const realAmount = safeNumber(real?.amount, NaN);
   if (Number.isFinite(realAmount) && realAmount > 0) {
     if (baseMode === 'NAV') {

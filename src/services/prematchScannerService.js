@@ -501,7 +501,10 @@ export const scanPrematchOpportunities = async () => {
             return { p1: i1 / sum, p2: i2 / sum };
         };
 
-        const bankrollBase = await getKellyBankrollBase();
+        const bankrollBase = await getKellyBankrollBase({
+            skipDbRefresh: true,
+            useCachedOnly: true
+        });
         const currentBankroll = bankrollBase.amount;
 
         // 2. Iterar sobre Pinnacle (SOLO VÁLIDOS FUTUROS)
