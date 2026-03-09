@@ -346,6 +346,15 @@ export const ingestPinnaclePrematch = async (force = false, options = {}) => {
     console.log(`   ♻️  Preservando ${keptMatches.length} partidos previos de ventana híbrida.`);
     console.log(`   🆕 Insertando/Actualizando ${refinedMatches.length} partidos frescos desde API.`);
 
+    // Guard anti-vaciado: si Pinnacle no devolvió partidos frescos (p. ej. mantenimiento/rate-limit),
+    // no pisamos la cache local con 0 y mantenemos los datos previos para que el matcher no quede ciego.
+    if (refinedMatches.length === 0 && existingMatchesFinal.length > 0) {
+        console.warn('⚠️ Ingesta Pinnacle sin partidos frescos. Se conserva upcomingMatches actual para evitar wipe por outage temporal.');
+        db.data.lastUpdate = new Date().toISOString();
+        await writeDBWithRetry({ maxAttempts: 8, baseDelayMs: 140 });
+        return;
+    }
+
     // 3. Fusionar Listas
     const finalMatchList = [...keptMatches, ...refinedMatches];
     
