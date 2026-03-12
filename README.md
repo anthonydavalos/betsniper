@@ -1807,6 +1807,22 @@ npm run health:latency
 
 ---
 
+### Problema: "placeWidget rechazó la apuesta (HTTP 4xx/5xx)"
+
+**Síntoma:** respuesta `BOOKY_REAL_PLACEMENT_REJECTED` o `BOOKY_PLACEWIDGET_REJECTED`.
+
+**Dónde auditar:**
+1. `db.json` → `booky.history[]` con `status=REAL_REJECTED` o `REAL_REJECTED_FAST`.
+2. Dentro del ticket, revisar `realPlacement.diagnostic`:
+3. `providerStatus`, `providerCode`, `providerMessage`, `providerBody`, `requestId`.
+
+**Acción recomendada:**
+1. Verificar si el mercado sigue abierto y si la cuota cambió.
+2. Validar token y perfil (`/api/booky/token-health`, `BOOK_PROFILE`, `ALTENAR_INTEGRATION`).
+3. Ejecutar `POST /api/booky/real/dryrun/:id` antes de reintentar con nuevo ticket.
+
+---
+
 ## 🗺️ Roadmap
 
 ### V3.1 (Q1 2026)

@@ -541,7 +541,14 @@ const isTransientProviderError = (error) => {
   const status = Number(error?.response?.status || 0);
   const code = String(error?.code || '').toUpperCase();
   if (status >= 500) return true;
-  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'ENOTFOUND') return true;
+  if (
+    code === 'ECONNABORTED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    code === 'ENOTFOUND' ||
+    code === 'EAI_AGAIN' ||
+    code === 'ERR_NETWORK'
+  ) return true;
   return false;
 };
 
@@ -567,6 +574,7 @@ const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = fals
       if (!hasAcceptedBets) {
         const statusCode = Number(response?.status) || 409;
         const providerError = body?.error || null;
+        const headers = pickResponseHeaders(response?.headers || {});
 
         throw createBookyError(
           providerError
@@ -580,6 +588,11 @@ const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = fals
               requestId: draft?.payload?.requestId || null,
               endpoint: draft?.endpoint || null,
               fastMode,
+              providerStatus: statusCode,
+              providerCode: null,
+              providerMessage: providerError || 'Response without accepted bets.',
+              providerHeaders: headers,
+              providerBody: body,
               providerError,
               responseHasBets: hasAcceptedBets,
               observedAt: nowIso()
@@ -1041,6 +1054,27 @@ const archiveUncertainRealPlacement = async ({ idx, ticket, draft, fastMode = fa
   await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
 };
 
+const archiveRejectedRealPlacement = async ({ idx, ticket, draft, fastMode = false, error }) => {
+  ticket.status = fastMode ? 'REAL_REJECTED_FAST' : 'REAL_REJECTED';
+  ticket.updatedAt = nowIso();
+  ticket.realPlacement = {
+    placedAt: nowIso(),
+    endpoint: draft?.endpoint || PLACE_WIDGET_URL,
+    requestId: draft?.payload?.requestId || null,
+    fastMode,
+    rejected: true,
+    diagnostic: error?.diagnostic || {
+      providerMessage: error?.message || null,
+      providerCode: error?.code || null,
+      observedAt: nowIso()
+    }
+  };
+
+  db.data.booky.history.push(ticket);
+  db.data.booky.pendingTickets.splice(idx, 1);
+  await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
+};
+
 const extractAcceptedPlacementMeta = (providerResponse = {}) => {
   const bet = Array.isArray(providerResponse?.bets) ? providerResponse.bets[0] : null;
   const selection = Array.isArray(bet?.selections) ? bet.selections[0] : null;
@@ -1154,7 +1188,14 @@ export const confirmRealPlacement = async (ticketId) => {
     lookup = getTicketById(ticketId);
   } catch (_) {
     const recovered = findBookyHistoryTicketById(ticketId);
-    if (recovered && (recovered.status === 'REAL_CONFIRMED' || recovered.status === 'REAL_CONFIRMED_FAST')) {
+    if (recovered && (
+      recovered.status === 'REAL_CONFIRMED' ||
+      recovered.status === 'REAL_CONFIRMED_FAST' ||
+      recovered.status === 'REAL_REJECTED' ||
+      recovered.status === 'REAL_REJECTED_FAST' ||
+      recovered.status === 'REAL_CONFIRMATION_UNKNOWN' ||
+      recovered.status === 'REAL_CONFIRMATION_UNKNOWN_FAST'
+    )) {
       return {
         ticket: recovered,
         mirroredBet: null,
@@ -1194,6 +1235,24 @@ export const confirmRealPlacement = async (ticketId) => {
         }
       );
     }
+
+    if (error?.code === 'BOOKY_PLACEWIDGET_REJECTED') {
+      await archiveRejectedRealPlacement({ idx, ticket, draft, fastMode: false, error });
+      throw createBookyError(
+        'Apuesta real rechazada por provider. Se archivó en historial para auditoría.',
+        {
+          statusCode: Number(error?.statusCode) || 409,
+          code: 'BOOKY_REAL_PLACEMENT_REJECTED',
+          diagnostic: {
+            ...(error?.diagnostic || {}),
+            ticketId,
+            requestId: draft?.payload?.requestId || null,
+            archivedStatus: 'REAL_REJECTED'
+          }
+        }
+      );
+    }
+
     throw error;
   }
 
@@ -1257,7 +1316,14 @@ export const confirmRealPlacementFast = async (ticketId) => {
     lookup = getTicketById(ticketId);
   } catch (_) {
     const recovered = findBookyHistoryTicketById(ticketId);
-    if (recovered && (recovered.status === 'REAL_CONFIRMED' || recovered.status === 'REAL_CONFIRMED_FAST')) {
+    if (recovered && (
+      recovered.status === 'REAL_CONFIRMED' ||
+      recovered.status === 'REAL_CONFIRMED_FAST' ||
+      recovered.status === 'REAL_REJECTED' ||
+      recovered.status === 'REAL_REJECTED_FAST' ||
+      recovered.status === 'REAL_CONFIRMATION_UNKNOWN' ||
+      recovered.status === 'REAL_CONFIRMATION_UNKNOWN_FAST'
+    )) {
       return {
         ticket: recovered,
         mirroredBet: null,
@@ -1297,6 +1363,24 @@ export const confirmRealPlacementFast = async (ticketId) => {
         }
       );
     }
+
+    if (error?.code === 'BOOKY_PLACEWIDGET_REJECTED') {
+      await archiveRejectedRealPlacement({ idx, ticket, draft, fastMode: true, error });
+      throw createBookyError(
+        'Apuesta real rechazada por provider. Se archivó en historial para auditoría.',
+        {
+          statusCode: Number(error?.statusCode) || 409,
+          code: 'BOOKY_REAL_PLACEMENT_REJECTED',
+          diagnostic: {
+            ...(error?.diagnostic || {}),
+            ticketId,
+            requestId: draft?.payload?.requestId || null,
+            archivedStatus: 'REAL_REJECTED_FAST'
+          }
+        }
+      );
+    }
+
     throw error;
   }
 

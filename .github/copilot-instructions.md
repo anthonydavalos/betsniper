@@ -81,8 +81,9 @@ Cuando se trabaja en el flujo de apuesta real (`src/services/bookySemiAutoServic
     - EV del ticket ≥ `BOOKY_MIN_EV_PERCENT`.
     - Drop máximo de cuota desde el snapshot ≤ `BOOKY_MAX_ODD_DROP` (protege ante cuota antigua).
 4.  **ESTADO INCIERTO:** Si el request a `placeWidget` devuelve timeout/error de red SIN confirmación, llamar a `archiveUncertainRealPlacement()`. **NUNCA reintentar ciegamente.** Primero verificar via `GET /api/booky/account?refresh=1` si la apuesta ya existe.
-5.  **PERFIL ANTES DE TOKEN:** El perfil (`BOOK_PROFILE`, `ALTENAR_INTEGRATION`, `ALTENAR_ORIGIN`) debe estar correcto ANTES de extraer el JWT. Usa `npm run book:dorado` o `npm run book:acity` primero, luego `npm run token:booky:wait-close`.
-6.  **BASE KELLEY:** El stake real se calcula sobre `getKellyBankrollBase()` que tiene 3 niveles de fallback: balance real `booky-real` → `portfolio` → `config.bankroll`. Nunca hardcodear el NAV.
+5.  **RECHAZO AUDITABLE:** Si `placeWidget` responde rechazo definitivo (`BOOKY_PLACEWIDGET_REJECTED`), archivar siempre en historial con `archiveRejectedRealPlacement()` y estado `REAL_REJECTED`/`REAL_REJECTED_FAST`, incluyendo `realPlacement.diagnostic` (status/code/body/requestId).
+6.  **PERFIL ANTES DE TOKEN:** El perfil (`BOOK_PROFILE`, `ALTENAR_INTEGRATION`, `ALTENAR_ORIGIN`) debe estar correcto ANTES de extraer el JWT. Usa `npm run book:dorado` o `npm run book:acity` primero, luego `npm run token:booky:wait-close`.
+7.  **BASE KELLEY:** El stake real se calcula sobre `getKellyBankrollBase()` que tiene 3 niveles de fallback: balance real `booky-real` → `portfolio` → `config.bankroll`. Nunca hardcodear el NAV.
 
 ## 8. OPERACIÓN EN ALTA CARGA (SÁBADOS)
 
