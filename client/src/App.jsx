@@ -581,6 +581,7 @@ function App() {
     });
     const [tokenHealth, setTokenHealth] = useState(null);
     const [kellyDiagnostics, setKellyDiagnostics] = useState(null);
+    const [tokenClockMs, setTokenClockMs] = useState(() => Date.now());
   
   const [loading, setLoading] = useState(false);
   
@@ -612,10 +613,15 @@ function App() {
     const blockedBetIdsRef = useRef(new Set());
     const remoteOpenBetIdsRef = useRef(new Set());
     const remoteOpenEventIdsRef = useRef(new Set());
+    const autoTokenRenewInFlightRef = useRef(false);
+    const lastSilentTokenRenewAttemptAtRef = useRef(0);
 
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
     const BOOKY_HISTORY_LIMIT = 120;
+    const TOKEN_CLOCK_TICK_MS = 1000;
+    const TOKEN_AUTO_RENEW_COOLDOWN_MS = 45000;
+    const TOKEN_AUTO_RENEW_LEAD_MINUTES = 1;
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
   const localDiscardedIdsRef = useRef(new Set());
@@ -1155,6 +1161,56 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const clockInterval = setInterval(() => {
+        setTokenClockMs(Date.now());
+    }, TOKEN_CLOCK_TICK_MS);
+
+    return () => clearInterval(clockInterval);
+  }, []);
+
+  useEffect(() => {
+      const shouldAutoRenew = Boolean(
+          tokenHealth?.autoRefreshEnabled &&
+          tokenHealth &&
+          !hasEnoughTokenLife(tokenHealth)
+      );
+
+      if (!shouldAutoRenew) return;
+
+      const nowMs = Date.now();
+      const elapsed = nowMs - Number(lastSilentTokenRenewAttemptAtRef.current || 0);
+      if (autoTokenRenewInFlightRef.current || elapsed < TOKEN_AUTO_RENEW_COOLDOWN_MS) return;
+
+      autoTokenRenewInFlightRef.current = true;
+      lastSilentTokenRenewAttemptAtRef.current = nowMs;
+      setTokenRenewing(true);
+
+      axios.post('/api/booky/token/renew', undefined, { timeout: 3500 })
+          .then(async (renewRes) => {
+              if (!(renewRes?.data?.success && renewRes?.data?.started)) return;
+
+              for (let i = 0; i < 12; i += 1) {
+                  await new Promise(resolve => setTimeout(resolve, 1500));
+                  try {
+                      const tokenRes = await axios.get('/api/booky/token-health', { timeout: 3500 });
+                      if (tokenRes?.data?.success) {
+                          setTokenHealth(tokenRes.data.token);
+                          if (hasEnoughTokenLife(tokenRes.data.token)) {
+                              await fetchData({ forceBookyRefresh: true });
+                              break;
+                          }
+                      }
+                  } catch (_) {}
+              }
+          })
+          .catch(() => {})
+          .finally(() => {
+              autoTokenRenewInFlightRef.current = false;
+              setTokenRenewing(false);
+          });
+    }, [tokenHealth, tokenClockMs]);
+
     useEffect(() => {
             try {
                     localStorage.setItem('finishedSelectionView', finishedSelectionView);
@@ -1229,21 +1285,51 @@ function App() {
         ? pnlFromSnapshot
         : (Number.isFinite(pnlFromSnapshotTotal) ? pnlFromSnapshotTotal : (Number.isFinite(pnlFromSnapshotRealized) ? pnlFromSnapshotRealized : 0));
     const realBookyPnLClass = realBookyPnL >= 0 ? 'text-emerald-400' : 'text-red-400';
-    const tokenRemainingMinutes = Number(tokenHealth?.remainingMinutes);
+    const getTokenRemainingMinutes = (token = null, nowMs = Date.now()) => {
+        const expMs = new Date(token?.expIso || 0).getTime();
+        if (Number.isFinite(expMs) && expMs > 0) {
+            return Number(((expMs - nowMs) / 60000).toFixed(2));
+        }
+        const fallback = Number(token?.remainingMinutes);
+        return Number.isFinite(fallback) ? fallback : NaN;
+    };
+
+    const hasEnoughTokenLife = (token = null, nowMs = Date.now()) => {
+        const remainingMinutes = getTokenRemainingMinutes(token, nowMs);
+        const minRequiredMinutes = Number(token?.minRequiredMinutes || 2);
+        return Boolean(
+            token?.exists &&
+            token?.jwtValid &&
+            token?.authenticated &&
+            !token?.expired &&
+            Number.isFinite(remainingMinutes) &&
+            remainingMinutes >= minRequiredMinutes
+        );
+    };
+
+    const tokenRemainingMinutes = getTokenRemainingMinutes(tokenHealth, tokenClockMs);
+    const tokenMinRequiredMinutes = Number(tokenHealth?.minRequiredMinutes || 2);
+    const tokenAutoRenewThresholdMinutes = tokenMinRequiredMinutes + TOKEN_AUTO_RENEW_LEAD_MINUTES;
+    const tokenAutoRefreshEnabled = Boolean(tokenHealth?.autoRefreshEnabled);
+    const silentRenewElapsedMs = tokenClockMs - Number(lastSilentTokenRenewAttemptAtRef.current || 0);
+    const silentRenewCooldownRemainingSec = Math.max(0, Math.ceil((TOKEN_AUTO_RENEW_COOLDOWN_MS - silentRenewElapsedMs) / 1000));
+    const silentRenewCooldownActive = Boolean(
+        tokenAutoRefreshEnabled &&
+        Number(lastSilentTokenRenewAttemptAtRef.current || 0) > 0 &&
+        silentRenewCooldownRemainingSec > 0
+    );
+    const tokenNearAutoRenewWindow = Boolean(
+        tokenAutoRefreshEnabled &&
+        Number.isFinite(tokenRemainingMinutes) &&
+        tokenRemainingMinutes <= tokenAutoRenewThresholdMinutes
+    );
     const tokenProfile = String(tokenHealth?.profile || tokenHealth?.integration || '').toLowerCase();
     const tokenRenewCommand = tokenProfile === 'acity'
             ? 'npm run token:booky:acity:wait-close'
             : tokenProfile === 'doradobet'
                     ? 'npm run token:booky:dorado:wait-close'
                     : (tokenHealth?.renewalCommand || 'npm run token:booky:wait-close');
-    const tokenHealthy = Boolean(
-            tokenHealth?.exists &&
-            tokenHealth?.jwtValid &&
-            tokenHealth?.authenticated &&
-            !tokenHealth?.expired &&
-            Number.isFinite(tokenRemainingMinutes) &&
-            tokenRemainingMinutes >= Number(tokenHealth?.minRequiredMinutes || 2)
-    );
+    const tokenHealthy = hasEnoughTokenLife(tokenHealth, tokenClockMs);
         const kellyBaseAmount = Number(kellyDiagnostics?.bankrollBase?.amount);
         const kellyBaseCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
         const kellyBaseMode = String(kellyDiagnostics?.bankrollBase?.baseMode || '--').toUpperCase();
@@ -1312,22 +1398,13 @@ function App() {
 
       if (launched) {
           (async () => {
-              const isHealthyToken = (token = null) => Boolean(
-                  token?.exists &&
-                  token?.jwtValid &&
-                  token?.authenticated &&
-                  !token?.expired &&
-                  Number.isFinite(Number(token?.remainingMinutes)) &&
-                  Number(token?.remainingMinutes) >= Number(token?.minRequiredMinutes || 2)
-              );
-
               for (let i = 0; i < 12; i += 1) {
                   await new Promise(resolve => setTimeout(resolve, 1500));
                   try {
                       const tokenRes = await axios.get('/api/booky/token-health', { timeout: 3500 });
                       if (tokenRes?.data?.success) {
                           setTokenHealth(tokenRes.data.token);
-                          if (isHealthyToken(tokenRes.data.token)) {
+                          if (hasEnoughTokenLife(tokenRes.data.token)) {
                               await fetchData({ forceBookyRefresh: true });
                               break;
                           }
@@ -1441,8 +1518,14 @@ function App() {
         const token = tokenRes?.data?.token;
         const tokenCheckAvailable = Boolean(tokenRes?.data?.success);
 
-        if (tokenCheckAvailable && (!token?.authenticated || token?.expired)) {
-            const reason = token?.expired ? 'token vencido' : 'token no autenticado';
+        if (tokenCheckAvailable && !hasEnoughTokenLife(token)) {
+            const liveTokenMins = getTokenRemainingMinutes(token);
+            const minRequiredMins = Number(token?.minRequiredMinutes || 2);
+            const reason = !token?.authenticated
+                ? 'token no autenticado'
+                : (token?.expired
+                    ? 'token vencido'
+                    : `token por vencer (${liveTokenMins.toFixed(1)} min < ${minRequiredMins.toFixed(1)} min requeridos)`);
             await axios.post(`/api/booky/cancel/${ticket.id}`).catch(() => {});
             alert(`⚠️ No se puede apostar en Booky: ${reason}. Renueva token y reintenta.`);
             localPlacedBetIdsRef.current.delete(id);
@@ -1486,7 +1569,7 @@ function App() {
         const stakeDeltaLine = showDelta(oldStake, stake, 2);
         const evDeltaLine = showDelta(oldEv, ev, 2);
         const probDeltaLine = showDelta(oldRealProb, realProb, 2);
-        const tokenMins = Number(token?.remainingMinutes || 0);
+        const tokenMins = getTokenRemainingMinutes(token);
         const tokenLine = tokenCheckAvailable
             ? `Token restante: ${tokenMins.toFixed(1)} min\n\n`
             : 'Token: verificación rápida no disponible (se validará al confirmar)\n\n';
@@ -2298,6 +2381,16 @@ function App() {
                             <div className={`text-xl font-mono font-bold leading-none ${tokenHealthy ? 'text-emerald-400' : 'text-amber-400'}`}>
                                 {Number.isFinite(tokenRemainingMinutes) ? tokenRemainingMinutes.toFixed(1) : '--'} <span className="text-[10px] font-sans text-slate-500 font-normal">min</span>
                             </div>
+                            {tokenRenewing && (
+                                <div className="mt-1 text-[9px] font-bold uppercase tracking-wide text-blue-300 bg-blue-500/15 border border-blue-400/25 rounded px-1.5 py-0.5 w-fit">
+                                    Renovando...
+                                </div>
+                            )}
+                            {!tokenRenewing && tokenNearAutoRenewWindow && silentRenewCooldownActive && (
+                                <div className="mt-1 text-[9px] font-bold uppercase tracking-wide text-amber-300 bg-amber-500/15 border border-amber-400/25 rounded px-1.5 py-0.5 w-fit">
+                                    Renovacion en espera ({silentRenewCooldownRemainingSec}s)
+                                </div>
+                            )}
                         </div>
                         {!tokenHealthy && (
                             <button
