@@ -36,6 +36,77 @@ const targetUrl = process.env.ALTENAR_BOOKY_URL ||
 
 const profileDir = path.join(outputDir, `chrome-profile-${bookProfile}`);
 const keepRealPlacementEnabled = String(process.env.BOOKY_KEEP_REAL_PLACEMENT_ON_TOKEN_REFRESH || '').toLowerCase() === 'true';
+const username = process.env.ALTENAR_LOGIN_USERNAME || '';
+const password = process.env.ALTENAR_LOGIN_PASSWORD || '';
+
+const firstSelector = async (page, selectors = []) => {
+  for (const selector of selectors) {
+    const handle = await page.$(selector);
+    if (handle) return selector;
+  }
+  return null;
+};
+
+const tryAutoLogin = async (page) => {
+  if (!username || !password) {
+    console.log('ℹ️ ALTENAR_LOGIN_USERNAME/ALTENAR_LOGIN_PASSWORD no definidos. Login automático omitido.');
+    return false;
+  }
+
+  const userSelectors = [
+    'input[name="username"]',
+    'input[name="login"]',
+    'input[type="email"]',
+    'input[autocomplete="username"]',
+    'input[id*="user"]',
+    'input[id*="login"]'
+  ];
+
+  const passSelectors = [
+    'input[name="password"]',
+    'input[type="password"]',
+    'input[autocomplete="current-password"]'
+  ];
+
+  const submitSelectors = [
+    'button[type="submit"]',
+    'button[id*="login"]',
+    'button[class*="login"]',
+    'button[class*="signin"]',
+    '[role="button"][id*="login"]'
+  ];
+
+  try {
+    await page.waitForTimeout?.(1000);
+    const userSelector = await firstSelector(page, userSelectors);
+    const passSelector = await firstSelector(page, passSelectors);
+
+    if (!userSelector || !passSelector) {
+      console.log('ℹ️ No se detectó formulario clásico de login. Continúa login manual si hace falta.');
+      return false;
+    }
+
+    await page.click(userSelector, { clickCount: 3 });
+    await page.type(userSelector, username, { delay: 35 });
+
+    await page.click(passSelector, { clickCount: 3 });
+    await page.type(passSelector, password, { delay: 35 });
+
+    const submitSelector = await firstSelector(page, submitSelectors);
+    if (submitSelector) {
+      await page.click(submitSelector);
+      console.log('🔐 Login automático enviado. Si hay captcha/2FA, complétalo manualmente en la ventana.');
+      return true;
+    }
+
+    await page.keyboard.press('Enter');
+    console.log('🔐 Login automático enviado con Enter.');
+    return true;
+  } catch (error) {
+    console.warn(`⚠️ Login automático parcial/fallido: ${error.message}`);
+    return false;
+  }
+};
 
 const upsertEnvKey = (content, key, value) => {
   const lines = content.split(/\r?\n/);
@@ -201,6 +272,8 @@ const run = async () => {
   try {
     await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 90000 });
   } catch (_) {}
+
+  await tryAutoLogin(page);
 
   console.log('   Esperando request Altenar con Authorization...');
 
