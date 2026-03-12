@@ -1813,6 +1813,8 @@ Implementar funciones puras en `mathUtils.js` basadas en "Simultaneous Kelly Bet
 
 **Estado Incierto:** Si `placeWidget` devuelve timeout sin confirmación → `archiveUncertainRealPlacement()`. Verificar via `GET /api/booky/account?refresh=1` antes de reintentar.
 
+**Rechazo Auditable:** Si `placeWidget` devuelve rechazo definitivo (`BOOKY_PLACEWIDGET_REJECTED`) → `archiveRejectedRealPlacement()` con estado `REAL_REJECTED`/`REAL_REJECTED_FAST` en `booky.history`, persistiendo `realPlacement.diagnostic` (providerStatus, providerCode, providerMessage, providerBody, requestId) para post-mortem.
+
 **Base de Bankroll Kelly (3 niveles de fallback):**
 ```
 getKellyBankrollBase() → booky-real (balance real Altenar)
