@@ -331,11 +331,16 @@ export const refreshOpportunity = async (opportunity) => {
         
         // Recalcular fairProb en caliente para prematch consultando Pinnacle antes de confirmar.
         // Si falla el refresh de Pinnacle, fallback a probabilidad previa de la oportunidad.
-        let fairProb = opportunity.realProb ? (opportunity.realProb / 100) : (1 / (opportunity.realPrice || opportunity.pinnaclePrice));
+        let fairProb = null;
         let fairProbSource = 'opportunity-snapshot';
         let refreshedPinnaclePrice = null;
 
-        if (PREMATCH_REFRESH_RECALCULATE_PINNACLE && isPrematchOpportunity(opportunity)) {
+        // [PRIORITIZED] 1. Si ya existe realProb guardado, usarlo directamente
+        if (Number.isFinite(Number(opportunity.realProb)) && Number(opportunity.realProb) > 0) {
+            fairProb = Number(opportunity.realProb) / 100;
+        } 
+        // 2. Si es prematch, intentar refrescar desde Pinnacle (activado o no, intentamos siempre)
+        else if (isPrematchOpportunity(opportunity)) {
             try {
                 const pinEntry = await findPinnaclePrematchEntry(opportunity);
                 const resolved = resolvePrematchFairProbFromPinnacle(opportunity, pinEntry, marketName, selectionName, totalsHint);
@@ -348,9 +353,63 @@ export const refreshOpportunity = async (opportunity) => {
                 console.warn(`⚠️ Pinnacle prematch refresh falló (${opportunity?.match}): ${pinErr.message}`);
             }
         }
+        
+        // 3. Si aún no tenemos fairProb, intentar desde pinnaclePrice snapshot
+        if (!Number.isFinite(fairProb)) {
+            const pinnacleRef = Number.isFinite(Number(opportunity.pinnaclePrice)) ? Number(opportunity.pinnaclePrice) : null;
+            const realPriceRef = Number.isFinite(Number(opportunity.realPrice)) ? Number(opportunity.realPrice) : null;
+            const refPrice = pinnacleRef || realPriceRef;
+            
+            if (refPrice && refPrice > 1) {
+                fairProb = 1 / refPrice;
+                fairProbSource = pinnacleRef ? 'pinnacle-price-snapshot' : 'real-price-snapshot';
+            }
+            // [NEW] 4. Intentar extraer desde pinnacleInfo.prematchContext si está disponible
+            else if (opportunity?.pinnacleInfo?.prematchContext) {
+                const ctx = opportunity.pinnacleInfo.prematchContext;
+                let contextOdd = null;
+                
+                if (is1x2MarketName(marketName)) {
+                    // 1x2 Context
+                    if (selectionName === 'Home' || selectionName === '1') contextOdd = ctx.home;
+                    else if (selectionName === 'Draw' || selectionName === 'X') contextOdd = ctx.draw;
+                    else if (selectionName === 'Away' || selectionName === '2') contextOdd = ctx.away;
+                    
+                    if (contextOdd && contextOdd > 1) {
+                        const allOdds = [ctx.home, ctx.draw, ctx.away].filter(o => Number.isFinite(Number(o)) && o > 0);
+                        fairProb = normalizeFairFromOdds(contextOdd, allOdds);
+                        if (fairProb) fairProbSource = 'pinnacle-context-1x2';
+                    }
+                } else if (normalizeMarketText(marketName).includes('total')) {
+                    // Totales Context (Over/Under)
+                    const targetLine = totalsHint?.line || parseTotalsHint(marketName, selectionName).line;
+                    const totals = Array.isArray(ctx.totals) ? ctx.totals : [];
+                    const lineObj = totals.find(t => !Number.isFinite(targetLine) || Math.abs(Number(t.line) - targetLine) < 0.11);
+                    
+                    if (lineObj) {
+                        const isSide = normalizeMarketText(selectionName).includes('over') || totalsHint?.side === 'over';
+                        contextOdd = isSide ? lineObj.over : lineObj.under;
+                        
+                        if (contextOdd && contextOdd > 1) {
+                            const allOdds = [lineObj.over, lineObj.under].filter(o => Number.isFinite(Number(o)) && o > 0);
+                            fairProb = normalizeFairFromOdds(contextOdd, allOdds);
+                            if (fairProb) fairProbSource = 'pinnacle-context-total';
+                        }
+                    }
+                }
+            }
+        }
 
         if (!Number.isFinite(fairProb) || fairProb <= 0 || fairProb >= 1) {
-            throw new Error('No se pudo calcular probabilidad real válida para refresh.');
+            const availableData = {
+                hasRealProb: Number.isFinite(Number(opportunity.realProb)),
+                hasPinnaclePrice: Number.isFinite(Number(opportunity.pinnaclePrice)),
+                hasRealPrice: Number.isFinite(Number(opportunity.realPrice)),
+                hasPinnacleInfo: Boolean(opportunity?.pinnacleInfo?.prematchContext),
+                market: marketName,
+                selection: selectionName
+            };
+            throw new Error(`No se pudo calcular probabilidad real válida para refresh. Datos: ${JSON.stringify(availableData)}`);
         }
         
         const newEV = (fairProb * newPrice) - 1;
