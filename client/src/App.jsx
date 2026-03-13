@@ -621,6 +621,7 @@ function App() {
     const BOOKY_HISTORY_LIMIT = 120;
     const TOKEN_CLOCK_TICK_MS = 1000;
     const TOKEN_AUTO_RENEW_COOLDOWN_MS = 45000;
+    const TOKEN_AUTO_RENEW_RETRY_ON_FAILURE_MS = 8000;
     const TOKEN_AUTO_RENEW_LEAD_MINUTES = 1;
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
@@ -1183,12 +1184,21 @@ function App() {
       if (autoTokenRenewInFlightRef.current || elapsed < TOKEN_AUTO_RENEW_COOLDOWN_MS) return;
 
       autoTokenRenewInFlightRef.current = true;
-      lastSilentTokenRenewAttemptAtRef.current = nowMs;
       setTokenRenewing(true);
 
       axios.post('/api/booky/token/renew', undefined, { timeout: 3500 })
           .then(async (renewRes) => {
-              if (!(renewRes?.data?.success && renewRes?.data?.started)) return;
+              const started = Boolean(renewRes?.data?.success && renewRes?.data?.started);
+              const busy = Boolean(renewRes?.data?.busy);
+
+              if (started || busy) {
+                  lastSilentTokenRenewAttemptAtRef.current = Date.now();
+              } else {
+                  lastSilentTokenRenewAttemptAtRef.current = Date.now() - (TOKEN_AUTO_RENEW_COOLDOWN_MS - TOKEN_AUTO_RENEW_RETRY_ON_FAILURE_MS);
+                  return;
+              }
+
+              if (!started) return;
 
               for (let i = 0; i < 12; i += 1) {
                   await new Promise(resolve => setTimeout(resolve, 1500));
@@ -1204,7 +1214,9 @@ function App() {
                   } catch (_) {}
               }
           })
-          .catch(() => {})
+          .catch(() => {
+              lastSilentTokenRenewAttemptAtRef.current = Date.now() - (TOKEN_AUTO_RENEW_COOLDOWN_MS - TOKEN_AUTO_RENEW_RETRY_ON_FAILURE_MS);
+          })
           .finally(() => {
               autoTokenRenewInFlightRef.current = false;
               setTokenRenewing(false);

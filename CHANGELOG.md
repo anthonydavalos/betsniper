@@ -7,6 +7,60 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.4] — 2026-03-13 — Sprint: Arcadia Auto-Recovery + Live Pipeline Visibility
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Control de arranque automatico del Gateway Pinnacle
+- **`server.js`**:
+  - Nuevo autostart opcional del proceso `services/pinnacleGateway.js` cuando `PINNACLE_GATEWAY_AUTOSTART=true`.
+  - Nuevo watchdog de trigger stale (`data/pinnacle_stale.trigger`) con chequeo configurable.
+  - Cooldown anti-bucle de relanzamiento via `PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS`.
+
+#### Auto-login opcional en Puppeteer
+- **`services/pinnacleGateway.js`**:
+  - Auto-login best-effort con `PINNACLE_AUTO_LOGIN_ENABLED`, `PINNACLE_LOGIN_USERNAME`, `PINNACLE_LOGIN_PASSWORD`.
+  - Reintentos de login sobre frames/selectores comunes y limpieza de timer en shutdown.
+
+### 🔄 Changed
+
+#### Arcadia stale handling mas fino y menos agresivo
+- **`services/pinnacleGateway.js`**:
+  - `PINNACLE_ARCADIA_MIN_SOCKETS` ahora permite operar con minimo 1 socket.
+  - Nuevo control de gracia con `PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE`.
+  - Intervalo de chequeo de trigger stale configurable (`PINNACLE_STALE_CHECK_INTERVAL_MS`).
+- **`src/services/liveValueScanner.js`**:
+  - Endurecimiento de guard de desync de reloj Pinnacle vs Altenar con umbral configurable (`PINNACLE_STALE_TIME_DIFF_MINUTES`).
+  - Trigger stale hacia gateway con cooldown (`PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS`) y requisito de persistencia (>=2 hits).
+  - Alineacion de reloj solo para drift pequeno (<=1 minuto) para evitar enmascarar congelamientos.
+
+#### Observabilidad de pipeline LIVE
+- **`src/services/scannerService.js`**:
+  - Log de pipeline `raw/dedup/stable/final` para diagnosticar diferencias entre deteccion interna y payload final de API.
+  - Fix de estabilidad cuando `QUOTE_STABILITY_MIN_HITS <= 1` para no exigir confirmacion extra.
+
+#### UX de renovacion de token Booky mas resiliente
+- **`client/src/App.jsx`**:
+  - Retry corto de auto-renovacion cuando la llamada `/api/booky/token/renew` falla o no inicia proceso remoto.
+  - El cooldown de intento silencioso ya no castiga con 45s completos en errores transitorios.
+
+#### Configuracion operativa y utilidades
+- **`package.json`**:
+  - Nuevo script `npm run pinnacle:gateway`.
+- **`.env.example`**:
+  - Actualizacion de defaults Arcadia/Gateway (autostart, cooldowns, stale thresholds, auto-login opcional, sockets minimos).
+- **`src/utils/dynamicAliases.json`**:
+  - Nuevos aliases para mejorar matching en ligas con naming heterogeneo.
+
+### 🐛 Fixed
+
+#### Relanzamientos repetidos de Puppeteer/Pinnacle
+- Se corrige el bucle de apertura frecuente del gateway ante triggers stale consecutivos, manteniendo refresco automatico pero rate-limited por cooldown.
+
+---
+
 ## [v3.4.3] — 2026-03-07 — Sprint: Prematch Refresh + Booky Orphan Cleanup
 
 > Rama: `master`

@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { initDB, pruneStaleEventCaches } from './src/db/database.js';
 
 // Cargar variables de entorno
-dotenv.config();
+dotenv.config({ override: true });
 
 // Inicializar App Express
 const app = express();
@@ -22,7 +22,8 @@ await initDB();
 import { startBackgroundScanner } from './src/services/scannerService.js';
 import { ingestPinnaclePrematch } from './scripts/ingest-pinnacle.js'; // Importar Función Directa
 import { startAltenarPrematchAdaptiveScheduler } from './src/services/altenarPrematchScheduler.js';
-import { exec } from 'child_process';
+import fs from 'fs';
+import { spawn } from 'child_process';
 import path from 'path';
 
 const backgroundWorkersEnabled = process.env.DISABLE_BACKGROUND_WORKERS !== 'true';
@@ -30,6 +31,48 @@ const liveScannerEnabled = process.env.DISABLE_LIVE_SCANNER !== 'true';
 const prematchSchedulerEnabled = process.env.DISABLE_PREMATCH_SCHEDULER !== 'true';
 const pinnacleIngestCronEnabled = process.env.DISABLE_PINNACLE_INGEST_CRON !== 'true';
 const monitorDashboardEnabled = process.env.DISABLE_MONITOR_DASHBOARD !== 'true';
+const pinnacleGatewayAutostart = process.env.PINNACLE_GATEWAY_AUTOSTART === 'true';
+const PINNACLE_TRIGGER_FILE = path.resolve('data', 'pinnacle_stale.trigger');
+const PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS = Math.max(60000, Number(process.env.PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS || 3600000));
+const PINNACLE_GATEWAY_TRIGGER_CHECK_INTERVAL_MS = Math.max(1000, Number(process.env.PINNACLE_GATEWAY_TRIGGER_CHECK_INTERVAL_MS || 5000));
+
+let pinnacleGatewayProcess = null;
+let lastPinnacleGatewayLaunchAt = 0;
+
+const isGatewayAlive = () => Boolean(pinnacleGatewayProcess && !pinnacleGatewayProcess.killed && pinnacleGatewayProcess.exitCode == null);
+
+const ensurePinnacleGatewayRunning = (reason = 'autostart') => {
+  if (isGatewayAlive()) return;
+
+  const nowMs = Date.now();
+  const elapsed = nowMs - lastPinnacleGatewayLaunchAt;
+  const bypassCooldown = reason === 'startup';
+  if (!bypassCooldown && lastPinnacleGatewayLaunchAt > 0 && elapsed < PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS) {
+    const waitSec = Math.ceil((PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS - elapsed) / 1000);
+    console.log(`⏱️ Autostart PinnacleGateway suprimido por cooldown (${waitSec}s restantes).`);
+    return;
+  }
+
+  const gatewayPath = path.resolve('services', 'pinnacleGateway.js');
+  try {
+    lastPinnacleGatewayLaunchAt = nowMs;
+    pinnacleGatewayProcess = spawn(process.execPath, [gatewayPath], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: 'inherit',
+      windowsHide: false
+    });
+
+    console.log(`🛰️ PinnacleGateway lanzado (${reason}) PID=${pinnacleGatewayProcess.pid || 'n/a'}`);
+
+    pinnacleGatewayProcess.on('exit', (code, signal) => {
+      console.warn(`⚠️ PinnacleGateway finalizó (code=${code ?? 'null'}, signal=${signal || 'none'}).`);
+      pinnacleGatewayProcess = null;
+    });
+  } catch (error) {
+    console.error(`❌ No se pudo iniciar PinnacleGateway (${reason}): ${error.message}`);
+  }
+};
 
 if (backgroundWorkersEnabled) {
   if (liveScannerEnabled) {
@@ -45,6 +88,16 @@ if (backgroundWorkersEnabled) {
   }
 } else {
   console.log('⏸️ Workers de fondo desactivados (DISABLE_BACKGROUND_WORKERS=true).');
+}
+
+if (backgroundWorkersEnabled && pinnacleGatewayAutostart) {
+  setTimeout(() => ensurePinnacleGatewayRunning('startup'), 3500);
+
+  // Si aparece trigger stale y no hay gateway vivo, levantarlo de inmediato.
+  setInterval(() => {
+    if (!fs.existsSync(PINNACLE_TRIGGER_FILE)) return;
+    ensurePinnacleGatewayRunning('stale-trigger');
+  }, PINNACLE_GATEWAY_TRIGGER_CHECK_INTERVAL_MS);
 }
 
 // --- TAREA PROGRAMADA: INGESTA AUTOMÁTICA PINNACLE ---

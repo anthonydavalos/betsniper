@@ -49,65 +49,45 @@
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
-### 1) Matcher Pinnacle ↔ Altenar reforzado
+### 1) Arcadia Gateway: auto-refresh estable y sin bucles
 
-- **Hot-reload de aliases dinámicos** en `src/utils/teamMatcher.js` leyendo `src/utils/dynamicAliases.json` sin reiniciar proceso.
-- **Diagnóstico de no-match** con `diagnoseNoMatch(...)` y razones probables (`time_window_*`, `category_mismatch`, `similarity_below_threshold`, etc.).
-- **Umbrales por entorno**:
-  - `MATCH_DIAGNOSTIC_LOG`
-  - `MATCH_FUZZY_THRESHOLD`
-  - `MATCH_MIN_ACCEPT_SCORE`
-  - `MATCH_TIME_TOLERANCE_MINUTES`
-  - `MATCH_TIME_EXTENDED_TOLERANCE_MINUTES`
-- **Validación al boot** (clamp/rango) para umbrales y flags inválidos.
-- **Fallback inverso (away-team)** en `src/services/liveScannerService.js` cuando el match por home no alcanza score mínimo.
-- **Resumen agregado por ciclo** en logs: `MATCH_DIAG_SUMMARY` y `MATCH_DIAG_RECOMMENDATION`.
+- `server.js` ahora puede levantar `services/pinnacleGateway.js` automáticamente (`PINNACLE_GATEWAY_AUTOSTART=true`).
+- Se añadió cooldown de relanzamiento (`PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS`) para evitar apertura repetitiva de Puppeteer/login.
+- Watchdog para trigger stale con frecuencia configurable (`PINNACLE_GATEWAY_TRIGGER_CHECK_INTERVAL_MS`).
+- Nuevo script de operación: `npm run pinnacle:gateway`.
 
-### 2) Cobertura PREMATCH más robusta (Pinnacle + Altenar)
+### 2) Stale detection más precisa en LIVE
 
-- `services/pinnacleLight.js` ahora mantiene **canal prematch separado** y guarda en `data/pinnacle_prematch.json`.
-- `src/services/pinnacleService.js` agrega `getAllPinnaclePrematchOdds()` (cache-first con fallback API).
-- `src/services/prematchScannerService.js` usa cache prematch, hace **upsert** a DB y persiste con retry anti-lock (`EPERM/EBUSY`).
-- Se añade filtro consistente para excluir variantes no deseadas (corners/cards/bookings/8 games).
-- Ventana temporal prematch en horario PE (noche extendida hasta 06:00 del día siguiente).
+- `src/services/liveValueScanner.js` incorpora guard de desync de reloj Pinnacle vs Altenar con umbral configurable (`PINNACLE_STALE_TIME_DIFF_MINUTES`).
+- El trigger de stale se emite solo con persistencia (>=2 hits por evento) y respeta cooldown (`PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS`).
+- Ajuste de alineación de reloj visual solo para drift pequeño (<=1 min), evitando maquillar sockets congelados.
 
-### 3) Scheduler adaptativo Altenar Prematch
+### 3) Pinnacle Gateway con auto-login opcional
 
-- Nuevo servicio: `src/services/altenarPrematchScheduler.js`.
-- Discovery + refresh por prioridad temporal/evento enlazado, con concurrencia controlada y backoff por fallos.
-- Integrado en `server.js` con `startAltenarPrematchAdaptiveScheduler()`.
+- `services/pinnacleGateway.js` agrega auto-login best-effort (frames + selectores comunes) controlado por:
+  - `PINNACLE_AUTO_LOGIN_ENABLED`
+  - `PINNACLE_LOGIN_USERNAME`
+  - `PINNACLE_LOGIN_PASSWORD`
+- Nuevos controles de stale-check/grace:
+  - `PINNACLE_STALE_CHECK_INTERVAL_MS`
+  - `PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE`
+- El mínimo de sockets Arcadia queda configurable y operativo desde 1 (`PINNACLE_ARCADIA_MIN_SOCKETS=1`).
 
-### 4) Flujo Booky semi-auto + placement real controlado
+### 4) Pipeline LIVE más observable y estable
 
-- Nuevas rutas en `src/routes/booky.js` bajo `/api/booky/*`.
-- Nuevo servicio `src/services/bookySemiAutoService.js`:
-  - Tickets draft/confirm/cancel.
-  - `dryrun` de payload real (`placeWidget`).
-  - `confirm` y `confirm-fast` con guardas de valor y manejo de estado incierto.
-  - Control de token JWT (`ALTENAR_BOOKY_AUTH_TOKEN`) y renovación asistida.
-- Nuevo servicio `src/services/bookyAccountService.js`:
-  - Balance real por perfil (`BOOK_PROFILE`).
-  - Historial remoto reconciliado con historial local.
-  - Base de bankroll Kelly con fallback (`booky-real` → `portfolio` → `config`).
-- `src/db/database.js` agrega estructura persistente `booky`.
+- `src/services/scannerService.js` ahora loguea pipeline `raw/dedup/stable/final` para explicar por qué una detección interna puede no llegar al payload final del endpoint.
+- Se corrigió el filtro de estabilidad cuando `QUOTE_STABILITY_MIN_HITS <= 1` para no exigir confirmación adicional innecesaria.
 
-### 5) Hardening Live (calidad de señal)
+### 5) UX de token Booky más resiliente
 
-- Estabilidad por ticks en `src/services/liveValueScanner.js` y `src/services/scannerService.js` para filtrar falsos spikes.
-- Guardia de sincronización de marcador Alt vs Pin antes de publicar oportunidades live.
-- Normalización de mercado `1x2` en payloads y refresh.
-- Cálculo de stake usando bankroll base centralizado (`getKellyBankrollBase()`).
+- `client/src/App.jsx` mejora el auto-renew silencioso del token Booky:
+  - Si `/api/booky/token/renew` falla o no inicia, reduce el tiempo para reintento corto (sin esperar todo el cooldown largo).
+  - Si el backend responde `busy`, respeta cooldown normal para no spamear renovaciones.
 
-### 6) Scripts nuevos de operación y diagnóstico
+### 6) Config y matching
 
-- Perfil rápido de booky: `npm run book:dorado`, `npm run book:acity`.
-- Extracción token: `npm run token:booky:*`.
-- Captura payload placeWidget: `npm run capture:booky:*`.
-- Spy de historial/endpoints: `npm run spy:booky:history`.
-- Smoke test API booky: `npm run smoke:booky` y `npm run smoke:booky:live`.
-- Saneo manual de huérfanas en `portfolio.activeBets`: `npm run cleanup:booky:orphans`.
-- Ingesta Pinnacle manual: `npm run ingest:pinnacle:force` (normal) y `npm run ingest:pinnacle:safe` (sin flush incremental, recomendado en OneDrive).
-- Plantilla de experimento matcher: `MATCH_DIAG_TEMPLATE.md` (guía A/B para ajustar `MATCH_TIME_TOLERANCE_MINUTES` con baseline prefilled).
+- `.env.example` fue actualizado con todos los nuevos knobs de Arcadia/Gateway/autologin.
+- `src/utils/dynamicAliases.json` añade aliases nuevos para reforzar matching en ligas con nombres variantes.
 
 ## 🚀 Características Principales
 

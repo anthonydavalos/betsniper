@@ -96,3 +96,18 @@ Cuando haya freeze intermitente o timeouts en `portfolio/live/prematch`:
 2.  Mantén `DISABLE_BACKGROUND_WORKERS=false` salvo emergencia total.
 3.  Valida impacto con `npm run health:latency` antes/después del cambio.
 4.  Si se toca polling del frontend, separar ciclos core y prematch, y permitir degradación parcial sin bloquear el dashboard completo.
+
+## 9. RESILIENCIA ARCADIA (AUTO-REFRESH SIN BUCLES)
+
+Cuando haya desync de reloj o socket stale en Pinnacle:
+
+1.  **Mantener modo automático por defecto** (no manual), usando `PINNACLE_GATEWAY_AUTOSTART=true`.
+2.  **Evitar relanzamientos en bucle:** respetar siempre `PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS` (recomendado 1h-2h).
+3.  **Trigger stale con persistencia:** no disparar por un unico pico; exigir al menos 2 hits de lag persistente en `liveValueScanner`.
+4.  **Umbral de lag configurable:** usar `PINNACLE_STALE_TIME_DIFF_MINUTES` (default endurecido: 6m).
+5.  **Sockets Arcadia:** permitir `PINNACLE_ARCADIA_MIN_SOCKETS=1` como minimo operativo.
+6.  **Auto-login opcional y seguro:**
+  - habilitar solo con `PINNACLE_AUTO_LOGIN_ENABLED=true`
+  - credenciales via `PINNACLE_LOGIN_USERNAME` y `PINNACLE_LOGIN_PASSWORD`
+  - si faltan credenciales, loggear warning y continuar sin bloquear gateway.
+7.  **No reiniciar ciegamente durante grace de login** salvo que `PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE=true`.
