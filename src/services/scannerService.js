@@ -119,6 +119,11 @@ const filterStableLiveQuotes = (ops = []) => {
                 firstSeenAt: now,
                 lastSeenAt: now
             });
+
+            // Si el umbral es 1, no debe requerir una segunda confirmacion.
+            if (QUOTE_STABILITY_MIN_HITS <= 1) {
+                stable.push(op);
+            }
             continue;
         }
 
@@ -245,11 +250,13 @@ export const startBackgroundScanner = () => {
                 }
             });
             let ops = Array.from(uniqueMap.values());
+            const dedupCount = ops.length;
 
             // [ANTI-VOLATILIDAD] Requiere 2 confirmaciones con la misma firma de cuota
             // antes de exponer oportunidad en UI (aplica a VALUE + TURNAROUND).
             const preStableCount = ops.length;
             ops = filterStableLiveQuotes(ops);
+            const stableCount = ops.length;
             if (preStableCount > 0 && ops.length < preStableCount && ticks % 3 === 0) {
                 console.log(`   🧱 Filtro de estabilidad: ${preStableCount - ops.length} oportunidades en enfriamiento.`);
             }
@@ -282,6 +289,10 @@ export const startBackgroundScanner = () => {
 
                 if (ops.length < initialCount) {
                     console.log(`   🧹 Ocultando ${initialCount - ops.length} oportunidades LIVE (Repetidas o Ya Apostadas).`);
+                }
+
+                if ((rawOps.length > 0 || dedupCount > 0) && ticks % 2 === 0) {
+                    console.log(`   📊 Pipeline LIVE: raw=${rawOps.length} dedup=${dedupCount} stable=${stableCount} final=${ops.length}`);
                 }
             }
 

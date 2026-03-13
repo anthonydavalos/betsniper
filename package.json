@@ -36,7 +36,8 @@
     "smoke:booky": "node scripts/smoke-booky.js",
     "smoke:booky:live": "node scripts/smoke-booky.js --live",
     "book:dorado": "node scripts/set-book-profile.js dorado",
-    "book:acity": "node scripts/set-book-profile.js acity"
+    "book:acity": "node scripts/set-book-profile.js acity",
+    "pinnacle:gateway": "node services/pinnacleGateway.js"
   },
   "keywords": [
     "trading",

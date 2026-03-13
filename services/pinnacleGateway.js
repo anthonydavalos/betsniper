@@ -31,6 +31,14 @@ function ensureDirForFile(filePath) {
     }
 }
 
+function parseBooleanFromEnv(rawValue, fallback = false) {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') return fallback;
+    const normalized = String(rawValue).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+}
+
 class PinnacleGateway {
     constructor() {
         this.browser = null;
@@ -50,6 +58,13 @@ class PinnacleGateway {
         this.autoCloseMinReadyMs = Math.max(0, Number(process.env.PINNACLE_AUTO_CLOSE_MIN_READY_MS || 25000));
         this.arcadiaMinSockets = Math.max(1, Number(process.env.PINNACLE_ARCADIA_MIN_SOCKETS || 2));
         this.staleReloadGraceMs = Math.max(0, Number(process.env.PINNACLE_STALE_RELOAD_GRACE_MS || 600000));
+        this.staleCheckIntervalMs = Math.max(500, Number(process.env.PINNACLE_STALE_CHECK_INTERVAL_MS || 1000));
+        this.allowStaleReloadDuringGrace = parseBooleanFromEnv(process.env.PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE, true);
+        this.autoLoginEnabled = parseBooleanFromEnv(process.env.PINNACLE_AUTO_LOGIN_ENABLED, false);
+        this.autoLoginUsername = String(process.env.PINNACLE_LOGIN_USERNAME || '').trim();
+        this.autoLoginPassword = String(process.env.PINNACLE_LOGIN_PASSWORD || '').trim();
+        this.autoLoginAttempts = 0;
+        this.autoLoginTimer = null;
         this.startedAtMs = Date.now();
         this.autoCloseTriggered = false;
         this.socketDetected = false;
@@ -125,6 +140,11 @@ class PinnacleGateway {
         if (this.autoSaveInterval) {
             clearInterval(this.autoSaveInterval);
             this.autoSaveInterval = null;
+        }
+
+        if (this.autoLoginTimer) {
+            clearInterval(this.autoLoginTimer);
+            this.autoLoginTimer = null;
         }
 
         try {
@@ -234,6 +254,8 @@ class PinnacleGateway {
                 waitUntil: 'domcontentloaded', // Más rápido que networkidle
                 timeout: 60000 
             });
+
+            this.scheduleAutoLogin();
             
             console.log("✅ Navigation Complete. Waiting for socket traffic...");
             if (this.autoCloseEnabled) {
@@ -248,9 +270,8 @@ class PinnacleGateway {
                 try {
                     if (fs.existsSync(CHECK_STALE_FILE)) {
                         const elapsedMs = Date.now() - this.startedAtMs;
-                        if (elapsedMs < this.staleReloadGraceMs) {
-                            fs.unlinkSync(CHECK_STALE_FILE);
-                            console.log('🛡️ Trigger stale ignorado durante fase de login manual.');
+                        if (elapsedMs < this.staleReloadGraceMs && !this.allowStaleReloadDuringGrace) {
+                            console.log('🛡️ Trigger stale diferido por ventana de gracia de login manual.');
                             return;
                         }
 
@@ -262,11 +283,14 @@ class PinnacleGateway {
                         
                         // Recargar página
                         this.page.reload({ waitUntil: 'domcontentloaded' })
-                            .then(() => console.log("✅ Página Recargada."))
+                            .then(() => {
+                                console.log("✅ Página Recargada.");
+                                this.scheduleAutoLogin();
+                            })
                             .catch(err => console.error("❌ Error recargando:", err));
                     }
                 } catch(e) { console.error("Error check stale:", e); }
-            }, 5000);
+            }, this.staleCheckIntervalMs);
 
             this.autoSaveInterval = setInterval(() => {
                  // Solo guardamos si han pasado al menos 2 segundos desde el último update de datos
@@ -289,6 +313,98 @@ class PinnacleGateway {
             console.error("❌ Navigation failed:", e.message);
             this.restart();
         }
+    }
+
+    scheduleAutoLogin() {
+        if (!this.autoLoginEnabled) return;
+        if (!this.autoLoginUsername || !this.autoLoginPassword) {
+            console.warn('⚠️ Auto-login Pinnacle activado pero faltan PINNACLE_LOGIN_USERNAME/PINNACLE_LOGIN_PASSWORD.');
+            return;
+        }
+
+        this.autoLoginAttempts = 0;
+        if (this.autoLoginTimer) {
+            clearInterval(this.autoLoginTimer);
+            this.autoLoginTimer = null;
+        }
+
+        this.autoLoginTimer = setInterval(async () => {
+            if (this.sessionDetected || this.socketDetected || this.autoLoginAttempts >= 8) {
+                clearInterval(this.autoLoginTimer);
+                this.autoLoginTimer = null;
+                return;
+            }
+
+            this.autoLoginAttempts += 1;
+            const attempted = await this.tryAutoLoginOnce();
+            if (attempted) {
+                console.log(`🔐 Auto-login Pinnacle: intento ${this.autoLoginAttempts} enviado.`);
+            }
+        }, 7000);
+    }
+
+    async tryAutoLoginOnce() {
+        const page = this.page;
+        if (!page) return false;
+
+        const frames = [page.mainFrame(), ...page.frames()];
+        const userSelectors = [
+            'input[name="username"]',
+            'input[name="email"]',
+            'input[type="email"]',
+            'input[type="text"]'
+        ];
+        const passSelectors = [
+            'input[name="password"]',
+            'input[type="password"]'
+        ];
+        const submitSelectors = [
+            'button[type="submit"]',
+            'button[data-test="login-submit"]',
+            'button.login-button',
+            'button[class*="login"]'
+        ];
+
+        for (const frame of frames) {
+            try {
+                let userEl = null;
+                for (const sel of userSelectors) {
+                    userEl = await frame.$(sel);
+                    if (userEl) break;
+                }
+
+                let passEl = null;
+                for (const sel of passSelectors) {
+                    passEl = await frame.$(sel);
+                    if (passEl) break;
+                }
+
+                if (!userEl || !passEl) continue;
+
+                await userEl.click({ clickCount: 3 });
+                await userEl.type(this.autoLoginUsername, { delay: 25 });
+                await passEl.click({ clickCount: 3 });
+                await passEl.type(this.autoLoginPassword, { delay: 25 });
+
+                let submitEl = null;
+                for (const sel of submitSelectors) {
+                    submitEl = await frame.$(sel);
+                    if (submitEl) break;
+                }
+
+                if (submitEl) {
+                    await submitEl.click();
+                } else {
+                    await passEl.press('Enter');
+                }
+
+                return true;
+            } catch (_) {
+                // Intentar siguiente frame/selectores
+            }
+        }
+
+        return false;
     }
 
     handleFrame({ requestId, response }) {

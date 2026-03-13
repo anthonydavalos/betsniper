@@ -64,6 +64,26 @@ Para días de alta congestión (ej. sábados), el sistema debe priorizar **respo
 3. **Prematch endpoint con cache agresivo:** usar `stale-while-revalidate` y `PREMATCH_CACHE_TTL_MS` para evitar scans pesados por request.
 4. **Diagnóstico de latencia operativo:** ejecutar `npm run health:latency` para validar `portfolio/live/prematch/booky/kelly` antes y después de ajustes.
 
+### 3.1 Resiliencia Arcadia (Auto-Recovery sin bucles)
+
+Para evitar ciclos de relanzamiento de Puppeteer/Pinnacle y mantener refresco automatico estable:
+
+1. **Gateway autostart con cooldown** (en `server.js`):
+  - `PINNACLE_GATEWAY_AUTOSTART=true`
+  - `PINNACLE_GATEWAY_AUTOSTART_MIN_INTERVAL_MS` (recomendado 1h-2h en operacion real)
+  - `PINNACLE_GATEWAY_TRIGGER_CHECK_INTERVAL_MS`
+2. **Deteccion stale por desync persistente** (en `liveValueScanner`):
+  - `PINNACLE_STALE_TIME_DIFF_MINUTES` define lag minimo Pinnacle vs Altenar para considerar posible congelamiento.
+  - Exigir al menos 2 hits persistentes por evento antes de disparar trigger.
+  - Cooldown de trigger con `PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS`.
+3. **Socket readiness configurable** (en `pinnacleGateway`):
+  - `PINNACLE_ARCADIA_MIN_SOCKETS` (admite 1 como minimo operativo).
+4. **Ventana de gracia + auto-login opcional**:
+  - `PINNACLE_STALE_RELOAD_GRACE_MS`
+  - `PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE`
+  - `PINNACLE_AUTO_LOGIN_ENABLED`, `PINNACLE_LOGIN_USERNAME`, `PINNACLE_LOGIN_PASSWORD`
+5. **Principio de seguridad operacional:** nunca degradar a modo manual por defecto; preferir automatizacion con rate-limit y observabilidad de logs.
+
 ### MÓDULO A: "Source of Truth" (Pinnacle Arcadia)
 **Endpoint:** `guest.api.arcadia.pinnacle.com/0.1` (Guest API Unofficial).
 **Restricción:** Usar Headers/Cookies de "Invitado" y throttling para no ser bloqueado por WAF.

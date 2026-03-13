@@ -1,8 +1,15 @@
 import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { findMatch } from '../utils/teamMatcher.js'; // [NEW]
 import { getKellyBankrollBase } from './bookyAccountService.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const STALE_TRIGGER_FILE = path.join(__dirname, '../../data/pinnacle_stale.trigger');
 
 let liveKellyBankroll = 100;
 
@@ -37,9 +44,41 @@ const LIVE_VALUE_STABILITY_MIN_HITS = parsePositiveIntOr(process.env.LIVE_VALUE_
 const LIVE_VALUE_STABILITY_MIN_AGE_MS = parsePositiveIntOr(process.env.LIVE_VALUE_STABILITY_MIN_AGE_MS, 4000);
 const LIVE_VALUE_REQUIRE_SCORE_SYNC = parseBooleanFromEnv(process.env.LIVE_VALUE_REQUIRE_SCORE_SYNC, true);
 const LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF = parsePositiveIntOr(process.env.LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF, 0);
+const PINNACLE_STALE_TIME_DIFF_MINUTES = Math.max(6, parsePositiveIntOr(process.env.PINNACLE_STALE_TIME_DIFF_MINUTES, 6));
+const PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS = Math.max(10000, parsePositiveIntOr(process.env.PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS, 60000));
 
 const liveOpportunityStability = new Map();
 const STABILITY_WINDOW_MS = 25000;
+let lastStaleTriggerAt = 0;
+const staleClockLagHits = new Map();
+
+const triggerPinnacleStaleReload = (reason = 'live-value-desync') => {
+    const nowMs = Date.now();
+    if ((nowMs - lastStaleTriggerAt) < PINNACLE_STALE_TRIGGER_MIN_INTERVAL_MS) return;
+
+    try {
+        fs.writeFileSync(STALE_TRIGGER_FILE, `${new Date().toISOString()} | ${reason}`);
+        lastStaleTriggerAt = nowMs;
+        console.warn(`🔄 Trigger stale enviado al Gateway desde LIVE_VALUE (${reason}).`);
+    } catch (error) {
+        console.warn('⚠️ No se pudo escribir trigger stale de Pinnacle:', error?.message || error);
+    }
+};
+
+const noteStaleLagHit = (eventId, lagMinutes) => {
+    const now = Date.now();
+    const key = String(eventId || 'na');
+    const prev = staleClockLagHits.get(key);
+
+    if (!prev || (now - prev.lastSeenAt) > STABILITY_WINDOW_MS || lagMinutes < PINNACLE_STALE_TIME_DIFF_MINUTES) {
+        staleClockLagHits.set(key, { hits: 1, lastSeenAt: now });
+        return 1;
+    }
+
+    const nextHits = prev.hits + 1;
+    staleClockLagHits.set(key, { hits: nextHits, lastSeenAt: now });
+    return nextHits;
+};
 
 const shouldPublishStableOpportunity = (opKey) => {
     if (!LIVE_VALUE_ENABLE_STABILITY_FILTER) return true;
@@ -446,17 +485,29 @@ export const scanLiveOpportunities = async (preFetchedEvents = null) => {
             event.liveTime = details.liveTime;
         }
 
-        // [FIX] Sincronización de Tiempos Robusta (Reloj Ganador) para Evitar Congelamiento
-        // Comparamos el tiempo que trae Pinnacle (pinLiveOdds.time) vs el de Altenar (event.liveTime/details)
+        // [FIX] Guard de desincronización de reloj para evitar usar cuotas Pinnacle congeladas.
         const pinTimeMin = pinLiveOdds ? (parseInt(String(pinLiveOdds.time).replace(/[^0-9]/g, "")) || 0) : 0;
         const evtTimeMin = (event.liveTime && event.liveTime !== "0'") ? (parseInt(String(event.liveTime).replace(/[^0-9]/g, "")) || 0) : 0;
+        const isHalfTime = String(event.liveTime || '').toUpperCase().includes('HT') || String(event.liveTime || '') === "45'";
+        const lagMinutes = evtTimeMin - pinTimeMin;
 
-        // Si Pinnacle está congelado (es menor que Altenar), forzar que el objeto Pinnacle tenga el tiempo de Altenar
-        if (pinLiveOdds && evtTimeMin > pinTimeMin) {
+        if (!isHalfTime && pinTimeMin > 0 && evtTimeMin > 0 && lagMinutes >= PINNACLE_STALE_TIME_DIFF_MINUTES) {
+            const lagHits = noteStaleLagHit(event.id, lagMinutes);
+            console.warn(`⚠️ [LIVE_VALUE] Posible socket Pinnacle stale en ${event.name}: Pin=${pinLiveOdds.time} vs Alt=${event.liveTime} (lag=${lagMinutes}m, hit=${lagHits})`);
+
+            // Evita reinicios por picos de un solo ciclo; exige persistencia en al menos 2 pasadas.
+            if (lagHits >= 2) {
+                triggerPinnacleStaleReload(`pin-lag-${lagMinutes}m`);
+            }
+            continue;
+        }
+
+        // Para diferencias pequenas permitimos alinear reloj visual sin forzar cuando hay drift grande.
+        if (pinLiveOdds && evtTimeMin > pinTimeMin && (evtTimeMin - pinTimeMin) <= 1) {
             pinLiveOdds.time = event.liveTime;
         }
-        // Si Pinnacle está adelantado (pero coherente, ej. feed oficial más rápido), actualizar Altenar
-        else if (pinLiveOdds && pinTimeMin > evtTimeMin && pinTimeMin < evtTimeMin + 15) {
+        // Si Pinnacle está levemente adelantado, usamos su reloj para display.
+        else if (pinLiveOdds && pinTimeMin > evtTimeMin && (pinTimeMin - evtTimeMin) <= 1) {
              event.liveTime = pinLiveOdds.time;
         }
 
