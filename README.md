@@ -909,6 +909,23 @@ npm run capture:booky
 curl -sS --compressed http://localhost:3000/api/booky/capture/latest
 # Debe devolver: {"success":true,"found":true,...}
 
+# 4.1) Health-check rápido de placeWidget (sin ruido)
+# Opcion A (si tienes jq):
+curl -sS --compressed http://localhost:3000/api/booky/token-health | jq.exe '{success,authenticated:.token.authenticated,jwtValid:.token.jwtValid,expired:.token.expired,remainingMinutes:.token.remainingMinutes,expIso:.token.expIso}'
+curl -sS --compressed "http://localhost:3000/api/booky/account?refresh=1" | jq.exe '{success,balance:.balance.amount,currency:.balance.currency,stale:.balance.stale,updatedAt:.balance.updatedAt,source:.balance.source}'
+curl -sS --compressed http://localhost:3000/api/booky/capture/latest | jq.exe '{success,found,profile,generatedAt,totalCaptured}'
+
+# Opcion B (si jq no esta disponible):
+curl -sS --compressed http://localhost:3000/api/booky/token-health | python -c "import sys,json; d=json.load(sys.stdin); t=d.get('token') or {}; print({'success':d.get('success'),'authenticated':t.get('authenticated'),'jwtValid':t.get('jwtValid'),'expired':t.get('expired'),'remainingMinutes':t.get('remainingMinutes'),'expIso':t.get('expIso')})"
+curl -sS --compressed "http://localhost:3000/api/booky/account?refresh=1" | python -c "import sys,json; d=json.load(sys.stdin); b=d.get('balance') or {}; print({'success':d.get('success'),'amount':b.get('amount'),'currency':b.get('currency'),'stale':b.get('stale'),'updatedAt':b.get('updatedAt'),'source':b.get('source')})"
+curl -sS --compressed http://localhost:3000/api/booky/capture/latest | python -c "import sys,json; d=json.load(sys.stdin); print({'success':d.get('success'),'found':d.get('found'),'profile':d.get('profile'),'generatedAt':d.get('generatedAt'),'totalCaptured':d.get('totalCaptured')})"
+
+# Criterio de salud minima para placeWidget:
+# - token: authenticated=true, jwtValid=true, expired=false, remainingMinutes > 2
+# - wallet: success=true, stale=false, updatedAt reciente
+# - captura: found=true, totalCaptured > 0 y generatedAt reciente
+# - validacion de payload: POST /api/booky/real/dryrun/:id debe responder success=true
+
 # 5) Ver salud de token y flujo seguro (sin apostar real)
 npm run smoke:booky
 
