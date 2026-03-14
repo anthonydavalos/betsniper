@@ -295,10 +295,12 @@ export const refreshOpportunity = async (opportunity) => {
                         const oName = (o.name || "").toLowerCase();
                         if (isTotalsCandidate) {
                             const oddLine = Number.isFinite(Number(o.line)) ? Number(o.line) : extractFirstNumber(o.name || '');
-                            const strictLine = totalsHint.lineFrom === 'market';
-                            const lineMatches = !strictLine || !Number.isFinite(totalsHint.line) || !Number.isFinite(oddLine)
-                                ? true
-                                : Math.abs(oddLine - totalsHint.line) < 0.11;
+                            // Si tenemos linea valida (venga de market o selection), debe matchear.
+                            // Solo relajamos cuando NO hay linea confiable para evitar tomar otra linea por error.
+                            const mustMatchLine = Number.isFinite(totalsHint.line);
+                            const lineMatches = mustMatchLine
+                                ? (Number.isFinite(oddLine) && Math.abs(oddLine - totalsHint.line) < 0.11)
+                                : true;
 
                             if (!lineMatches) return false;
 
