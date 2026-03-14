@@ -7,6 +7,28 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.6] — 2026-03-13 — Sprint: Live UX Origin Labels + Snipe Data Guards
+
+> Rama: `master`
+
+### 🔄 Changed
+
+#### UX de apuestas PREMATCH cuando el partido ya está en juego
+- **`client/src/App.jsx`**:
+  - Las apuestas de origen PREMATCH que pasan a pestaña LIVE conservan badge `PRE-MATCH` como metadata de origen.
+  - Se habilita render de badges también para filas `ACTIVE` (no solo cuando hay reloj live numérico).
+  - Si el feed trae `liveTime="Live"` sin minuto, la UI muestra contador estimado por tiempo transcurrido desde `matchDate`.
+
+### 🐛 Fixed
+
+#### Oportunidades LIVE_SNIPE inválidas por cuotas Pinnacle en cero
+- **`src/services/liveScannerService.js`**:
+  - Endurecida validación de moneyline live (`home/away > 1`) antes de calcular probabilidad real.
+  - Se descartan snipes con `realProb` o `ev` no finitos (casos `Infinity`/`null`).
+  - Sanitización de `pinnaclePrice` y `prematchContext` para no propagar cuotas `0` a UI.
+
+---
+
 ## [v3.4.5] — 2026-03-13 — Sprint: Live Totals Refresh Integrity
 
 > Rama: `master`

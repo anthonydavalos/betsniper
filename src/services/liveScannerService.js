@@ -151,6 +151,16 @@ const isMatchTotalMarket = (market, eventName, oddsMap) => {
     return true;
 };
 
+const sanitizeOddForUi = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 1 ? n : null;
+};
+
+const isValidDecimalOdd = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 1;
+};
+
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER"
 // Estrategia: "La Volteada" (Favorito perdiendo por 1 gol)
@@ -700,19 +710,36 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                             pinLiveOdds = pinData ? pinData.moneyline : null;
 
                             if (pinLiveOdds) {
+                                const pinHome = Number(pinLiveOdds.home);
+                                const pinAway = Number(pinLiveOdds.away);
+                                const pinDraw = Number(pinLiveOdds.draw);
+
+                                if (!isValidDecimalOdd(pinHome) || !isValidDecimalOdd(pinAway)) {
+                                    console.log(`   ⚠️ Pinnacle Live inválido (moneyline sin cuotas válidas): Home=${pinLiveOdds.home}, Away=${pinLiveOdds.away}`);
+                                } else {
                                 // Calcular Total Implied Prob (Suma de inversas)
-                                const invHome = 1 / pinLiveOdds.home;
-                                const invAway = 1 / pinLiveOdds.away;
-                                const invDraw = pinLiveOdds.draw > 1 ? (1 / pinLiveOdds.draw) : 0; // Draw puede no existir o ser bajo
+                                const invHome = 1 / pinHome;
+                                const invAway = 1 / pinAway;
+                                const invDraw = isValidDecimalOdd(pinDraw) ? (1 / pinDraw) : 0; // Draw puede no existir o ser bajo
                                 const totalImplied = invHome + invAway + invDraw;
                                 
                                 // Seleccionar cuota objetivo
-                                const targetPinOdd = targetSide === 'home' ? pinLiveOdds.home : pinLiveOdds.away;
+                                const targetPinOdd = targetSide === 'home' ? pinHome : pinAway;
                                 
                                 // Calcular Prob Real sin Vig
-                                realProb = calculateNoVigProb(targetPinOdd, totalImplied);
-                                isLivePinnacle = true;
-                                console.log(`   🎯 Pinnacle Live Found: Home=${pinLiveOdds.home}, Away=${pinLiveOdds.away} -> RealProb(${targetSide})=${realProb.toFixed(1)}%`);
+                                if (Number.isFinite(totalImplied) && totalImplied > 0 && isValidDecimalOdd(targetPinOdd)) {
+                                    const nextRealProb = calculateNoVigProb(targetPinOdd, totalImplied);
+                                    if (Number.isFinite(nextRealProb) && nextRealProb > 0 && nextRealProb < 100) {
+                                        realProb = nextRealProb;
+                                        isLivePinnacle = true;
+                                        console.log(`   🎯 Pinnacle Live Found: Home=${pinHome}, Away=${pinAway} -> RealProb(${targetSide})=${realProb.toFixed(1)}%`);
+                                    } else {
+                                        console.log(`   ⚠️ Pinnacle Live descartado por realProb inválida: ${nextRealProb}`);
+                                    }
+                                } else {
+                                    console.log(`   ⚠️ Pinnacle Live descartado por totalImplied/target inválido (target=${targetPinOdd}, implied=${totalImplied})`);
+                                }
+                                }
                             }
                         }
 
@@ -722,6 +749,11 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                             const minute = parseInt((event.liveTime||"0").replace("'", ""));
                             const timeDecayFactor = Math.max(0.3, 1 - (minute / 120)); // Reduce prob conforme avanza tiempo
                             realProb = condition.prematchProb * timeDecayFactor;
+                        }
+
+                        if (!Number.isFinite(realProb) || realProb <= 0 || realProb >= 100) {
+                            console.log(`   ⚠️ Skip LIVE_SNIPE por realProb inválida: ${realProb}`);
+                            continue;
                         }
 
                         // Regla estricta: LIVE_SNIPE requiere cuota live real de Pinnacle.
@@ -746,6 +778,12 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                             liveBankroll || 100,
                             'LIVE_SNIPE'
                         );
+
+                        const evPercent = (((realProb)/100 * altenarOdd) - 1) * 100;
+                        if (!Number.isFinite(evPercent)) {
+                            console.log(`   ⚠️ Skip LIVE_SNIPE por EV inválido: ${evPercent}`);
+                            continue;
+                        }
                         
                         // Solo push si hay valor positivo y min 1 Sol
                         if (kellyResult.amount >= 1) {
@@ -774,14 +812,16 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                                 
                                 realProb: realProb, 
                                 odd: altenarOdd,
-                                ev: (((realProb)/100 * altenarOdd) - 1) * 100,
+                                ev: evPercent,
                                 kellyStake: kellyResult.amount,
 
                                 // [FIXED] Add missing pinnaclePrice for UI (Prevent "PIN OFF")
                                 // Priority: 1. Fresh Fetch (pinLiveOdds), 2. Global Feed (pinMatch.liveOdds), 3. Null
-                                pinnaclePrice: (isLivePinnacle 
-                                    ? (condition.side === 'home' ? pinLiveOdds?.home : pinLiveOdds?.away) 
-                                    : (pinMatch.liveOdds ? (condition.side === 'home' ? pinMatch.liveOdds.home : pinMatch.liveOdds.away) : null)),
+                                pinnaclePrice: sanitizeOddForUi(
+                                    isLivePinnacle
+                                        ? (condition.side === 'home' ? pinLiveOdds?.home : pinLiveOdds?.away)
+                                        : (pinMatch.liveOdds ? (condition.side === 'home' ? pinMatch.liveOdds.home : pinMatch.liveOdds.away) : null)
+                                ),
                                 
                                 // [NEW] Enhanced Pinnacle Info for Frontend
                                 pinnacleInfo: {
@@ -789,14 +829,14 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                                     time: pinMatch.time || event.liveTime,
                                     score: condition.currentScore,
                                     // [NEW] Add Prematch Odds Context for UI
-                                    prematchPrice: condition.side === 'home' ? pinMatch.odds?.home : pinMatch.odds?.away,
+                                    prematchPrice: sanitizeOddForUi(condition.side === 'home' ? pinMatch.odds?.home : pinMatch.odds?.away),
                                     // [NEW] Full Context for Badges
                                     prematchContext: {
-                                        home: pinMatch.odds?.home,
-                                        draw: pinMatch.odds?.draw,
-                                        away: pinMatch.odds?.away,
-                                        over25: (pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over,
-                                        under25: (pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under,
+                                        home: sanitizeOddForUi(pinMatch.odds?.home),
+                                        draw: sanitizeOddForUi(pinMatch.odds?.draw),
+                                        away: sanitizeOddForUi(pinMatch.odds?.away),
+                                        over25: sanitizeOddForUi((pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over),
+                                        under25: sanitizeOddForUi((pinMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under),
                                     }
                                 }
                             });

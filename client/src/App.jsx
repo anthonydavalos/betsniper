@@ -469,6 +469,32 @@ const hasLiveClockSignal = (value = '') => {
     return /\b\d{1,3}(?:\+\d{1,2})?\s*'?\s*(MIN)?\b/i.test(normalized);
 };
 
+const isEventInPlayNow = (row = {}, fallbackRow = null) => {
+    const liveSignal =
+        row?.liveTime ||
+        row?.time ||
+        row?.pinnacleInfo?.time ||
+        row?.raw?.selections?.[0]?.gameTime ||
+        fallbackRow?.liveTime ||
+        fallbackRow?.time ||
+        fallbackRow?.pinnacleInfo?.time ||
+        fallbackRow?.raw?.selections?.[0]?.gameTime ||
+        '';
+
+    const upperLiveSignal = String(liveSignal || '').trim().toUpperCase();
+    if (upperLiveSignal === 'FINAL' || upperLiveSignal === 'FT') return false;
+    if (hasLiveClockSignal(liveSignal)) return true;
+
+    const eventStartIso = resolveOpEventStartIso(row) || resolveOpEventStartIso(fallbackRow || {});
+    if (!eventStartIso) return false;
+
+    const eventStartMs = new Date(eventStartIso).getTime();
+    if (!Number.isFinite(eventStartMs)) return false;
+
+    const minutesSinceStart = (Date.now() - eventStartMs) / 60000;
+    return minutesSinceStart >= 2 && minutesSinceStart <= 180;
+};
+
 const resolveOptimisticTtlMs = (meta = {}) => {
     const custom = Number(meta?.optimisticTtlMs);
     if (Number.isFinite(custom) && custom > 0) return custom;
@@ -2069,10 +2095,9 @@ function App() {
         // 2. Apuestas EN JUEGO (Portfolio Active Bets)
         // Queremos mostrar aquí las apuestas que ya hicimos pero cuyo partido se está jugando.
         const activePlayingBets = (portfolio.activeBets || []).filter(bet => {
-            // [MOD] Filtrar por TIPO: Solo mostrar apuestas de origen LIVE en la pestaña LIVE
-            // PREMATCH bets que ya iniciaron se quedan en TODOS (User Request)
             const isLiveOrigin = bet.type === 'LIVE_SNIPE' || bet.type === 'LIVE_VALUE' || bet.type === 'LA_VOLTEADA' || bet.isLive;
-            if (!isLiveOrigin) return false;
+            const isInPlayNow = isEventInPlayNow(bet);
+            if (!isLiveOrigin && !isInPlayNow) return false;
 
             // a. Evitar duplicados visuales si el scanner también lo está viendo (aunque el scanner suele ocultar activeBets)
             if (ops.some(o => String(o.eventId) === String(bet.eventId))) return false;
@@ -2109,18 +2134,9 @@ function App() {
         }));
 
         const openBookyLiveBets = getOpenBookyRemoteBets().filter(bet => {
-            const timingOrigin = resolvePlacementTimingOrigin(bet);
-            const liveSignal = bet.liveTime || bet.time || '';
-            const hasTrustedLiveClock = hasLiveClockSignal(liveSignal);
             const isLiveOrigin = isLiveOriginOpportunity(bet);
-
-            // Si la apuesta fue realmente prematch y aún no hay señal de partido en juego,
-            // no debe entrar a LIVE.
-            if (timingOrigin.inferredPrematchByTiming && !hasTrustedLiveClock && !isLiveOrigin) return false;
-
-            // Si ya hay señal live (timing o reloj), mostrarla en LIVE aunque el origen
-            // histórico sea PREMATCH para evitar que "desaparezca" entre pestañas.
-            return timingOrigin.inferredLiveByTiming || hasTrustedLiveClock || isLiveOrigin;
+            const isInPlayNow = isEventInPlayNow(bet);
+            return isLiveOrigin || isInPlayNow;
         }).filter(bet => {
             const byProvider = String(bet.providerBetId || '');
             const duplicateInPortfolio = activePlayingBets.some(a => String(a.providerBetId || '') === byProvider && byProvider);
@@ -2172,11 +2188,11 @@ function App() {
         
         // 3. [FIX] Inyectar APUESTAS ACTIVAS (Active Bets) que ya no están en scanners
         // Esto resuelve que las apuestas desaparezcan cuando empieza el partido
-        const dayActiveBets = portfolio.activeBets.filter(bet => {
-             // [MOD] User Request: Oportunidades Live NO deben salir en TOTALES (ALL), Solo en LIVE.
-             // Así que filtramos y QUITAMOS las de origen Live aquí.
+           const dayActiveBets = portfolio.activeBets.filter(bet => {
+               // En PREMATCH solo deben quedar apuestas aun no iniciadas.
              const isLiveOrigin = bet.type === 'LIVE_SNIPE' || bet.type === 'LIVE_VALUE' || bet.type === 'LA_VOLTEADA' || bet.isLive;
              if (isLiveOrigin) return false;
+               if (isEventInPlayNow(bet)) return false;
 
              // a) Filtrar por fecha
              if (!bet.matchDate) return false; // si no tiene fecha, skip
@@ -2201,6 +2217,9 @@ function App() {
 
         const dayBookyOpenBets = getOpenBookyRemoteBets().filter(bet => {
                          const timingOrigin = resolvePlacementTimingOrigin(bet);
+
+                 // Si ya esta en juego, va a LIVE (no duplicar en PREMATCH).
+                 if (isEventInPlayNow(bet)) return false;
 
                          // Mantener en PREMATCH las apuestas colocadas antes del inicio,
                          // aunque el feed remoto luego reporte gameTime/isLive.
@@ -2641,13 +2660,14 @@ function App() {
                                         op?.raw?.selections?.[0]?.gameTime ||
                                         '';
                                     const hasTrustedVisualLiveClock = hasLiveClockSignal(visualLiveSignal);
+                                    const isInPlayNow = isEventInPlayNow(betData, op);
                                     const isLive =
                                         activeTab !== 'FINISHED' &&
                                         !op.isBookyHistory &&
                                         !isBookySettledByStatus &&
                                         !isStatusCompleted &&
                                         !isExplicitlyFinished &&
-                                        (isReallyLiveType || hasTrustedVisualLiveClock);
+                                        (isReallyLiveType || hasTrustedVisualLiveClock || isInPlayNow);
                                     const eventStartIso = op.isBookyHistory ? (resolveBookyEventStartIso(op) || resolveOpEventStartIso(op)) : resolveOpEventStartIso(op);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
                                     const entryMeta = ticketIdForRow ? (entryOrderByTicketId.get(String(ticketIdForRow)) || null) : null;
@@ -2686,7 +2706,7 @@ function App() {
                                         (typeUnknown && (hasLiveSignal || inferredLiveByTiming));
                                     const showPrematchBadge =
                                         effectiveType === 'PREMATCH_VALUE' ||
-                                        (typeUnknown && !hasLiveSignal && inferredPrematchByTiming);
+                                        (typeUnknown && inferredPrematchByTiming);
                                     const evRaw = Number(
                                         betData?.ev ??
                                         op?.ev ??
@@ -2755,9 +2775,15 @@ function App() {
                                                     <span className="flex items-center gap-1 text-red-500 animate-pulse font-bold bg-red-500/10 px-2 py-0.5 rounded w-fit text-[10px]">
                                                        <Clock className="w-3 h-3" />
                                                        {/* Live Timer - Prioridad a liveTime (actualizado en tiempo real) */}
-                                                       {op.liveTime || effectivePinnacleInfo?.time || op.time || (
-                                                            (minutesElapsed > 90 ? `90'+` : `${minutesElapsed}'`)
-                                                       )}
+                                                        {(() => {
+                                                            const rawClock = op.liveTime || effectivePinnacleInfo?.time || op.time || '';
+                                                            if (hasLiveClockSignal(rawClock)) return rawClock;
+
+                                                            const normalizedMinutes = Number.isFinite(minutesElapsed)
+                                                                ? Math.max(1, minutesElapsed)
+                                                                : 1;
+                                                            return normalizedMinutes > 90 ? "90'+" : `${normalizedMinutes}'`;
+                                                        })()}
                                                     </span>
                                                     {/* SCORE con Prioridad a lastKnownScore (actualizado en tiempo real) */}
                                                     <span className="font-mono font-bold text-white text-xs pl-0.5">
@@ -2809,7 +2835,7 @@ function App() {
                                         </td>
                                         <td className="p-3">
                                             {/* STRATEGY BADGE */}
-                                            {((isLive || showFinished || executionStatus === 'FINISHED') || (entryMeta && entryMeta.total > 1)) && (
+                                            {((isLive || showFinished || executionStatus === 'FINISHED' || executionStatus === 'ACTIVE') || (entryMeta && entryMeta.total > 1)) && (
                                                 <div className="mb-1 flex items-center gap-1.5 flex-wrap">
                                                     {(isLive || showFinished || executionStatus === 'FINISHED') && (
                                                         <>
