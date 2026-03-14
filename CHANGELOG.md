@@ -7,6 +7,92 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.8] -- 2026-03-14 -- Sprint: Auto SNIPE Outcomes + Reentry Guards + Matcher High Confidence
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Trazabilidad completa del resultado de AUTO_SNIPE
+- **`src/services/scannerService.js`**:
+  - Nuevos logs de outcome final por intento: `CONFIRMED`, `REJECTED`, `UNCERTAIN`.
+  - Registro explicito de motivo cuando una oportunidad `LIVE_SNIPE` queda en manual (`reason=...`).
+  - Log de arranque del motor AUTO_SNIPE con parametros efectivos (`enabled`, `dryRun`, `bookyReal`, `minEV`, `minStake`, `hourlyCap`).
+
+#### Politica de reentrada con guardas de mejora real de cuota
+- **`src/services/scannerService.js`**:
+  - Nueva guarda de mejora minima para segunda entrada por pick:
+    - `AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT`
+    - `AUTO_SNIPE_REENTRY_MIN_ODD_POINTS`
+  - Limite configurable de entradas por pick:
+    - `AUTO_SNIPE_MAX_ENTRIES_PER_PICK`
+  - Nuevos motivos operativos de rechazo en guardas: `reentry-cap`, `reentry-no-improvement(...)`.
+- **`.env.example`**:
+  - Se documentan las tres variables nuevas de reentrada para rollout seguro.
+
+#### Matcher manual con motor High Confidence (frontend)
+- **`client/src/components/ManualMatcher.jsx`**:
+  - Nuevo scoring compuesto para sugerencias de enlace masivo:
+    - similitud home/away,
+    - riesgo de equipos cruzados,
+    - proximidad horaria,
+    - contexto de liga/pais,
+    - margen frente al segundo candidato.
+  - Nuevas acciones operativas: `SUGERIR`, `APLICAR`, `APLICAR TOP 20`.
+
+### 🔄 Changed
+
+#### Aliases dinamicos consumidos por el matcher de frontend
+- **`src/routes/matcher.js`**:
+  - `GET /api/matcher/data` ahora incluye `aliases` para alinear la normalizacion con backend.
+- **`src/utils/dynamicAliases.json`**:
+  - Expansion de aliases para casos reales de no-match en ligas y equipos con variantes (`II/B`, abreviaturas, transliteraciones y sufijos).
+
+#### Diagnostico de rechazo provider preservado en real placement
+- **`src/services/bookySemiAutoService.js`**:
+  - Se conserva el detalle original de `providerBody/providerStatus` cuando `placeWidget` rechaza o falla, evitando perder evidencia en auditoria.
+
+### 🐛 Fixed
+
+#### Rechazos ambiguos de AUTO_SNIPE y reentradas sin mejora de precio
+- Se corrige el escenario donde el sistema podia reintentar entradas sobre el mismo pick sin exigir mejora material de cuota.
+- Se corrige la perdida de diagnostico provider en rechazos reales, mejorando el analisis post-mortem (`BOOKY_PLACEWIDGET_REJECTED`).
+
+---
+
+## [v3.4.7] — 2026-03-14 — Sprint: Auto SNIPE Controlled Rollout
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Motor de auto-colocación exclusivo para LIVE_SNIPE
+- **`src/services/scannerService.js`**:
+  - Nuevo flujo opcional de ejecución automática para oportunidades `LIVE_SNIPE` / `LA_VOLTEADA`.
+  - Integración directa con Booky real placement usando `prepareSemiAutoTicket()` + `confirmRealPlacementFast()`.
+  - Estado interno anti-duplicado con lock in-flight por `eventId+pick`.
+
+#### Flags operativas para rollout gradual
+- **`.env.example`**:
+  - `AUTO_SNIPE_ENABLED`
+  - `AUTO_SNIPE_DRY_RUN`
+  - `AUTO_SNIPE_MIN_EV_PERCENT`
+  - `AUTO_SNIPE_MIN_STAKE_SOL`
+  - `AUTO_SNIPE_MAX_BETS_PER_HOUR`
+  - `AUTO_SNIPE_COOLDOWN_PER_PICK_MS`
+  - `AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED`
+
+### 🔄 Changed
+
+#### Guardas de riesgo para auto SNIPE
+- **`src/services/scannerService.js`**:
+  - Cooldown por selección para evitar re-disparo en ventanas cortas.
+  - Cap horario de ejecuciones para limitar exposición en sesiones volátiles.
+  - Filtros previos de EV mínimo y stake mínimo antes de cualquier intento real.
+  - Compatibilidad de operación `dry-run` para validar decisiones sin enviar apuestas reales.
+
+---
+
 ## [v3.4.6] — 2026-03-13 — Sprint: Live UX Origin Labels + Snipe Data Guards
 
 > Rama: `master`

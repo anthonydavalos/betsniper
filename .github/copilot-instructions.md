@@ -111,3 +111,33 @@ Cuando haya desync de reloj o socket stale en Pinnacle:
   - credenciales via `PINNACLE_LOGIN_USERNAME` y `PINNACLE_LOGIN_PASSWORD`
   - si faltan credenciales, loggear warning y continuar sin bloquear gateway.
 7.  **No reiniciar ciegamente durante grace de login** salvo que `PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE=true`.
+
+## 10. AUTO_SNIPE (ROLLOUT REAL + REENTRY POLICY)
+
+Cuando toques `src/services/scannerService.js` en flujo `LIVE_SNIPE`:
+
+1.  **Outcome obligatorio por intento:** dejar log final con estado `CONFIRMED`, `REJECTED` o `UNCERTAIN`.
+2.  **Manual con razon:** si no auto-coloca, loggear `reason=...` (nunca silent-drop).
+3.  **Reentrada segura (obligatoria):**
+  - exigir mejora minima de cuota por `%` (`AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT`) o por puntos (`AUTO_SNIPE_REENTRY_MIN_ODD_POINTS`),
+  - respetar maximo de entradas por pick (`AUTO_SNIPE_MAX_ENTRIES_PER_PICK`).
+4.  **No duplicar por latencia:** mantener lock por `eventId+pick` + cooldown por pick.
+5.  **No asumir reject local:** distinguir rechazo por guardas internas vs rechazo real de provider (`BOOKY_PLACEWIDGET_REJECTED`).
+
+## 11. MATCHER HIGH CONFIDENCE (MANUAL ASSIST)
+
+Cuando trabajes en `client/src/components/ManualMatcher.jsx` y `src/routes/matcher.js`:
+
+1.  **Aliases en backend, consumo en frontend:** el frontend no debe hardcodear catalogo separado si ya viene en `/api/matcher/data`.
+2.  **Score compuesto y explicable:** home/away + riesgo swap + ventana horaria + contexto liga/pais + margen contra segundo candidato.
+3.  **Bulk apply con limites:** habilitar `APLICAR` / `APLICAR TOP 20` solo bajo threshold de alta confianza.
+4.  **Proteccion de categorias sensibles:** Women/U21/Reserve/II/III requieren match contextual mas estricto.
+5.  **Diagnostico antes de umbral:** si hay muchos no-match, priorizar razon (`time_window`, `category_mismatch`, `similarity`) antes de bajar thresholds globalmente.
+
+## 12. AUDITORIA DE RECHAZOS BOOKY
+
+Cuando se procese `placeWidget` en `bookySemiAutoService`:
+
+1.  **Preservar evidencia provider:** no perder `providerStatus/providerBody/requestId` al envolver errores.
+2.  **Sin `bets[]` no hay confirmacion real:** archivar como rechazo auditable.
+3.  **Estado incierto no se reintenta ciego:** primero reconciliar por cuenta/historial remoto.

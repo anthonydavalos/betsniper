@@ -4,6 +4,7 @@ import db, { initDB } from '../db/database.js';
 import { scanLiveOpportunities as performValueScan, getLiveOverview } from './liveValueScanner.js';
 import { scanLiveOpportunities as performTurnaroundScan } from './liveScannerService.js'; 
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
+import { prepareSemiAutoTicket, confirmRealPlacementFast } from './bookySemiAutoService.js';
 
 const parseBooleanFromEnv = (rawValue, fallback = false) => {
     if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
@@ -22,6 +23,12 @@ const parsePositiveIntOr = (value, fallback) => {
     return intN > 0 ? intN : fallback;
 };
 
+const parsePositiveNumberOr = (value, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return n > 0 ? n : fallback;
+};
+
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER" (Background Worker)
 // Estrategia: "La Volteada" (Favorito Pre-match perdiendo por 1 gol)
@@ -35,6 +42,28 @@ const liveQuoteStability = new Map();
 const QUOTE_STABILITY_WINDOW_MS = 20000;
 const LIVE_GLOBAL_STABILITY_ENABLED = parseBooleanFromEnv(process.env.LIVE_GLOBAL_STABILITY_ENABLED, true);
 const QUOTE_STABILITY_MIN_HITS = parsePositiveIntOr(process.env.LIVE_GLOBAL_STABILITY_MIN_HITS, 2);
+
+const AUTO_SNIPE_ENABLED = parseBooleanFromEnv(process.env.AUTO_SNIPE_ENABLED, false);
+const AUTO_SNIPE_DRY_RUN = parseBooleanFromEnv(process.env.AUTO_SNIPE_DRY_RUN, true);
+const AUTO_SNIPE_MIN_EV_PERCENT = parsePositiveNumberOr(
+    process.env.AUTO_SNIPE_MIN_EV_PERCENT,
+    Math.max(0.1, Number(process.env.BOOKY_MIN_EV_PERCENT || 2))
+);
+const AUTO_SNIPE_MIN_STAKE_SOL = parsePositiveNumberOr(process.env.AUTO_SNIPE_MIN_STAKE_SOL, 1);
+const AUTO_SNIPE_MAX_BETS_PER_HOUR = parsePositiveIntOr(process.env.AUTO_SNIPE_MAX_BETS_PER_HOUR, 3);
+const AUTO_SNIPE_COOLDOWN_PER_PICK_MS = parsePositiveIntOr(process.env.AUTO_SNIPE_COOLDOWN_PER_PICK_MS, 180000);
+const AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT = parsePositiveNumberOr(process.env.AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT, 8);
+const AUTO_SNIPE_REENTRY_MIN_ODD_POINTS = parsePositiveNumberOr(process.env.AUTO_SNIPE_REENTRY_MIN_ODD_POINTS, 0.30);
+const AUTO_SNIPE_MAX_ENTRIES_PER_PICK = parsePositiveIntOr(process.env.AUTO_SNIPE_MAX_ENTRIES_PER_PICK, 2);
+const AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(
+    process.env.AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED,
+    true
+);
+const BOOKY_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(process.env.BOOKY_REAL_PLACEMENT_ENABLED, false);
+
+const autoSnipeInFlight = new Set();
+const autoSnipeLastAttemptAt = new Map();
+const autoSnipePlacedAtHistory = [];
 
 // Helper: Generar ID único por oportunidad (eventId + selection)
 // Debe coincidir con la función del frontend
@@ -72,6 +101,149 @@ function getOpportunityId(op) {
   const eventId = String(op.eventId || op.id);
     return `${eventId}_${normalizePick(op)}`;
 }
+
+const isAutoSnipeOpportunity = (op = {}) => {
+    const type = String(op?.type || op?.strategy || '').toUpperCase();
+    return type === 'LIVE_SNIPE' || type === 'LA_VOLTEADA';
+};
+
+const pruneAutoSnipeState = () => {
+    const now = Date.now();
+    const oneHourAgo = now - (60 * 60 * 1000);
+
+    while (autoSnipePlacedAtHistory.length > 0 && autoSnipePlacedAtHistory[0] < oneHourAgo) {
+        autoSnipePlacedAtHistory.shift();
+    }
+
+    for (const [key, ts] of autoSnipeLastAttemptAt.entries()) {
+        if ((now - ts) > Math.max(AUTO_SNIPE_COOLDOWN_PER_PICK_MS * 4, 20 * 60 * 1000)) {
+            autoSnipeLastAttemptAt.delete(key);
+        }
+    }
+};
+
+const maybeRunAutoSnipe = async (opportunity) => {
+    if (!AUTO_SNIPE_ENABLED) return { triggered: false, reason: 'disabled' };
+    if (!isAutoSnipeOpportunity(opportunity)) return { triggered: false, reason: 'not-snipe' };
+
+    if (AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED && !BOOKY_REAL_PLACEMENT_ENABLED) {
+        return { triggered: false, reason: 'booky-real-disabled' };
+    }
+
+    pruneAutoSnipeState();
+
+    const key = getOpportunityId(opportunity);
+    const now = Date.now();
+
+    if (autoSnipeInFlight.has(key)) return { triggered: false, reason: 'in-flight' };
+
+    const lastAttempt = Number(autoSnipeLastAttemptAt.get(key) || 0);
+    if (lastAttempt > 0 && (now - lastAttempt) < AUTO_SNIPE_COOLDOWN_PER_PICK_MS) {
+        return { triggered: false, reason: 'cooldown' };
+    }
+
+    const evPercent = Number(opportunity?.ev);
+    if (!Number.isFinite(evPercent) || evPercent < AUTO_SNIPE_MIN_EV_PERCENT) {
+        return { triggered: false, reason: 'ev-guard' };
+    }
+
+    const stake = Number(opportunity?.kellyStake || 0);
+    if (!Number.isFinite(stake) || stake < AUTO_SNIPE_MIN_STAKE_SOL) {
+        return { triggered: false, reason: 'stake-guard' };
+    }
+
+    const opEventId = String(opportunity?.eventId || opportunity?.id || '');
+    const opPick = normalizePick(opportunity);
+    const candidateOdd = Number(opportunity?.price ?? opportunity?.odd ?? NaN);
+    const activeSamePick = (db.data?.portfolio?.activeBets || []).filter((b) => {
+        const betEventId = String(b?.eventId || b?.id || '');
+        if (!betEventId || !opEventId || betEventId !== opEventId) return false;
+        return normalizePick(b) === opPick;
+    });
+
+    if (activeSamePick.length >= AUTO_SNIPE_MAX_ENTRIES_PER_PICK) {
+        return { triggered: false, reason: 'reentry-cap' };
+    }
+
+    if (activeSamePick.length > 0 && Number.isFinite(candidateOdd) && candidateOdd > 1) {
+        const bestExistingOdd = activeSamePick.reduce((best, b) => {
+            const odd = Number(b?.odd ?? b?.price ?? NaN);
+            if (!Number.isFinite(odd) || odd <= 1) return best;
+            return Math.max(best, odd);
+        }, NaN);
+
+        if (Number.isFinite(bestExistingOdd) && bestExistingOdd > 1) {
+            const oddImprovementPoints = candidateOdd - bestExistingOdd;
+            const oddImprovementPct = ((candidateOdd / bestExistingOdd) - 1) * 100;
+            const passesByPoints = oddImprovementPoints >= AUTO_SNIPE_REENTRY_MIN_ODD_POINTS;
+            const passesByPct = oddImprovementPct >= AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT;
+
+            if (!passesByPoints && !passesByPct) {
+                return {
+                    triggered: false,
+                    reason: `reentry-no-improvement(${oddImprovementPoints.toFixed(2)}pts/${oddImprovementPct.toFixed(1)}%)`
+                };
+            }
+        }
+    }
+
+    if (autoSnipePlacedAtHistory.length >= AUTO_SNIPE_MAX_BETS_PER_HOUR) {
+        return { triggered: false, reason: 'hourly-cap' };
+    }
+
+    autoSnipeInFlight.add(key);
+    autoSnipeLastAttemptAt.set(key, now);
+
+    let ticketIdForLog = 'n/a';
+
+    try {
+        if (AUTO_SNIPE_DRY_RUN) {
+            console.log(`🤖 [AUTO_SNIPE_DRY_RUN] ${opportunity.match} | ${opportunity.selection} | EV=${evPercent.toFixed(2)}% | stake=S/. ${stake.toFixed(2)}`);
+            return { triggered: true, dryRun: true };
+        }
+
+        const ticket = await prepareSemiAutoTicket(opportunity);
+        const ticketId = ticket?.id;
+        ticketIdForLog = ticketId || 'n/a';
+        if (!ticketId) {
+            return { triggered: false, reason: 'ticket-missing-id' };
+        }
+
+        const placementResult = await confirmRealPlacementFast(ticketId);
+        autoSnipePlacedAtHistory.push(Date.now());
+        const status = String(placementResult?.ticket?.status || 'REAL_CONFIRMED_FAST');
+        const portfolioBetId = placementResult?.mirroredBet?.id || placementResult?.ticket?.portfolioBetId || 'n/a';
+        console.log(
+            `✅ [AUTO_SNIPE] Resultado final=CONFIRMED | ${opportunity.match} (${opportunity.selection}) ` +
+            `ticket=${ticketId} status=${status} portfolioBetId=${portfolioBetId}`
+        );
+        return { triggered: true, dryRun: false, ticketId, outcome: 'confirmed', status, portfolioBetId };
+    } catch (error) {
+        const msg = error?.message || 'Error desconocido';
+        const code = String(error?.code || '');
+
+        if (code === 'BOOKY_REAL_PLACEMENT_REJECTED') {
+            console.warn(
+                `❌ [AUTO_SNIPE] Resultado final=REJECTED | ${opportunity?.match || 'n/a'} ` +
+                `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
+            );
+            return { triggered: true, dryRun: false, outcome: 'rejected', reason: 'provider-rejected', error: msg, code };
+        }
+
+        if (code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') {
+            console.warn(
+                `❓ [AUTO_SNIPE] Resultado final=UNCERTAIN | ${opportunity?.match || 'n/a'} ` +
+                `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
+            );
+            return { triggered: true, dryRun: false, outcome: 'uncertain', reason: 'provider-uncertain', error: msg, code };
+        }
+
+        console.warn(`⚠️ [AUTO_SNIPE] Falló ejecución para ${opportunity?.match || 'n/a'}: ${msg}`);
+        return { triggered: false, reason: 'execution-error', error: msg };
+    } finally {
+        autoSnipeInFlight.delete(key);
+    }
+};
 
 const buildOpportunityCoreKey = (op = {}) => {
     const eventId = String(op.eventId || op.id || 'na');
@@ -302,10 +474,25 @@ export const startBackgroundScanner = () => {
             if (ops && ops.length > 0) {
                  console.log(`   🎯 Oportunidades LIVE encontradas: ${ops.length}`);
                 for (const op of ops) {
-                    // [MOD] MODO SEMI-AUTOMÁTICO
-                    // Deshabilitamos el auto-bet para que el usuario confirme manualmente (botón APOSTAR)
-                    // await placeAutoBet(op);
-                    console.log(`      👀 Oportunidad detectada (Esperando confirmación manual): ${op.match}`);
+                    // Modo por defecto: semi-automático.
+                    // Si AUTO_SNIPE está activo, solo ejecuta LIVE_SNIPE/LA_VOLTEADA con guardas.
+                    const autoResult = await maybeRunAutoSnipe(op);
+                    if (autoResult?.triggered) {
+                        if (autoResult.dryRun) {
+                            console.log(`      🤖 AUTO_SNIPE (dry-run): ${op.match}`);
+                        } else if (autoResult.outcome === 'confirmed') {
+                            console.log(`      🤖 AUTO_SNIPE resultado final: CONFIRMED | ${op.match} | ticket=${autoResult.ticketId}`);
+                        } else if (autoResult.outcome === 'rejected') {
+                            console.log(`      🤖 AUTO_SNIPE resultado final: REJECTED | ${op.match}`);
+                        } else if (autoResult.outcome === 'uncertain') {
+                            console.log(`      🤖 AUTO_SNIPE resultado final: UNCERTAIN | ${op.match}`);
+                        } else {
+                            console.log(`      🤖 AUTO_SNIPE ejecutado: ${op.match}`);
+                        }
+                    } else {
+                        const reason = autoResult?.reason || 'manual-default';
+                        console.log(`      👀 Oportunidad detectada (Esperando confirmación manual): ${op.match} | reason=${reason}`);
+                    }
                 }
             } else {
                  if(ticks % 2 === 0) console.log(`   ... Escaneo Live completado. Sin oportunidades (nuevas).`);
@@ -372,7 +559,14 @@ export const startBackgroundScanner = () => {
     };
 
     loop();
-    console.log('🔄 Background Scanner Iniciado (Modo Seguro Anti-Ban) + AUTO-TRADING ACTIVO');
+    console.log(
+        `🔄 Background Scanner Iniciado (Modo Seguro Anti-Ban) | ` +
+        `AUTO_SNIPE=${AUTO_SNIPE_ENABLED ? 1 : 0} dryRun=${AUTO_SNIPE_DRY_RUN ? 1 : 0} ` +
+        `bookyReal=${BOOKY_REAL_PLACEMENT_ENABLED ? 1 : 0} minEV=${AUTO_SNIPE_MIN_EV_PERCENT} ` +
+        `minStake=${AUTO_SNIPE_MIN_STAKE_SOL} hourlyCap=${AUTO_SNIPE_MAX_BETS_PER_HOUR} ` +
+        `reentryPct=${AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT}% reentryPts=${AUTO_SNIPE_REENTRY_MIN_ODD_POINTS} ` +
+        `maxEntriesPick=${AUTO_SNIPE_MAX_ENTRIES_PER_PICK}`
+    );
 };
 
 export const getCachedLiveOpportunities = () => {
