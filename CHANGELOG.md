@@ -7,6 +7,26 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.5] — 2026-03-13 — Sprint: Live Totals Refresh Integrity
+
+> Rama: `master`
+
+### 🔄 Changed
+
+#### Consistencia de pick en Totals (sin fallback a linea 0)
+- **`src/services/bookySemiAutoService.js`**, **`src/services/scannerService.js`**, **`src/routes/opportunities.js`** y **`client/src/App.jsx`**:
+  - `normalizePick()` deja de generar `over_0` / `under_0` cuando no puede parsear línea.
+  - Nuevo comportamiento: usa `over` / `under` como fallback semántico para evitar contaminación de IDs/keys/UI con `Total 0`.
+
+### 🐛 Fixed
+
+#### Falso negativo de EV al confirmar apuesta real en Totals
+- **`src/services/oddsService.js`**:
+  - En `refreshOpportunity()`, el matching de cuotas de Totals ahora exige coincidencia de línea siempre que exista una línea válida (venga del market o de la selección).
+  - Se evita capturar por error otra línea del mismo evento (ej. tomar 5.5 cuando la oportunidad era 6.5), que podía degradar EV positivo a negativo y abortar confirmaciones reales con `El valor desapareció tras refresh`.
+
+---
+
 ## [v3.4.4] — 2026-03-13 — Sprint: Arcadia Auto-Recovery + Live Pipeline Visibility
 
 > Rama: `master`

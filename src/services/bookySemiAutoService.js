@@ -88,13 +88,15 @@ const normalizePick = (obj = {}) => {
   if (combined.includes('BTTS') && combined.includes('NO')) return 'btts_no';
 
   if (combined.includes('OVER') || combined.includes('MÁS') || combined.includes('MAS')) {
-    const line = parseFloat((selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/) || [0])[0]);
-    return `over_${Number.isNaN(line) ? 0 : line}`;
+    const lineMatch = selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/);
+    const line = lineMatch ? parseFloat(lineMatch[0]) : NaN;
+    return Number.isFinite(line) ? `over_${line}` : 'over';
   }
 
   if (combined.includes('UNDER') || combined.includes('MENOS')) {
-    const line = parseFloat((selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/) || [0])[0]);
-    return `under_${Number.isNaN(line) ? 0 : line}`;
+    const lineMatch = selectionStr.match(/\d+(\.\d+)?/) || marketStr.match(/\d+(\.\d+)?/);
+    const line = lineMatch ? parseFloat(lineMatch[0]) : NaN;
+    return Number.isFinite(line) ? `under_${line}` : 'under';
   }
 
   return String(obj.selection || obj.action || obj.market || '').replace(/\s+/g, '_').toLowerCase();
