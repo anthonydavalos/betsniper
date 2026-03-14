@@ -1,10 +1,27 @@
 import express from 'express';
+import { readFile } from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import db, { pruneStaleEventCaches, writeDBWithRetry } from '../db/database.js';
 import { registerDynamicAlias } from '../utils/teamMatcher.js';
 
 const router = express.Router();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DYNAMIC_ALIASES_PATH = path.resolve(__dirname, '../utils/dynamicAliases.json');
+
 const wait = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
+
+const loadDynamicAliases = async () => {
+    try {
+        const raw = await readFile(DYNAMIC_ALIASES_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (_) {
+        return {};
+    }
+};
 
 const buildTupleKey = (row = {}) => {
     const home = String(row?.home || '').trim().toLowerCase();
@@ -41,6 +58,7 @@ router.get('/data', async (req, res) => {
         await db.read();
         const pinnacle = db.data.upcomingMatches || [];
         const altenar = db.data.altenarUpcoming || [];
+        const aliases = await loadDynamicAliases();
         
         // Enviamos todo para que el cliente filtre
         res.json({ 
@@ -61,7 +79,8 @@ router.get('/data', async (req, res) => {
                 date: m.date || m.startDate,
                 league: m.league || m.leagueName || m.championshipName, // [MOD] Updated to use new prop
                 country: m.country // [NEW] Country prop (if available)
-            }))
+            })),
+            aliases
         });
     } catch (e) {
         res.status(500).json({ error: e.message });

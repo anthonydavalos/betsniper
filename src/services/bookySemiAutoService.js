@@ -612,7 +612,16 @@ const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = fals
     }
   }
 
-  const diagnostic = buildProviderDiagnostic({ error: lastError, draft, ticketId, authHeader: auth });
+  const diagnostic = lastError?.diagnostic
+    ? {
+        ...lastError.diagnostic,
+        provider: lastError?.diagnostic?.provider || 'altenar_placeWidget',
+        ticketId: lastError?.diagnostic?.ticketId || ticketId,
+        endpoint: lastError?.diagnostic?.endpoint || draft?.endpoint || PLACE_WIDGET_URL,
+        requestId: lastError?.diagnostic?.requestId || draft?.payload?.requestId || null,
+        observedAt: lastError?.diagnostic?.observedAt || nowIso()
+      }
+    : buildProviderDiagnostic({ error: lastError, draft, ticketId, authHeader: auth });
   const transientFailure = isTransientProviderError(lastError);
   diagnostic.transientFailure = transientFailure;
   diagnostic.acceptanceUnknown = transientFailure;

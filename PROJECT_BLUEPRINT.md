@@ -84,6 +84,47 @@ Para evitar ciclos de relanzamiento de Puppeteer/Pinnacle y mantener refresco au
   - `PINNACLE_AUTO_LOGIN_ENABLED`, `PINNACLE_LOGIN_USERNAME`, `PINNACLE_LOGIN_PASSWORD`
 5. **Principio de seguridad operacional:** nunca degradar a modo manual por defecto; preferir automatizacion con rate-limit y observabilidad de logs.
 
+### 3.2 AUTO_SNIPE Controlado (Live Snipe Real Placement)
+
+El motor de auto-colocacion para `LIVE_SNIPE` debe operar con guardas explicitas y observabilidad completa.
+
+1. **Scope estricto:** aplicar solo a oportunidades `LIVE_SNIPE` / `LA_VOLTEADA`.
+2. **Rollout por flags (`.env`):**
+  - `AUTO_SNIPE_ENABLED`
+  - `AUTO_SNIPE_DRY_RUN`
+  - `AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED`
+  - `AUTO_SNIPE_MIN_EV_PERCENT`
+  - `AUTO_SNIPE_MIN_STAKE_SOL`
+  - `AUTO_SNIPE_MAX_BETS_PER_HOUR`
+  - `AUTO_SNIPE_COOLDOWN_PER_PICK_MS`
+3. **Guardas de reentrada (obligatorias):**
+  - `AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT`
+  - `AUTO_SNIPE_REENTRY_MIN_ODD_POINTS`
+  - `AUTO_SNIPE_MAX_ENTRIES_PER_PICK`
+4. **Trazabilidad de decisiones:** loggear siempre cuando una oportunidad pasa a manual con `reason=...`.
+5. **Trazabilidad de resultado final:** cada intento auto debe cerrar con outcome explicito `CONFIRMED`, `REJECTED` o `UNCERTAIN`.
+6. **No reintento ciego ante incertidumbre:** si el provider queda en estado incierto, reconciliar primero contra `GET /api/booky/account?refresh=1`.
+
+### 3.3 Matcher Hibrido (Auto + Manual High Confidence)
+
+Para reducir backlog de eventos no enlazados sin aumentar falsos positivos:
+
+1. **Backend como fuente unica de aliases:**
+  - `src/utils/dynamicAliases.json` (hot reload).
+  - Exponer aliases al frontend mediante `GET /api/matcher/data`.
+2. **Score compuesto en UI matcher:** combinar similitud home/away, riesgo de swap, contexto liga/pais y diferencia respecto al segundo candidato.
+3. **Aplicacion masiva con control:** habilitar `APLICAR` y `APLICAR TOP 20` solo con threshold alto y diagnostico visible.
+4. **Regla de seguridad:** si hay señales de categorias sensibles (`Women`, `U21`, `Reserve`, `II/III`), endurecer matching contextual.
+5. **Criterio de bypass contextual:** permitir bypass de gate de liga solo cuando el par home/away sea extremadamente fuerte y sin riesgo de swap.
+
+### 3.4 Auditoria de rechazo provider (Booky)
+
+En `bookySemiAutoService`, cuando `placeWidget` responda rechazo o error:
+
+1. Preservar diagnostico crudo del provider (`providerStatus`, `providerBody`, `requestId`) al repropagar excepcion.
+2. Archivar siempre como rechazo auditable (`REAL_REJECTED` / `REAL_REJECTED_FAST`) o incierto segun corresponda.
+3. Evitar clasificar como confirmado si falta `bets[]` en respuesta.
+
 ### MÓDULO A: "Source of Truth" (Pinnacle Arcadia)
 **Endpoint:** `guest.api.arcadia.pinnacle.com/0.1` (Guest API Unofficial).
 **Restricción:** Usar Headers/Cookies de "Invitado" y throttling para no ser bloqueado por WAF.

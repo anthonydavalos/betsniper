@@ -14,10 +14,42 @@ const normalizeText = (value = '') => String(value || '')
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\bphilippines\b/g, 'filipinas')
+    .replace(/\bpfl\b/g, 'liga futbol filipina')
+    .replace(/\bclub friendlies\b/g, 'amistosos clubes')
+    .replace(/\bamistosos de clubes\b/g, 'amistosos clubes')
+    .replace(/\bturkey\b/g, 'turquia')
+    .replace(/\b2nd\b/g, '2')
+    .replace(/\bleague\b/g, 'lig')
+    .replace(/\bpraha\b/g, 'prague')
+    .replace(/\bsjk\b/g, 'seinajoen jk')
+    .replace(/\btiffy army\b/g, 'national defense')
+    .replace(/\bkisvarda 2\b/g, 'kisvarda bteam')
+    .replace(/\bkisvarda fc ii\b/g, 'kisvarda bteam')
+    .replace(/\bkomaromi vse\b/g, 'komarom')
+    .replace(/\bfosfat\b/g, ' ')
+    .replace(/\bspor\b/g, ' ')
+    .replace(/\b(19|20)\d{2}\b/g, ' ')
+    .replace(/\b(ii|iii|iv)\b/g, ' bteam ')
+    .replace(/\b(b|res|reserve|reserves)\b/g, ' bteam ')
+    .replace(/\b(fk|sk|fc|cf|sc|ac|mfk|fotbal|club)\b/g, ' ')
     .replace(/\(f\)|\(res\.?\)|\bu\d{2}\b|\bres\b|\breserves\b/g, ' ')
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+const resolveAliasName = (normalizedValue = '', aliases = {}) => {
+    let current = String(normalizedValue || '');
+    if (!current) return current;
+
+    const visited = new Set();
+    while (aliases[current] && !visited.has(current)) {
+        visited.add(current);
+        current = aliases[current];
+    }
+
+    return current;
+};
 
 const isSwappedRisk = (pin = {}, alt = {}) => {
     const pinHome = normalizeText(pin?.home || splitSides(pin?.match || '').home);
@@ -34,10 +66,98 @@ const isSwappedRisk = (pin = {}, alt = {}) => {
     return swapped && !direct;
 };
 
+const levenshteinDistance = (a = '', b = '') => {
+    const s = String(a || '');
+    const t = String(b || '');
+    if (s === t) return 0;
+    const m = s.length;
+    const n = t.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i += 1) dp[i][0] = i;
+    for (let j = 0; j <= n; j += 1) dp[0][j] = j;
+
+    for (let i = 1; i <= m; i += 1) {
+        for (let j = 1; j <= n; j += 1) {
+            const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+            dp[i][j] = Math.min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost
+            );
+        }
+    }
+
+    return dp[m][n];
+};
+
+const tokenScore = (a = '', b = '', aliases = {}) => {
+    const na = resolveAliasName(normalizeText(a), aliases);
+    const nb = resolveAliasName(normalizeText(b), aliases);
+    const ta = na.split(' ').filter(Boolean);
+    const tb = nb.split(' ').filter(Boolean);
+    if (!ta.length || !tb.length) return 0;
+    const sa = new Set(ta);
+    const sb = new Set(tb);
+    let overlap = 0;
+    for (const w of sa) {
+        if (sb.has(w)) overlap += 1;
+    }
+    return Math.max(overlap / sa.size, overlap / sb.size);
+};
+
+const textSimilarity = (a = '', b = '', aliases = {}) => {
+    const na = resolveAliasName(normalizeText(a), aliases);
+    const nb = resolveAliasName(normalizeText(b), aliases);
+    if (!na || !nb) return 0;
+    if (na === nb) return 1;
+    const tok = tokenScore(na, nb, aliases);
+    const dist = levenshteinDistance(na, nb);
+    const lev = 1 - (dist / Math.max(na.length, nb.length, 1));
+    return Math.max(tok, lev);
+};
+
+const evaluatePairConfidence = (pin = {}, alt = {}, aliases = {}) => {
+    const pinHome = pin?.home || splitSides(pin?.match || '').home;
+    const pinAway = pin?.away || splitSides(pin?.match || '').away;
+    const altSides = splitSides(alt?.name || `${alt?.home || ''} vs ${alt?.away || ''}`);
+
+    const directHome = textSimilarity(pinHome, altSides.home, aliases);
+    const directAway = textSimilarity(pinAway, altSides.away, aliases);
+    const swappedHome = textSimilarity(pinHome, altSides.away, aliases);
+    const swappedAway = textSimilarity(pinAway, altSides.home, aliases);
+
+    const directScore = Math.min(directHome, directAway);
+    const swappedScore = Math.min(swappedHome, swappedAway);
+
+    return {
+        directHome,
+        directAway,
+        swappedHome,
+        swappedAway,
+        directScore,
+        swappedScore,
+        orientation: directScore >= swappedScore ? 'direct' : 'swapped'
+    };
+};
+
+const contextSimilarity = (pinLeague = '', altLeague = '', altCountry = '', aliases = {}) => {
+    const left = normalizeText(pinLeague);
+    const right = normalizeText(`${altLeague || ''} ${altCountry || ''}`);
+    if (!left || !right) return null;
+    return textSimilarity(left, right, aliases);
+};
+
 const ManualMatcher = () => {
     const [pinnacleData, setPinnacleData] = useState([]);
     const [altenarData, setAltenarData] = useState([]);
     const [loading, setLoading] = useState(false);
+    const [buildingSuggestions, setBuildingSuggestions] = useState(false);
+    const [applyingSuggestions, setApplyingSuggestions] = useState(false);
+    const [suggestedLinks, setSuggestedLinks] = useState([]);
+    const [dynamicAliases, setDynamicAliases] = useState({});
     
     const [filterPin, setFilterPin] = useState('');
     const [filterAlt, setFilterAlt] = useState('');
@@ -55,6 +175,16 @@ const ManualMatcher = () => {
             const res = await axios.get('http://localhost:3000/api/matcher/data');
             setPinnacleData(res.data.pinnacle);
             setAltenarData(res.data.altenar);
+            const rawAliases = (res.data.aliases && typeof res.data.aliases === 'object') ? res.data.aliases : {};
+            const normalizedAliases = {};
+            for (const [fromRaw, toRaw] of Object.entries(rawAliases)) {
+                const from = normalizeText(fromRaw);
+                const to = normalizeText(toRaw);
+                if (!from || !to) continue;
+                normalizedAliases[from] = to;
+            }
+            setDynamicAliases(normalizedAliases);
+            setSuggestedLinks([]);
         } catch (e) {
             console.error("Error fetching matcher data:", e);
         } finally {
@@ -75,6 +205,186 @@ const ManualMatcher = () => {
 
     // Identificar IDs de Altenar ya ocupados
     const linkedAltenarIds = new Set(pinnacleData.map(p => p.altenarId).filter(id => id != null));
+
+    const buildHighConfidenceSuggestions = () => {
+        const HIGH_CONF_MIN_PAIR_SCORE = 0.84;
+        const HIGH_CONF_MIN_MARGIN = 0.08;
+        const HIGH_CONF_MAX_TIME_DIFF_MIN = 2;
+        const HIGH_CONF_MIN_LEAGUE_SCORE = 0.20;
+        const HIGH_CONF_LEAGUE_EPS = 1e-6;
+        const HIGH_CONF_SECONDARY_MIN_SIDE = 0.60;
+        const HIGH_CONF_SECONDARY_MAX_SIDE = 0.98;
+        const HIGH_CONF_VERY_STRONG_PAIR = 0.98;
+        const MAX_SUGGESTIONS = 120;
+
+        const occupiedAltIds = new Set(pinnacleData.map(p => p.altenarId).filter(id => id != null));
+        const stagedAltIds = new Set();
+        const unlinkedPin = pinnacleData.filter(p => !p.altenarId);
+        const suggestions = [];
+
+        for (const pin of unlinkedPin) {
+            const pinTs = new Date(pin.date).getTime();
+            if (!Number.isFinite(pinTs)) continue;
+
+            const scored = [];
+
+            for (const alt of altenarData) {
+                if (!alt?.id || occupiedAltIds.has(alt.id) || stagedAltIds.has(alt.id)) continue;
+
+                const altTs = new Date(alt.date).getTime();
+                if (!Number.isFinite(altTs)) continue;
+
+                const timeDiffMin = Math.abs(pinTs - altTs) / 60000;
+                if (timeDiffMin > HIGH_CONF_MAX_TIME_DIFF_MIN) continue;
+
+                const pair = evaluatePairConfidence(pin, alt, dynamicAliases);
+                if (pair.orientation !== 'direct') continue;
+                if (pair.swappedScore >= 0.82) continue;
+
+                const leagueScore = contextSimilarity(pin?.league || '', alt?.league || '', alt?.country || '', dynamicAliases);
+
+                const sideMin = Math.min(pair.directHome, pair.directAway);
+                const sideMax = Math.max(pair.directHome, pair.directAway);
+                const strongPrimary = pair.directScore >= HIGH_CONF_MIN_PAIR_SCORE;
+                const strongSecondary =
+                    timeDiffMin === 0 &&
+                    sideMin >= HIGH_CONF_SECONDARY_MIN_SIDE &&
+                    sideMax >= HIGH_CONF_SECONDARY_MAX_SIDE &&
+                    pair.swappedScore <= 0.25;
+                if (!strongPrimary && !strongSecondary) continue;
+
+                const skipLeagueGate =
+                    timeDiffMin === 0 &&
+                    pair.directScore >= HIGH_CONF_VERY_STRONG_PAIR &&
+                    pair.swappedScore <= 0.25;
+                if (
+                    !skipLeagueGate &&
+                    leagueScore !== null &&
+                    (leagueScore + HIGH_CONF_LEAGUE_EPS) < HIGH_CONF_MIN_LEAGUE_SCORE
+                ) {
+                    continue;
+                }
+
+                if (timeDiffMin > 0 && pair.directScore < 0.93) continue;
+
+                const timeScore = Math.max(0, 1 - (timeDiffMin / HIGH_CONF_MAX_TIME_DIFF_MIN));
+                const contextScore = leagueScore === null ? 0.5 : leagueScore;
+                const confidence = (pair.directScore * 0.72) + (timeScore * 0.18) + (contextScore * 0.10);
+
+                scored.push({
+                    pin,
+                    alt,
+                    pair,
+                    timeDiffMin,
+                    leagueScore,
+                    confidence
+                });
+            }
+
+            if (!scored.length) continue;
+            scored.sort((a, b) => b.confidence - a.confidence);
+
+            const best = scored[0];
+            const second = scored[1] || null;
+            const margin = second ? (best.confidence - second.confidence) : 1;
+            if (margin < HIGH_CONF_MIN_MARGIN) continue;
+
+            stagedAltIds.add(best.alt.id);
+            suggestions.push({ ...best, margin });
+            if (suggestions.length >= MAX_SUGGESTIONS) break;
+        }
+
+        suggestions.sort((a, b) => b.confidence - a.confidence);
+        return suggestions;
+    };
+
+    const handleSuggestHighConfidence = () => {
+        setBuildingSuggestions(true);
+        try {
+            const suggestions = buildHighConfidenceSuggestions();
+            setSuggestedLinks(suggestions);
+        } finally {
+            setBuildingSuggestions(false);
+        }
+    };
+
+    const handleApplySuggested = async (limit = null) => {
+        if (!suggestedLinks.length || applyingSuggestions) return;
+
+        const batch = Number.isFinite(Number(limit)) && Number(limit) > 0
+            ? suggestedLinks.slice(0, Number(limit))
+            : suggestedLinks;
+        if (!batch.length) return;
+
+        setApplyingSuggestions(true);
+        let applied = 0;
+        let failed = 0;
+        const failedItems = [];
+        const appliedByPinId = new Map();
+
+        try {
+            for (const suggestion of batch) {
+                const payload = {
+                    pinnacleId: suggestion.pin.id,
+                    altenarId: suggestion.alt.id,
+                    altenarName: suggestion.alt.name
+                };
+
+                const doLink = () => axios.post('http://localhost:3000/api/matcher/link', payload, { timeout: 45000 });
+
+                try {
+                    try {
+                        await doLink();
+                    } catch (linkError) {
+                        const status = Number(linkError?.response?.status);
+                        const linkMsg = String(linkError?.response?.data?.error || linkError?.message || '').toLowerCase();
+                        const isTimeout = linkError?.code === 'ECONNABORTED' || linkMsg.includes('timeout');
+                        const isRace409 = status === 409;
+                        if (!isTimeout && !isRace409) throw linkError;
+
+                        await new Promise(resolve => setTimeout(resolve, 900));
+                        await doLink();
+                    }
+
+                    applied += 1;
+                    appliedByPinId.set(suggestion.pin.id, {
+                        altenarId: suggestion.alt.id,
+                        altenarName: suggestion.alt.name
+                    });
+                } catch (error) {
+                    failed += 1;
+                    failedItems.push(
+                        `${suggestion.pin.home} vs ${suggestion.pin.away} -> ${suggestion.alt.name}: ${error?.response?.data?.error || error?.message || 'Error desconocido'}`
+                    );
+                }
+            }
+
+            if (appliedByPinId.size > 0) {
+                setPinnacleData(prev => prev.map(p => {
+                    const linked = appliedByPinId.get(p.id);
+                    if (!linked) return p;
+                    return {
+                        ...p,
+                        altenarId: linked.altenarId,
+                        altenarName: linked.altenarName
+                    };
+                }));
+            }
+
+            if (applied > 0) {
+                setSuggestedLinks(prev => prev.filter(s => !appliedByPinId.has(s.pin.id)));
+            }
+
+            if (failed > 0) {
+                alert(
+                    `Auto-link High Confidence finalizado. Aplicados: ${applied}, Fallidos: ${failed}.` +
+                    `\n\nPrimeros fallos:\n${failedItems.slice(0, 5).join('\n')}`
+                );
+            }
+        } finally {
+            setApplyingSuggestions(false);
+        }
+    };
 
     // Filtrar Altenar
     // Si hay un seleccionado en Pinnacle, sugerir por nombre
@@ -201,10 +511,62 @@ const ManualMatcher = () => {
                 <h2 className="text-xl font-bold flex items-center gap-2">
                     <Link className="text-blue-400" /> Manual Matcher
                 </h2>
-                <button onClick={fetchData} className="p-2 bg-gray-800 rounded hover:bg-gray-700">
-                    <RefreshCw size={20} className={loading ? "animate-spin" : ""} />
-                </button>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={handleSuggestHighConfidence}
+                        disabled={buildingSuggestions || loading}
+                        className="px-3 py-2 bg-indigo-700 rounded hover:bg-indigo-600 disabled:opacity-60 disabled:cursor-not-allowed text-xs font-bold"
+                        title="Generar sugerencias seguras por nombre+tiempo+contexto"
+                    >
+                        {buildingSuggestions ? 'SUGIRIENDO...' : 'SUGERIR HIGH CONF'}
+                    </button>
+                    <button
+                        onClick={() => handleApplySuggested()}
+                        disabled={applyingSuggestions || suggestedLinks.length === 0}
+                        className="px-3 py-2 bg-emerald-700 rounded hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed text-xs font-bold"
+                        title="Aplicar en lote solo sugerencias de alta confianza"
+                    >
+                        {applyingSuggestions ? 'APLICANDO...' : `APLICAR (${suggestedLinks.length})`}
+                    </button>
+                    <button
+                        onClick={() => handleApplySuggested(20)}
+                        disabled={applyingSuggestions || suggestedLinks.length === 0}
+                        className="px-3 py-2 bg-teal-700 rounded hover:bg-teal-600 disabled:opacity-60 disabled:cursor-not-allowed text-xs font-bold"
+                        title="Aplicar solo las primeras 20 sugerencias de alta confianza"
+                    >
+                        {applyingSuggestions ? 'APLICANDO TOP 20...' : `APLICAR TOP 20 (${Math.min(20, suggestedLinks.length)})`}
+                    </button>
+                    <button onClick={fetchData} className="p-2 bg-gray-800 rounded hover:bg-gray-700">
+                        <RefreshCw size={20} className={loading ? "animate-spin" : ""} />
+                    </button>
+                </div>
             </div>
+
+            {suggestedLinks.length > 0 && (
+                <div className="mb-4 bg-emerald-950/40 border border-emerald-700 rounded-lg p-3">
+                    <div className="flex items-center justify-between">
+                        <div className="text-sm font-bold text-emerald-300 flex items-center gap-2">
+                            <CheckCircle size={16} />
+                            Sugerencias High Confidence: {suggestedLinks.length}
+                        </div>
+                        <div className="text-[11px] text-emerald-200/80">
+                            Solo se incluyen pares con orientación directa, score alto y sin ambigüedad
+                        </div>
+                    </div>
+                    <div className="mt-2 max-h-40 overflow-y-auto text-xs space-y-1">
+                        {suggestedLinks.slice(0, 25).map(item => (
+                            <div key={`${item.pin.id}_${item.alt.id}`} className="flex justify-between gap-2">
+                                <span className="text-emerald-100">
+                                    {item.pin.home} vs {item.pin.away} → {item.alt.name}
+                                </span>
+                                <span className="text-emerald-300">
+                                    conf={item.confidence.toFixed(3)} pair={item.pair.directScore.toFixed(3)} Δt={item.timeDiffMin.toFixed(1)}m
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-[75vh]">
                 

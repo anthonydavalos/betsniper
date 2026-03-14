@@ -89,6 +89,37 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 - `.env.example` fue actualizado con todos los nuevos knobs de Arcadia/Gateway/autologin.
 - `src/utils/dynamicAliases.json` añade aliases nuevos para reforzar matching en ligas con nombres variantes.
 
+### 7) AUTO_SNIPE con outcome final y razones auditables
+
+- `src/services/scannerService.js` ahora deja resultado final por intento con estado:
+  - `CONFIRMED`
+  - `REJECTED`
+  - `UNCERTAIN`
+- Si una oportunidad `LIVE_SNIPE` queda en manual, se registra `reason=...` para evitar silent-drop.
+- El arranque del motor auto-snipe loguea parametros efectivos (enabled/dryrun/minEV/minStake/hourlyCap).
+
+### 8) Reentry policy segura para LIVE_SNIPE
+
+- Se incorporan guardas de reentrada para evitar entradas casi identicas sin mejora de precio:
+  - `AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT`
+  - `AUTO_SNIPE_REENTRY_MIN_ODD_POINTS`
+  - `AUTO_SNIPE_MAX_ENTRIES_PER_PICK`
+- Si no hay mejora material o se supero el limite por pick, el flujo marca razon explicita (`reentry-no-improvement`, `reentry-cap`).
+
+### 9) Matcher High Confidence (Manual Assist)
+
+- `client/src/components/ManualMatcher.jsx` incorpora motor de sugerencias con score compuesto.
+- Nuevas acciones operativas para lote controlado:
+  - `SUGERIR`
+  - `APLICAR`
+  - `APLICAR TOP 20`
+- El score combina similitud home/away, riesgo de swap, ventana temporal y contexto de liga/pais.
+
+### 10) Evidencia provider preservada en rechazos Booky
+
+- `src/services/bookySemiAutoService.js` conserva `providerStatus/providerBody/requestId` al envolver errores de `placeWidget`.
+- Esto mejora auditoria de rechazos definitivos (`BOOKY_PLACEWIDGET_REJECTED`) y post-mortem de apuestas reales.
+
 ## 🚀 Características Principales
 
 ### 🧠 Motor Cuantitativo (Quant Core)
@@ -1109,10 +1140,11 @@ Total Apostado: S/1,234.00 | Ganado: S/1,421.30 | ROI: +15.2% | Win Rate: 58.3%
 
 **Flujo:**
 1.  Lista de eventos Altenar sin match.
-2.  Buscar manualmente en lista de Pinnacle.
-3.  Click en "VINCULAR".
-4.  El sistema guarda el mapping en `db.json`.
-5.  Futuras detecciones usarán este match guardado.
+2.  Click en `SUGERIR` para generar candidatos `High Confidence`.
+3.  Revisar sugerencias y aplicar con `APLICAR` o `APLICAR TOP 20`.
+4.  Para casos puntuales, buscar manualmente en lista de Pinnacle y usar `VINCULAR`.
+5.  El sistema guarda el mapping en `db.json`.
+6.  Futuras detecciones usarán este match guardado y los aliases dinámicos del backend.
 
 ---
 
@@ -1286,6 +1318,18 @@ ALTENAR_SPORT_ID=0
 # BOOKY_TOKEN_MIN_REMAINING_MINUTES=2
 # BOOKY_MIN_EV_PERCENT=2
 # BOOKY_MAX_ODD_DROP=0.20
+
+# AUTO_SNIPE (rollout controlado)
+# AUTO_SNIPE_ENABLED=false
+# AUTO_SNIPE_DRY_RUN=true
+# AUTO_SNIPE_MIN_EV_PERCENT=3
+# AUTO_SNIPE_MIN_STAKE_SOL=2
+# AUTO_SNIPE_MAX_BETS_PER_HOUR=4
+# AUTO_SNIPE_COOLDOWN_PER_PICK_MS=120000
+# AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED=true
+# AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT=8
+# AUTO_SNIPE_REENTRY_MIN_ODD_POINTS=0.30
+# AUTO_SNIPE_MAX_ENTRIES_PER_PICK=2
 
 # Matcher diagnostics/tuning
 # MATCH_DIAGNOSTIC_LOG=1
