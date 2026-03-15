@@ -7,6 +7,32 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.10] -- 2026-03-15 -- Sprint: Token Sync to Google Sheets
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Sincronizacion automatica de token Altenar a Google Sheets
+- **`scripts/extract-booky-auth-token.js`**:
+  - Nuevo paso de sincronizacion opcional via webhook luego de persistir `ALTENAR_BOOKY_AUTH_TOKEN` en `.env`.
+  - Payload enviado: `{ "token": "Bearer <jwt>" }`.
+  - El flujo no se bloquea si el webhook falla; se deja diagnostico en logs.
+
+#### Configuracion por entorno para webhook
+- **`.env.example`**:
+  - Se documenta `GSHEETS_TOKEN_WEBHOOK_URL` solo como ejemplo (placeholder).
+- **`.env` (local)**:
+  - Debe contener la URL real del Apps Script para actualizar hoja `TOKEN!A1`.
+
+### 🔄 Changed
+
+#### Politica de seguridad de credenciales y webhooks
+- **`PROJECT_BLUEPRINT.md`**:
+  - Se formaliza que la URL real del webhook no debe hardcodearse ni versionarse.
+
+---
+
 ## [v3.4.9] -- 2026-03-15 -- Sprint: Arcadia/ACity Login Separation + Reliability Hardening
 
 > Rama: `master`

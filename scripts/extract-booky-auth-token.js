@@ -234,6 +234,36 @@ const isAltenarApiRequest = (url = '') => {
   return low.includes('biahosted.com/api/') || low.includes('/api/widget/');
 };
 
+// Función para enviar el token a Google Sheets por medio del Webhook
+const syncTokenToGoogleSheets = async (nuevoToken) => {
+  const WEBHOOK_URL = process.env.GSHEETS_TOKEN_WEBHOOK_URL || '';
+
+  if (!WEBHOOK_URL) return;
+
+  try {
+    if (typeof fetch !== 'function') {
+      console.warn('   ⚠️ fetch no está disponible en esta versión de Node. Se omite sync con Google Sheets.');
+      return;
+    }
+
+    console.log('   Sincronizando token con Google Sheets...');
+    const response = await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: nuevoToken })
+    });
+
+    const result = await response.json().catch(() => ({}));
+    if (result?.success) {
+      console.log('   ✅ Google Sheets Token Actualizado!');
+    } else {
+      console.log(`   ⚠️ Error al actualizar Sheets: ${result?.message || `HTTP ${response.status}`}`);
+    }
+  } catch (error) {
+    console.error(`   ❌ Falló la conexión con el Webhook de Google Sheets: ${error.message}`);
+  }
+};
+
 const run = async () => {
   if (requiredProfile && bookProfile !== requiredProfile) {
     console.error(`❌ Perfil inválido. Requerido=${requiredProfile} Actual=${bookProfile}`);
@@ -320,6 +350,9 @@ const run = async () => {
         nextEnv = upsertEnvKey(nextEnv, 'BOOKY_REAL_PLACEMENT_ENABLED', 'false');
       }
       fs.writeFileSync(envPath, nextEnv, 'utf8');
+
+      // Sincronizar el nuevo token con Google Sheets automáticamente
+      await syncTokenToGoogleSheets(foundAuth);
 
       await finish(true, 'Token capturado y guardado en .env (ALTENAR_BOOKY_AUTH_TOKEN).');
     } catch (_) {}

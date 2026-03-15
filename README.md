@@ -146,6 +146,36 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
   - `PINNACLE_CHROME_PROFILE_DIR=data/pinnacle/chrome-profile`
 - Recomendación operativa: mantener Arcadia y Booky en perfiles separados para evitar contaminación de sesión.
 
+### 15) Sync automático de token Altenar a Google Sheets
+
+- `scripts/extract-booky-auth-token.js` sincroniza el token capturado a Google Sheets justo despues de actualizar `ALTENAR_BOOKY_AUTH_TOKEN` en `.env`.
+- Variable de entorno usada para el webhook:
+  - `GSHEETS_TOKEN_WEBHOOK_URL`
+- Politica de seguridad:
+  - `.env.example` solo incluye ejemplo/comentario de la variable.
+  - `.env` (local, no versionado) debe contener la URL real del Apps Script.
+- Comportamiento operativo:
+  - Si el webhook no esta definido, la captura de token continua sin fallo.
+  - Si el webhook falla, se registra warning/error pero no se bloquea la renovacion del token.
+
+Secuencia exacta de actualizacion (timing):
+
+1. Puppeteer detecta request Altenar con `Authorization` valido.
+2. El script actualiza `.env` (`ALTENAR_BOOKY_AUTH_TOKEN=Bearer ...`).
+3. Inmediatamente en la misma ejecucion hace `POST` al webhook con `{ token: "Bearer ..." }`.
+4. El Apps Script (`doPost`) recibe payload y actualiza `TOKEN!A1`.
+5. El proceso de extraccion finaliza como exitoso.
+
+Nota: la sincronizacion a Sheets no se ejecuta antes del guardado en `.env`; siempre ocurre despues del upsert local del token.
+
+Ejemplo esperado de payload enviado al webhook:
+
+```json
+{
+  "token": "Bearer <jwt>"
+}
+```
+
 ## 🚀 Características Principales
 
 ### 🧠 Motor Cuantitativo (Quant Core)
