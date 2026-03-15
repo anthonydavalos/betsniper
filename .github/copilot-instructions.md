@@ -112,6 +112,19 @@ Cuando haya desync de reloj o socket stale en Pinnacle:
   - si faltan credenciales, loggear warning y continuar sin bloquear gateway.
 7.  **No reiniciar ciegamente durante grace de login** salvo que `PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE=true`.
 
+## 9.1 SEPARACIÓN DE CONTEXTO ARCADA VS BOOKY (OBLIGATORIO)
+
+Cuando toques login/sesión de navegadores:
+
+1.  **Arcadia/Pinnacle con perfil dedicado:** usar `PINNACLE_CHROME_PROFILE_DIR` (default recomendado `data/pinnacle/chrome-profile`).
+2.  **No compartir perfiles por defecto:** evita que `pinnacleGateway` dependa de `BOOK_PROFILE` para `userDataDir`.
+3.  **Ownership estricto de login:**
+  - login Pinnacle solo en `services/pinnacleGateway.js`,
+  - login ACity/Altenar solo en `scripts/extract-booky-auth-token.js` y `scripts/capture-altenar-betslip.js`.
+4.  **Detección de sesión antes de autologin:**
+  - si header indica sesión activa (cuenta/deposito/bankroll), no forzar login,
+  - si aparece bloque de login real, entonces sí enviar credenciales.
+
 ## 10. AUTO_SNIPE (ROLLOUT REAL + REENTRY POLICY)
 
 Cuando toques `src/services/scannerService.js` en flujo `LIVE_SNIPE`:

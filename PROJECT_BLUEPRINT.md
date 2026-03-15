@@ -83,6 +83,18 @@ Para evitar ciclos de relanzamiento de Puppeteer/Pinnacle y mantener refresco au
   - `PINNACLE_STALE_RELOAD_ALLOW_DURING_GRACE`
   - `PINNACLE_AUTO_LOGIN_ENABLED`, `PINNACLE_LOGIN_USERNAME`, `PINNACLE_LOGIN_PASSWORD`
 5. **Principio de seguridad operacional:** nunca degradar a modo manual por defecto; preferir automatizacion con rate-limit y observabilidad de logs.
+6. **Separacion de perfiles de navegador (obligatoria):**
+  - Arcadia/Pinnacle debe usar perfil dedicado (`PINNACLE_CHROME_PROFILE_DIR`, default `data/pinnacle/chrome-profile`).
+  - No compartir por defecto `userDataDir` de Booky/Altenar con el gateway de Pinnacle.
+7. **Deteccion de estado de sesion en header Pinnacle:**
+  - Si hay menu de cuenta / deposito / bankroll, tratar como sesion activa y evitar login redundante.
+  - Solo intentar login cuando exista bloque de formulario real (`username/password` + login button).
+
+### 3.1.1 Ownership de login por fuente
+
+1. **Arcadia login** vive en `services/pinnacleGateway.js` y solo debe cubrir Pinnacle.
+2. **ACity/Altenar login** vive en scripts Booky (`scripts/extract-booky-auth-token.js`, `scripts/capture-altenar-betslip.js`).
+3. Prohibido mezclar selectores ACity dentro de gateway Arcadia para evitar falsos positivos y acoplamiento cruzado.
 
 ### 3.2 AUTO_SNIPE Controlado (Live Snipe Real Placement)
 

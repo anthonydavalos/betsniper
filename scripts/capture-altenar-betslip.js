@@ -123,7 +123,15 @@ const tryLogin = async (page) => {
     return false;
   }
 
+  const isAcity = bookProfile === 'acity';
+  const loginTriggerSelectors = [
+    'button#login',
+    '#login',
+    '[data-test-id="header-login-loginButton"] button'
+  ];
+
   const userSelectors = [
+    'input[name="user"]',
     'input[name="username"]',
     'input[name="login"]',
     'input[type="email"]',
@@ -140,6 +148,8 @@ const tryLogin = async (page) => {
 
   const submitSelectors = [
     'button[type="submit"]',
+    'form button.styles_primaryButton__02bqI',
+    'form button.styles_baseButton__3ohKA',
     'button[id*="login"]',
     'button[class*="login"]',
     'button[class*="signin"]',
@@ -148,6 +158,38 @@ const tryLogin = async (page) => {
 
   try {
     await page.waitForTimeout?.(1000);
+
+    const alreadyLoggedIn = await page.evaluate(() => {
+      const bodyText = String(document.body?.innerText || '').toLowerCase();
+      const hasMyBets = bodyText.includes('mis apuestas');
+      const hasDeposit = bodyText.includes('depositar');
+      return hasMyBets && hasDeposit;
+    }).catch(() => false);
+
+    if (alreadyLoggedIn) {
+      console.log('✅ Sesión ya autenticada en ACity (MIS APUESTAS + DEPOSITAR detectado). Se omite login.');
+      return true;
+    }
+
+    if (isAcity) {
+      const triggerSelector = await firstSelector(page, loginTriggerSelectors);
+      if (triggerSelector) {
+        try {
+          const triggerHandle = await page.$(triggerSelector);
+          const canClick = triggerHandle
+            ? await page.evaluate((el) => {
+                const txt = String(el?.innerText || el?.textContent || '').trim().toLowerCase();
+                return txt.includes('ingresar') || txt.includes('iniciar sesi') || txt.includes('login');
+              }, triggerHandle)
+            : false;
+          if (canClick) {
+            await page.click(triggerSelector);
+            await page.waitForTimeout?.(450);
+          }
+        } catch (_) {}
+      }
+    }
+
     const userSelector = await firstSelector(page, userSelectors);
     const passSelector = await firstSelector(page, passSelectors);
 
@@ -164,8 +206,46 @@ const tryLogin = async (page) => {
 
     const submitSelector = await firstSelector(page, submitSelectors);
     if (submitSelector) {
-      await page.click(submitSelector);
-      console.log('🔐 Login automático enviado. Si hay captcha/2FA, complétalo manualmente en la ventana.');
+      const clicked = await page.$eval(submitSelector, (el) => {
+        const txt = String(el?.innerText || el?.textContent || '').trim().toLowerCase();
+        if (txt.includes('mostrar')) return false;
+        el.click();
+        return true;
+      }).catch(() => false);
+      if (clicked) {
+        console.log('🔐 Login automático enviado. Si hay captcha/2FA, complétalo manualmente en la ventana.');
+        return true;
+      }
+    }
+
+    const submittedByForm = await page.$eval(passSelector, (el) => {
+      const form = el?.form || el?.closest?.('form');
+      if (!form) return false;
+
+      const buttons = Array.from(form.querySelectorAll('button, [role="button"]'));
+      const submitBtn = buttons.find((btn) => {
+        const txt = String(btn?.innerText || btn?.textContent || '').trim().toLowerCase();
+        if (!txt || txt.includes('mostrar')) return false;
+        if (txt.includes('iniciar sesi') || txt.includes('ingresar') || txt.includes('login') || txt.includes('sign in')) return true;
+        return btn?.type === 'submit';
+      });
+
+      if (submitBtn) {
+        submitBtn.click();
+        return true;
+      }
+
+      if (typeof form.requestSubmit === 'function') {
+        form.requestSubmit();
+        return true;
+      }
+
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      return true;
+    }).catch(() => false);
+
+    if (submittedByForm) {
+      console.log('🔐 Login automático enviado por formulario.');
       return true;
     }
 

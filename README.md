@@ -120,6 +120,32 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 - `src/services/bookySemiAutoService.js` conserva `providerStatus/providerBody/requestId` al envolver errores de `placeWidget`.
 - Esto mejora auditoria de rechazos definitivos (`BOOKY_PLACEWIDGET_REJECTED`) y post-mortem de apuestas reales.
 
+### 11) Separación Arcadia vs Booky en perfiles de Chrome
+
+- `services/pinnacleGateway.js` ahora usa perfil dedicado de Pinnacle por defecto (`data/pinnacle/chrome-profile`).
+- Se elimina el acoplamiento por defecto con `BOOK_PROFILE` en Arcadia.
+- Se mantiene override por entorno con `PINNACLE_CHROME_PROFILE_DIR`.
+
+### 12) Arcadia login más preciso con estado de sesión
+
+- `services/pinnacleGateway.js` detecta explícitamente cuando ya hay sesión activa en Pinnacle (`Account-Menu`, bankroll/deposito).
+- Solo intenta autologin cuando detecta el bloque real de login (`header-login-loginButton`, `Forms-Element-username/password`).
+- Se refuerza compatibilidad con selectores de header (`input#username`, `input#password`, submit en `header-login-loginButton`).
+
+### 13) Autologin ACity movido al lugar correcto (scripts Booky)
+
+- `scripts/extract-booky-auth-token.js` y `scripts/capture-altenar-betslip.js` implementan flujo ACity:
+  - trigger `button#login` / `#login`,
+  - detección de `input[name="user"]`,
+  - submit robusto (`INICIAR SESION` / `INGRESAR` + fallbacks).
+- Si ya está logueado (header con `MIS APUESTAS` + `DEPOSITAR`), omite login automático.
+
+### 14) Configuración de perfil dedicado para Pinnacle
+
+- `.env.example` documenta:
+  - `PINNACLE_CHROME_PROFILE_DIR=data/pinnacle/chrome-profile`
+- Recomendación operativa: mantener Arcadia y Booky en perfiles separados para evitar contaminación de sesión.
+
 ## 🚀 Características Principales
 
 ### 🧠 Motor Cuantitativo (Quant Core)
