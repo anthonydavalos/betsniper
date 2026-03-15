@@ -7,6 +7,56 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.9] -- 2026-03-15 -- Sprint: Arcadia/ACity Login Separation + Reliability Hardening
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Flujo de autologin ACity dedicado en scripts Booky
+- **`scripts/extract-booky-auth-token.js`** y **`scripts/capture-altenar-betslip.js`**:
+  - Soporte explicito para header ACity con trigger `button#login` / `#login`.
+  - Soporte para campo usuario `input[name="user"]` en modal de login.
+  - Submit robusto del formulario buscando boton `INICIAR SESION` / `INGRESAR`, con fallback a `requestSubmit()` y `Enter`.
+  - Filtro para evitar click accidental en botones auxiliares como `MOSTRAR`.
+
+#### Deteccion de sesion ya autenticada en ACity
+- **`scripts/extract-booky-auth-token.js`** y **`scripts/capture-altenar-betslip.js`**:
+  - Si el header ya muestra `MIS APUESTAS` + `DEPOSITAR`, el script omite login y continua flujo normal.
+
+### 🔄 Changed
+
+#### Arcadia/Pinnacle desacoplado de perfiles Booky
+- **`services/pinnacleGateway.js`**:
+  - Perfil Chrome por defecto ahora dedicado a Pinnacle: `data/pinnacle/chrome-profile`.
+  - Se elimina dependencia por defecto de `BOOK_PROFILE` para `userDataDir` del gateway Arcadia.
+  - Se mantiene override por entorno con `PINNACLE_CHROME_PROFILE_DIR`.
+
+#### Autologin de Pinnacle endurecido con selectores reales de header
+- **`services/pinnacleGateway.js`**:
+  - Deteccion explicita de estado autenticado (`Account-Menu`, bankroll/deposito) para no forzar login innecesario.
+  - Deteccion explicita de formulario no autenticado (`Forms-Element-username/password`, `header-login-loginButton`).
+  - Soporte de selectores `input#username`, `input#password` y submit de header de Pinnacle.
+  - Se conserva estrategia de no cortar intentos de login solo por `socketDetected`.
+
+#### Configuracion operativa de perfiles
+- **`.env.example`**:
+  - Documentada variable `PINNACLE_CHROME_PROFILE_DIR` para separar persistencia Arcadia de Booky/Altenar.
+
+#### Normalizacion de aliases
+- **`src/utils/dynamicAliases.json`**:
+  - Actualizacion de aliases dinamicos para reforzar matching en casos reales reportados durante operacion.
+
+### 🐛 Fixed
+
+#### Mezcla de contexto de sesion entre Arcadia y Booky
+- Se corrige el escenario donde el gateway de Pinnacle podia heredar estado de login de ACity por compartir perfil de Chrome.
+
+#### Flujos de relogin ACity incompletos
+- Se corrige el caso donde ACity quedaba en modal con credenciales cargadas pero sin click final de `INICIAR SESION`.
+
+---
+
 ## [v3.4.8] -- 2026-03-14 -- Sprint: Auto SNIPE Outcomes + Reentry Guards + Matcher High Confidence
 
 > Rama: `master`

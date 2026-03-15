@@ -16,13 +16,12 @@ const ARCADIA_HTTP_HOST = 'api.arcadia.pinnacle.com';
 const OUTPUT_FILE = path.join(__dirname, '../data/pinnacle_live.json');
 const TOKEN_FILE = path.join(__dirname, '../data/pinnacle_token.json');
 const IS_STANDALONE = process.argv[1] === fileURLToPath(import.meta.url);
-const BOOK_PROFILE = (process.env.BOOK_PROFILE || 'doradobet').toLowerCase();
-const DEFAULT_SHARED_BOOKY_PROFILE_DIR = path.join(projectRoot, 'data', 'booky', `chrome-profile-${BOOK_PROFILE}`);
+const DEFAULT_PINNACLE_PROFILE_DIR = path.join(projectRoot, 'data', 'pinnacle', 'chrome-profile');
 const PINNACLE_PROFILE_DIR = process.env.PINNACLE_CHROME_PROFILE_DIR
     ? (path.isAbsolute(process.env.PINNACLE_CHROME_PROFILE_DIR)
         ? process.env.PINNACLE_CHROME_PROFILE_DIR
         : path.join(projectRoot, process.env.PINNACLE_CHROME_PROFILE_DIR))
-    : DEFAULT_SHARED_BOOKY_PROFILE_DIR;
+    : DEFAULT_PINNACLE_PROFILE_DIR;
 
 function ensureDirForFile(filePath) {
     const dir = path.dirname(filePath);
@@ -183,7 +182,6 @@ class PinnacleGateway {
         }
 
         console.log(`👤 Perfil Chrome Pinnacle: ${PINNACLE_PROFILE_DIR}`);
-        console.log(`👤 BOOK_PROFILE activo: ${BOOK_PROFILE}`);
         console.log(`🌐 Chrome del sistema: ${useSystemChrome ? 'Sí' : 'No (Chromium de Puppeteer)'}`);
         
         this.browser = await puppeteer.launch(launchOptions);
@@ -329,7 +327,8 @@ class PinnacleGateway {
         }
 
         this.autoLoginTimer = setInterval(async () => {
-            if (this.sessionDetected || this.socketDetected || this.autoLoginAttempts >= 8) {
+            // No cortar solo por socket: puede haber feed guest activo sin sesion autenticada.
+            if (this.sessionDetected || this.autoLoginAttempts >= 8) {
                 clearInterval(this.autoLoginTimer);
                 this.autoLoginTimer = null;
                 return;
@@ -348,22 +347,82 @@ class PinnacleGateway {
         if (!page) return false;
 
         const frames = [page.mainFrame(), ...page.frames()];
+        const loginTriggerSelectors = [
+            '[data-test-id="header-login-loginButton"] button',
+            'div[data-test-id="header-login-loginButton"] button',
+            'button[data-test-id="header-login-loginButton"]',
+            'button[data-test-id="Button"]'
+        ];
         const userSelectors = [
+            '[data-test-id="Forms-Element-username"] input',
+            'input#username',
             'input[name="username"]',
             'input[name="email"]',
             'input[type="email"]',
             'input[type="text"]'
         ];
         const passSelectors = [
+            '[data-test-id="Forms-Element-password"] input',
+            'input#password',
             'input[name="password"]',
             'input[type="password"]'
         ];
         const submitSelectors = [
+            '[data-test-id="header-login-loginButton"] button',
+            'div[data-test-id="header-login-loginButton"] button',
             'button[type="submit"]',
             'button[data-test="login-submit"]',
+            '[data-test-id="login-submit"] button',
             'button.login-button',
-            'button[class*="login"]'
+            'button[class*="login"]',
+            '[data-test-id="Button"]'
         ];
+
+        // Paso 0: detectar estado de sesion en header Pinnacle.
+        const alreadyLoggedIn = await page.evaluate(() => {
+            const hasAccountMenu = Boolean(document.querySelector('[data-test-id="Account-Menu"]'));
+            const hasBankroll = Boolean(document.querySelector('[data-test-id="QuickCashier-BankRoll"]'));
+            const hasDeposit = Boolean(document.querySelector('a[href*="/account/deposit"], .deposit-oF4Fv8zY5I'));
+            return hasAccountMenu || (hasBankroll && hasDeposit);
+        }).catch(() => false);
+
+        if (alreadyLoggedIn) {
+            this.sessionDetected = true;
+            return true;
+        }
+
+        const hasVisibleLoginForm = await page.evaluate(() => {
+            const hasHeaderLoginBtn = Boolean(document.querySelector('[data-test-id="header-login-loginButton"] button'));
+            const hasUser = Boolean(document.querySelector('input#username, [data-test-id="Forms-Element-username"] input'));
+            const hasPass = Boolean(document.querySelector('input#password, [data-test-id="Forms-Element-password"] input'));
+            return hasHeaderLoginBtn && hasUser && hasPass;
+        }).catch(() => false);
+
+        // Paso 0: abrir modal/login panel cuando el boton superior es type="button".
+        if (!hasVisibleLoginForm) {
+            for (const frame of frames) {
+                try {
+                    for (const sel of loginTriggerSelectors) {
+                        const triggerEl = await frame.$(sel);
+                        if (!triggerEl) continue;
+
+                        // Evitar clicks ciegos: si es un boton generico, exigir texto relacionado a login.
+                        const shouldClick = await frame.evaluate((el) => {
+                            const txt = String(el?.innerText || el?.textContent || '').trim().toLowerCase();
+                            if (!txt) return false;
+                            return txt.includes('iniciar sesi') || txt.includes('login') || txt.includes('sign in');
+                        }, triggerEl);
+                        if (!shouldClick) continue;
+
+                        await triggerEl.click();
+                        await new Promise((r) => setTimeout(r, 250));
+                        break;
+                    }
+                } catch (_) {
+                    // Intentar siguiente frame
+                }
+            }
+        }
 
         for (const frame of frames) {
             try {
@@ -393,9 +452,47 @@ class PinnacleGateway {
                 }
 
                 if (submitEl) {
-                    await submitEl.click();
+                    const clicked = await frame.evaluate((el) => {
+                        const txt = String(el?.innerText || el?.textContent || '').trim().toLowerCase();
+                        // Evitar click en botones auxiliares como MOSTRAR.
+                        if (txt.includes('mostrar')) return false;
+                        el.click();
+                        return true;
+                    }, submitEl);
+
+                    if (!clicked) {
+                        await passEl.press('Enter');
+                    }
                 } else {
-                    await passEl.press('Enter');
+                    const submittedByForm = await passEl.evaluate((el) => {
+                        const form = el?.form || el?.closest?.('form');
+                        if (!form) return false;
+
+                        const btnCandidates = Array.from(form.querySelectorAll('button, [role="button"]'));
+                        const submitBtn = btnCandidates.find((btn) => {
+                            const txt = String(btn?.innerText || btn?.textContent || '').trim().toLowerCase();
+                            if (!txt || txt.includes('mostrar')) return false;
+                            if (txt.includes('iniciar sesi') || txt.includes('login') || txt.includes('sign in')) return true;
+                            return btn?.type === 'submit';
+                        });
+
+                        if (submitBtn) {
+                            submitBtn.click();
+                            return true;
+                        }
+
+                        if (typeof form.requestSubmit === 'function') {
+                            form.requestSubmit();
+                            return true;
+                        }
+
+                        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                        return true;
+                    });
+
+                    if (!submittedByForm) {
+                        await passEl.press('Enter');
+                    }
                 }
 
                 return true;
