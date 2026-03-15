@@ -137,6 +137,16 @@ En `bookySemiAutoService`, cuando `placeWidget` responda rechazo o error:
 2. Archivar siempre como rechazo auditable (`REAL_REJECTED` / `REAL_REJECTED_FAST`) o incierto segun corresponda.
 3. Evitar clasificar como confirmado si falta `bets[]` en respuesta.
 
+### 3.5 Sincronizacion de token a Google Sheets (ops)
+
+Cuando se renueve `ALTENAR_BOOKY_AUTH_TOKEN` desde `scripts/extract-booky-auth-token.js`:
+
+1. Ejecutar sync opcional a webhook de Google Apps Script con payload JSON `{ token: "Bearer ..." }`.
+2. Leer URL exclusivamente desde entorno (`GSHEETS_TOKEN_WEBHOOK_URL`).
+3. No hardcodear URL real de webhook en codigo fuente ni en `.env.example`.
+4. Si falla el webhook, no bloquear la actualizacion del token en `.env`; solo registrar diagnostico en logs.
+5. Uso recomendado en Apps Script: hoja `TOKEN`, celda `A1`.
+
 ### MÓDULO A: "Source of Truth" (Pinnacle Arcadia)
 **Endpoint:** `guest.api.arcadia.pinnacle.com/0.1` (Guest API Unofficial).
 **Restricción:** Usar Headers/Cookies de "Invitado" y throttling para no ser bloqueado por WAF.
