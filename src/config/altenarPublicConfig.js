@@ -9,6 +9,32 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '../..');
+const envFilePath = path.join(projectRoot, '.env');
+const ENV_RELOAD_MIN_INTERVAL_MS = 1500;
+let lastEnvReloadAt = 0;
+let lastEnvMtimeMs = 0;
+
+const maybeReloadEnvFromDisk = ({ force = false } = {}) => {
+  try {
+    const now = Date.now();
+    if (!force && now - lastEnvReloadAt < ENV_RELOAD_MIN_INTERVAL_MS) return false;
+
+    lastEnvReloadAt = now;
+    const stat = fs.statSync(envFilePath);
+    const mtimeMs = Number(stat?.mtimeMs || 0);
+    if (!force && mtimeMs <= lastEnvMtimeMs) return false;
+
+    // Recarga incremental para reflejar tokens renovados por procesos externos.
+    dotenv.config({ path: envFilePath, override: true });
+    lastEnvMtimeMs = mtimeMs;
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+
+maybeReloadEnvFromDisk({ force: true });
+
 const TOKEN_RENEW_COOLDOWN_MS = Math.max(
   15000,
   Number(process.env.ALTENAR_WIDGET_TOKEN_RENEW_COOLDOWN_MS || 120000)
@@ -68,6 +94,8 @@ const shouldRequireScannerAuth = () => {
 };
 
 const getScannerAuthorizationHeader = () => {
+  maybeReloadEnvFromDisk();
+
   if (!shouldRequireScannerAuth()) return '';
 
   const widgetAuth = normalizeWidgetAuthToken(process.env.ALTENAR_WIDGET_AUTH_TOKEN || '');
