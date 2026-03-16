@@ -1,4 +1,5 @@
 import altenarClient from '../src/config/axiosClient.js';
+import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../src/config/altenarPublicConfig.js';
 import db, { initDB } from '../src/db/database.js';
 
 import { fileURLToPath } from 'url';
@@ -60,38 +61,15 @@ export const ingestAltenarPrematch = async (force = false) => {
     );
     console.log(`📡 Consultando API Altenar /GetUpcoming (objetivo hasta: ${endDate.toISOString()})...`);
 
-    // Re-aplicamos headers/params explícitos en ESTA llamada para reforzar comportamiento anti-bot,
-    // pero tomados del perfil activo del axiosClient (BOOK_PROFILE / .env), NO hardcodeados.
-    const defaultHeaders = altenarClient.defaults.headers || {};
-    const headerCommon = defaultHeaders.common || {};
-
-    const requestHeaders = {
-      'User-Agent': defaultHeaders['User-Agent'] || headerCommon['User-Agent'],
-      'Referer': defaultHeaders['Referer'] || headerCommon['Referer'],
-      'Origin': defaultHeaders['Origin'] || headerCommon['Origin'],
-      'Sec-Fetch-Dest': defaultHeaders['Sec-Fetch-Dest'] || headerCommon['Sec-Fetch-Dest'] || 'empty',
-      'Sec-Fetch-Mode': defaultHeaders['Sec-Fetch-Mode'] || headerCommon['Sec-Fetch-Mode'] || 'cors',
-      'Sec-Fetch-Site': defaultHeaders['Sec-Fetch-Site'] || headerCommon['Sec-Fetch-Site'] || 'cross-site'
-    };
-
-    const defaultParams = altenarClient.defaults.params || {};
-    const requestParams = {
-      culture: defaultParams.culture,
-      timezoneOffset: defaultParams.timezoneOffset,
-      integration: defaultParams.integration,
-      deviceType: defaultParams.deviceType,
-      numFormat: defaultParams.numFormat,
-      countryCode: defaultParams.countryCode,
-      sportId: 66
-    };
-    
-    // PARAMS EXACTOS DEL APPS SCRIPT (Sin eventCount explicito si el default es masivo)
-    // Añadimos endDate al request si la API lo soporta, pero filtramos localmente igual.
-    // Altenar suele traer todo por defecto o paginado. Filtramos en memoria.
-    const response = await altenarClient.get('/GetUpcoming', {
-      headers: requestHeaders,
-      params: requestParams
-    });
+    // Para ACity, esta configuración agrega Authorization automáticamente
+    // (cuando corresponde) y mantiene consistencia de perfil sin cruces.
+    const response = await altenarClient.get(
+      '/GetUpcoming',
+      getAltenarPublicRequestConfig({
+        sportId: 66,
+        _: Date.now()
+      })
+    );
 
     const events = response.data.events || [];
     if (events.length === 0) {
@@ -211,6 +189,7 @@ export const ingestAltenarPrematch = async (force = false) => {
     console.log('✅ INGESTA ALTENAR COMPLETADA.');
 
   } catch (error) {
+    maybeAutoRenewWidgetToken(error, 'ingestAltenarPrematch.GetUpcoming');
     console.error('❌ Error ingestion Altenar:', error.message);
   }
 };

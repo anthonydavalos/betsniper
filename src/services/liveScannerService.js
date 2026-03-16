@@ -1,4 +1,5 @@
 import altenarClient from '../config/axiosClient.js';
+import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../config/altenarPublicConfig.js';
 import db, { initDB } from '../db/database.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { findMatch, diagnoseNoMatch } from '../utils/teamMatcher.js'; // [NEW] Import Matcher
@@ -174,13 +175,14 @@ export const getLiveOverview = async () => {
     try {
         // sportId=66 (Fútbol), categoryId=0 (Mundo)
         // Usamos GetLivenow en lugar de GetLiveOverview
-        const { data } = await altenarClient.get('/GetLivenow', {
-            params: { 
-                sportId: 66, 
+        const { data } = await altenarClient.get(
+            '/GetLivenow',
+            getAltenarPublicRequestConfig({
+                sportId: 66,
                 categoryId: 0,
                 _: Date.now() // Cache buster
-            } // Eliminado limit eventCount para ver todo
-        });
+            })
+        );
 
         // [NEW] Mapas de búsqueda rápida para Ligas y Países (Relational Data)
         const champsMap = new Map();
@@ -254,6 +256,7 @@ export const getLiveOverview = async () => {
              };
         });
     } catch (error) {
+        maybeAutoRenewWidgetToken(error, 'liveScanner.getLiveOverview');
         console.error('❌ Error en GetLivenow:', error.message);
         return [];
     }
@@ -264,14 +267,16 @@ export const getLiveOverview = async () => {
  */
 export const getEventDetails = async (eventId) => {
     try {
-        const { data } = await altenarClient.get('/GetEventDetails', {
-            params: {
+        const { data } = await altenarClient.get(
+            '/GetEventDetails',
+            getAltenarPublicRequestConfig({
                 eventId,
                 _: Date.now()
-            }
-        });
+            })
+        );
         return data; // Retorna objeto completo con markets, odds, etc.
     } catch (error) {
+        maybeAutoRenewWidgetToken(error, `liveScanner.getEventDetails:${eventId}`);
         console.error(`❌ Error en GetEventDetails (${eventId}):`, error.message);
         return null;
     }
@@ -294,12 +299,12 @@ export const getEventResult = async (sportId, catId, dateISO) => {
          console.log(`[DEBUG] Calling GetEventResults: Sport=${sportId}, Cat=${catId}, Date=${dateParam}`);
          
          const { data } = await altenarClient.get('/GetEventResults', {
-            baseURL: resultsBaseURL, 
-            params: {
+            ...getAltenarPublicRequestConfig({
                 sportId: sportId || 66,
                 categoryId: catId,
                 date: dateParam
-            }
+            }),
+            baseURL: resultsBaseURL
          });
          return data;
     } catch (error) {

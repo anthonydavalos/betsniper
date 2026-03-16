@@ -148,7 +148,10 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 
 ### 15) Sync automático de token Altenar a Google Sheets
 
-- `scripts/extract-booky-auth-token.js` sincroniza el token capturado a Google Sheets justo despues de actualizar `ALTENAR_BOOKY_AUTH_TOKEN` en `.env`.
+- `scripts/extract-booky-auth-token.js` captura y persiste:
+  - `ALTENAR_BOOKY_AUTH_TOKEN` (JWT para flujo real `placeWidget`), y
+  - `ALTENAR_WIDGET_AUTH_TOKEN` (token crudo de `api/widget` para scanner/live/prematch).
+- La sincronizacion a Google Sheets se ejecuta solo para `ALTENAR_BOOKY_AUTH_TOKEN`.
 - Variable de entorno usada para el webhook:
   - `GSHEETS_TOKEN_WEBHOOK_URL`
 - Politica de seguridad:
@@ -161,7 +164,7 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 Secuencia exacta de actualizacion (timing):
 
 1. Puppeteer detecta request Altenar con `Authorization` valido.
-2. El script actualiza `.env` (`ALTENAR_BOOKY_AUTH_TOKEN=Bearer ...`).
+2. El script actualiza `.env` (`ALTENAR_BOOKY_AUTH_TOKEN=Bearer ...` y/o `ALTENAR_WIDGET_AUTH_TOKEN=<raw>`).
 3. Inmediatamente en la misma ejecucion hace `POST` al webhook con `{ token: "Bearer ..." }`.
 4. El Apps Script (`doPost`) recibe payload y actualiza `TOKEN!A1`.
 5. El proceso de extraccion finaliza como exitoso.
@@ -175,6 +178,29 @@ Ejemplo esperado de payload enviado al webhook:
   "token": "Bearer <jwt>"
 }
 ```
+
+### 16) Renovación automática del token widget (401/403) con anti-bucle
+
+- El backend no renueva por intervalo fijo; renueva de forma reactiva solo cuando Altenar responde con error de autenticación (`401` o `403`) en endpoints críticos del scanner (`GetLivenow`, `GetEventDetails`, `GetUpcoming`).
+- Al detectar `401/403`, se dispara en segundo plano el script de captura de token con Puppeteer para refrescar `ALTENAR_WIDGET_AUTH_TOKEN`.
+- Para evitar bucles (múltiples scanners fallando al mismo tiempo), la renovación respeta un cooldown global por proceso:
+  - `ALTENAR_WIDGET_TOKEN_RENEW_COOLDOWN_MS` (default recomendado: `120000`).
+- El tiempo máximo de la captura automática está controlado por:
+  - `ALTENAR_WIDGET_TOKEN_RENEW_TIMEOUT_MS` (default recomendado: `90000`).
+
+Comportamiento operativo:
+
+1. Llega `401/403` en una llamada Altenar del scanner.
+2. Se intenta lanzar una renovación automática (si no está en cooldown).
+3. Si ya hubo intento reciente, se suprime el nuevo intento y se registra aviso con segundos restantes.
+4. Si la captura logra nuevo token en `.env`, se recomienda reiniciar backend para recargar entorno de forma limpia.
+
+Guía de tuning:
+
+- Operación normal: `ALTENAR_WIDGET_TOKEN_RENEW_COOLDOWN_MS=60000` a `120000`.
+- Alta carga/ruido de feed: mantener `120000` o subir a `180000`.
+- Debug puntual: `30000` temporalmente.
+- Evitar valores demasiado bajos (`<15000`) para no abrir flujos Puppeteer en ráfaga.
 
 ## 🚀 Características Principales
 

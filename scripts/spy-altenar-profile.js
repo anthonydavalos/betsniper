@@ -8,6 +8,11 @@ const targetUrl = targetArg
 
 const headless = !args.includes('--headed');
 const timeoutMs = Number((args.find(a => a.startsWith('--timeout=')) || '--timeout=25000').split('=')[1]);
+const showAllHeaders = args.includes('--all-headers');
+const waitCloseArg = args.includes('--wait-close');
+const explicitNoWaitCloseArg = args.includes('--no-wait-close');
+const waitUntilClose = explicitNoWaitCloseArg ? false : (waitCloseArg || !headless);
+const logSockets = !args.includes('--no-sockets');
 
 const profile = {
   referer: '',
@@ -79,6 +84,46 @@ const logRequestIfAltenar = (request) => {
   console.log(`\n📡 ${request.method()} ${parsed.pathname}`);
   console.log(`   Host: ${parsed.origin}`);
   console.log(`   Params: ${JSON.stringify(interestingParams)}`);
+
+  const headers = request.headers();
+  const headerSnapshot = showAllHeaders
+    ? headers
+    : {
+        origin: headers.origin,
+        referer: headers.referer,
+        'user-agent': headers['user-agent'],
+        cookie: headers.cookie ? '[present]' : '[absent]',
+        authorization: headers.authorization ? '[present]' : '[absent]',
+        'accept-language': headers['accept-language'],
+        'sec-fetch-site': headers['sec-fetch-site'],
+        'sec-fetch-mode': headers['sec-fetch-mode']
+      };
+  console.log(`   Headers: ${JSON.stringify(headerSnapshot)}`);
+};
+
+const logResponseIfAltenar = async (response) => {
+  const url = response.url();
+  if (!url.includes('/api/widget/')) return;
+  const parsed = asUrl(url);
+  if (!parsed) return;
+  const status = response.status();
+
+  if (status >= 400) {
+    const headers = response.headers() || {};
+    const headerSnapshot = {
+      'www-authenticate': headers['www-authenticate'] || '',
+      'set-cookie': headers['set-cookie'] ? '[present]' : '[absent]',
+      server: headers.server || '',
+      'cf-ray': headers['cf-ray'] || '',
+      'x-cache': headers['x-cache'] || ''
+    };
+    console.log(`   ↩️ Response ${status} ${parsed.pathname} headers=${JSON.stringify(headerSnapshot)}`);
+    return;
+  }
+
+  if (status >= 400 || parsed.pathname.includes('GetLivenow')) {
+    console.log(`   ↩️ Response ${status} ${parsed.pathname}`);
+  }
 };
 
 const printEnvSuggestion = () => {
@@ -97,10 +142,55 @@ const printEnvSuggestion = () => {
   console.log('===========================================================\n');
 };
 
+const attachSocketSpy = async (page) => {
+  const cdp = await page.target().createCDPSession();
+  await cdp.send('Network.enable');
+
+  cdp.on('Network.webSocketCreated', (evt) => {
+    const url = evt?.url || '';
+    if (!url) return;
+    console.log(`\n🧵 WS Created: ${url}`);
+  });
+
+  cdp.on('Network.webSocketWillSendHandshakeRequest', (evt) => {
+    const req = evt?.request || {};
+    const headers = req?.headers || {};
+    const url = req?.url || '';
+    if (!url) return;
+    console.log(`   🧵 WS Handshake Request: ${url}`);
+    console.log(`   🧵 WS Req Headers: ${JSON.stringify({
+      origin: headers.Origin || headers.origin,
+      host: headers.Host || headers.host,
+      'user-agent': headers['User-Agent'] || headers['user-agent'],
+      cookie: headers.Cookie || headers.cookie ? '[present]' : '[absent]',
+      authorization: headers.Authorization || headers.authorization ? '[present]' : '[absent]'
+    })}`);
+  });
+
+  cdp.on('Network.webSocketHandshakeResponseReceived', (evt) => {
+    const res = evt?.response || {};
+    const headers = res?.headers || {};
+    console.log(`   🧵 WS Handshake Response: status=${res?.status}`);
+    console.log(`   🧵 WS Res Headers: ${JSON.stringify({
+      server: headers.server || headers.Server,
+      'set-cookie': headers['set-cookie'] || headers['Set-Cookie'] ? '[present]' : '[absent]',
+      'cf-ray': headers['cf-ray'] || headers['CF-RAY'] || ''
+    })}`);
+  });
+
+  cdp.on('Network.webSocketClosed', (evt) => {
+    console.log(`   🧵 WS Closed requestId=${evt?.requestId || ''}`);
+  });
+
+  cdp.on('Network.webSocketFrameError', (evt) => {
+    console.log(`   🧵 WS Frame Error requestId=${evt?.requestId || ''} msg=${evt?.errorMessage || ''}`);
+  });
+};
+
 const run = async () => {
   console.log(`🕵️ Spy Altenar iniciando en: ${targetUrl}`);
   console.log(`   Modo: ${headless ? 'headless' : 'headed'}`);
-  console.log(`   Tiempo de captura: ${timeoutMs}ms`);
+  console.log(`   Estrategia: ${waitUntilClose ? 'esperar cierre manual del navegador' : `timeout ${timeoutMs}ms`}`);
 
   const browser = await puppeteer.launch({
     headless,
@@ -110,9 +200,23 @@ const run = async () => {
   try {
     const page = await browser.newPage();
 
+    if (logSockets) {
+      try {
+        await attachSocketSpy(page);
+      } catch (error) {
+        console.warn(`⚠️ No se pudo habilitar socket-spy CDP: ${error.message}`);
+      }
+    }
+
     page.on('request', (req) => {
       try {
         logRequestIfAltenar(req);
+      } catch (_) {}
+    });
+
+    page.on('response', (res) => {
+      try {
+        logResponseIfAltenar(res);
       } catch (_) {}
     });
 
@@ -121,12 +225,23 @@ const run = async () => {
     } catch (err) {
       console.warn(`⚠️ Navegación con timeout (${err.message}). Continuando con datos capturados...`);
     }
+
+    if (waitUntilClose) {
+      console.log('   Completa login/navegación manual en la ventana. El spy finalizará cuando cierres el navegador.');
+      await new Promise((resolve) => {
+        browser.once('disconnected', resolve);
+      });
+      return;
+    }
+
     await new Promise(r => setTimeout(r, timeoutMs));
 
     printEnvSuggestion();
     console.log('✅ Spy finalizado. Copia variables al .env y reinicia backend.');
   } finally {
-    await browser.close();
+    if (browser.connected) {
+      await browser.close();
+    }
   }
 };
 

@@ -2,11 +2,17 @@ import WebSocket from 'ws';
 import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
+import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const projectRoot = path.resolve(__dirname, '..');
+
+// Cargar .env tambien en ejecucion directa (node services/pinnacleLight.js)
+dotenv.config({ path: path.join(projectRoot, '.env'), override: true });
+
 const OUTPUT_FILE = path.join(__dirname, '../data/pinnacle_live.json');
 const OUTPUT_PREMATCH_FILE = path.join(__dirname, '../data/pinnacle_prematch.json');
 const TOKEN_FILE = path.join(__dirname, '../data/pinnacle_token.json');

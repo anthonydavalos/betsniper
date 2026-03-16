@@ -20,7 +20,16 @@ const profiles = {
     ALTENAR_TIMEZONE_OFFSET: '300',
     ALTENAR_NUM_FORMAT: 'en-GB',
     ALTENAR_DEVICE_TYPE: '1',
-    ALTENAR_SPORT_ID: '0'
+    ALTENAR_SPORT_ID: '0',
+    ALTENAR_PUBLIC_INTEGRATION: 'doradobet',
+    ALTENAR_PUBLIC_ORIGIN: 'https://doradobet.com',
+    ALTENAR_PUBLIC_REFERER: 'https://doradobet.com/deportes-en-vivo',
+    ALTENAR_PUBLIC_COUNTRY_CODE: 'PE',
+    ALTENAR_PUBLIC_CULTURE: 'es-ES',
+    ALTENAR_PUBLIC_TIMEZONE_OFFSET: '300',
+    ALTENAR_PUBLIC_NUM_FORMAT: 'en-GB',
+    ALTENAR_PUBLIC_DEVICE_TYPE: '1',
+    ALTENAR_PUBLIC_SPORT_ID: '0'
   },
   acity: {
     BOOK_PROFILE: 'acity',
@@ -33,7 +42,16 @@ const profiles = {
     ALTENAR_TIMEZONE_OFFSET: '300',
     ALTENAR_NUM_FORMAT: 'en-GB',
     ALTENAR_DEVICE_TYPE: '1',
-    ALTENAR_SPORT_ID: '0'
+    ALTENAR_SPORT_ID: '0',
+    ALTENAR_PUBLIC_INTEGRATION: 'acity',
+    ALTENAR_PUBLIC_ORIGIN: 'https://www.casinoatlanticcity.com',
+    ALTENAR_PUBLIC_REFERER: 'https://www.casinoatlanticcity.com/apuestas-deportivas',
+    ALTENAR_PUBLIC_COUNTRY_CODE: 'PE',
+    ALTENAR_PUBLIC_CULTURE: 'es-ES',
+    ALTENAR_PUBLIC_TIMEZONE_OFFSET: '300',
+    ALTENAR_PUBLIC_NUM_FORMAT: 'en-GB',
+    ALTENAR_PUBLIC_DEVICE_TYPE: '1',
+    ALTENAR_PUBLIC_SPORT_ID: '0'
   }
 };
 
@@ -82,6 +100,13 @@ Object.entries(target).forEach(([k, v]) => upsertEnvKey(lines, k, v));
 // Mantener llaves de credenciales para flujo de captura/control real
 if (!lines.some(l => l.startsWith('ALTENAR_LOGIN_USERNAME='))) upsertEnvKey(lines, 'ALTENAR_LOGIN_USERNAME', '');
 if (!lines.some(l => l.startsWith('ALTENAR_LOGIN_PASSWORD='))) upsertEnvKey(lines, 'ALTENAR_LOGIN_PASSWORD', '');
+if (!lines.some(l => l.startsWith('ALTENAR_PUBLIC_USER_AGENT='))) {
+  upsertEnvKey(
+    lines,
+    'ALTENAR_PUBLIC_USER_AGENT',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
+  );
+}
 
 const normalized = lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
 fs.writeFileSync(envPath, normalized, 'utf8');
@@ -89,6 +114,7 @@ fs.writeFileSync(envPath, normalized, 'utf8');
 console.log(`✅ Perfil actualizado en .env: ${rawArg}`);
 console.log(`   BOOK_PROFILE=${target.BOOK_PROFILE}`);
 console.log(`   ALTENAR_INTEGRATION=${target.ALTENAR_INTEGRATION}`);
+console.log(`   ALTENAR_PUBLIC_INTEGRATION=${target.ALTENAR_PUBLIC_INTEGRATION}`);
 console.log(`   ALTENAR_BOOKY_URL=${target.ALTENAR_BOOKY_URL}`);
 
 const loginUser = getEnvValue(lines, 'ALTENAR_LOGIN_USERNAME');
