@@ -7,6 +7,34 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.11] -- 2026-03-16 -- Sprint: Widget Token Auto-Renew Policy Documentation
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Documentación operativa de renovación automática del token widget
+- **`README.md`**:
+  - Se documenta la política exacta de auto-renovación del token widget Altenar:
+    - trigger reactivo solo ante `401/403` (no por intervalo fijo),
+    - cooldown anti-bucle por proceso (`ALTENAR_WIDGET_TOKEN_RENEW_COOLDOWN_MS`),
+    - timeout de captura (`ALTENAR_WIDGET_TOKEN_RENEW_TIMEOUT_MS`),
+    - secuencia operativa completa y recomendaciones de tuning por contexto (normal/alta carga/debug).
+
+#### Fuente de verdad de arquitectura actualizada
+- **`PROJECT_BLUEPRINT.md`**:
+  - Se agrega sección explícita para política de resiliencia del scanner Altenar en autenticación widget:
+    - renovación inmediata ante `401/403`,
+    - supresión por cooldown para evitar tormenta de Puppeteer,
+    - lineamientos de operación segura sin relanzamientos agresivos.
+
+### 🔄 Changed
+
+#### Trazabilidad de operación más clara
+- Se alinea la documentación entre blueprint + readme para que la estrategia de renovación de token no se interprete como polling periódico, sino como recuperación por evento de error auth.
+
+---
+
 ## [v3.4.10] -- 2026-03-15 -- Sprint: Token Sync to Google Sheets
 
 > Rama: `master`

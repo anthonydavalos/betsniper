@@ -1,4 +1,5 @@
 import altenarClient from '../config/axiosClient.js';
+import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../config/altenarPublicConfig.js';
 import db, { initDB } from '../db/database.js';
 import { ingestAltenarPrematch } from '../../scripts/ingest-altenar.js';
 
@@ -291,9 +292,10 @@ const refreshDueEventDetails = async () => {
 
             try {
                 requestCount += 1;
-                const { data } = await altenarClient.get('/GetEventDetails', {
-                    params: { eventId: event.id, _: Date.now() }
-                });
+                const { data } = await altenarClient.get(
+                    '/GetEventDetails',
+                    getAltenarPublicRequestConfig({ eventId: event.id, _: Date.now() })
+                );
 
                 const extracted = extractOddsFromDetails(data, event.name);
                 const hash = JSON.stringify(extracted);
@@ -314,6 +316,7 @@ const refreshDueEventDetails = async () => {
                     lastUpdated: new Date().toISOString()
                 };
             } catch (error) {
+                maybeAutoRenewWidgetToken(error, `altenarPrematchScheduler.GetEventDetails:${event.id}`);
                 const failCount = (state.failCount || 0) + 1;
                 const backoffMs = Math.min(15 * 60 * 1000, intervalMs * Math.pow(2, failCount));
                 eventState.set(id, {

@@ -1,4 +1,5 @@
 import altenarClient from '../config/axiosClient.js';
+import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../config/altenarPublicConfig.js';
 import db, { initDB } from '../db/database.js';
 import fs from 'fs';
 import path from 'path';
@@ -269,13 +270,14 @@ const isMatchTotalMarket = (market, eventName, oddsMap) => {
  */
 export const getLiveOverview = async () => {
     try {
-        const { data } = await altenarClient.get('/GetLivenow', {
-            params: { 
-                sportId: 66, 
+        const { data } = await altenarClient.get(
+            '/GetLivenow',
+            getAltenarPublicRequestConfig({
+                sportId: 66,
                 categoryId: 0,
                 _: Date.now() // [MOD] Cache Buster
-            }
-        });
+            })
+        );
 
         // [NEW] Mapas de búsqueda rápida para Ligas y Países (Relational Data)
         const champsMap = new Map();
@@ -347,6 +349,7 @@ export const getLiveOverview = async () => {
              };
         });
     } catch (error) {
+        maybeAutoRenewWidgetToken(error, 'liveValueScanner.getLiveOverview');
         console.error('❌ Error en GetLivenow:', error.message);
         return [];
     }
@@ -357,14 +360,16 @@ export const getLiveOverview = async () => {
  */
 export const getEventDetails = async (eventId) => {
     try {
-        const { data } = await altenarClient.get('/GetEventDetails', {
-            params: { 
+        const { data } = await altenarClient.get(
+            '/GetEventDetails',
+            getAltenarPublicRequestConfig({
                 eventId,
                 _: Date.now() // [MOD] Cache Buster para asegurar datos frescos siempre
-            }
-        });
+            })
+        );
         return data; 
     } catch (error) {
+        maybeAutoRenewWidgetToken(error, `liveValueScanner.getEventDetails:${eventId}`);
         return null; 
     }
 };

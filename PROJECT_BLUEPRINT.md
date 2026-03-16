@@ -119,6 +119,27 @@ El motor de auto-colocacion para `LIVE_SNIPE` debe operar con guardas explicitas
 
 ### 3.3 Matcher Hibrido (Auto + Manual High Confidence)
 
+### 3.4 Resiliencia Altenar Widget Auth (401/403)
+
+Para evitar freeze operativo por expiración del token widget, sin introducir bucles de relanzamiento:
+
+1. **Trigger por evento de error auth (no por cron):**
+  - La renovación del token widget se dispara cuando Altenar responde `401` o `403` en llamadas críticas del scanner.
+  - No usar renovación por intervalo fijo como mecanismo principal.
+2. **Cooldown anti-bucle obligatorio:**
+  - Debe respetarse `ALTENAR_WIDGET_TOKEN_RENEW_COOLDOWN_MS` para suprimir relanzamientos consecutivos.
+  - Objetivo: evitar tormenta de procesos Puppeteer cuando múltiples workers fallan simultáneamente.
+3. **Timeout de captura controlado:**
+  - El proceso de captura automática debe respetar `ALTENAR_WIDGET_TOKEN_RENEW_TIMEOUT_MS`.
+  - Si expira, registrar diagnóstico y mantener continuidad del backend.
+4. **Operación segura post-renovación:**
+  - Si `.env` recibe un token nuevo, reiniciar backend de forma controlada para recargar variables en memoria.
+  - Evitar reintentos agresivos en caliente sin cooldown.
+5. **Tuning recomendado:**
+  - Operación normal: 60s-120s de cooldown.
+  - Alta carga: 120s-180s.
+  - Debug puntual: 30s temporal.
+
 Para reducir backlog de eventos no enlazados sin aumentar falsos positivos:
 
 1. **Backend como fuente unica de aliases:**

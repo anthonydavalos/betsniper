@@ -199,11 +199,13 @@ const upsertEnvKey = (content, key, value) => {
   return lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
 };
 
-const normalizeAuthToken = (value = '') => {
+const normalizeBookyJwtToken = (value = '') => {
   const token = String(value).trim();
   if (!token) return '';
   return token.toLowerCase().startsWith('bearer ') ? token : `Bearer ${token}`;
 };
+
+const normalizeWidgetAuthToken = (value = '') => String(value || '').trim();
 
 const decodeJwtPayload = (token = '') => {
   const parts = String(token).split('.');
@@ -233,6 +235,8 @@ const isAltenarApiRequest = (url = '') => {
   const low = String(url).toLowerCase();
   return low.includes('biahosted.com/api/') || low.includes('/api/widget/');
 };
+
+const isWidgetApiRequest = (url = '') => String(url || '').toLowerCase().includes('/api/widget/');
 
 // Función para enviar el token a Google Sheets por medio del Webhook
 const syncTokenToGoogleSheets = async (nuevoToken) => {
@@ -304,8 +308,34 @@ const run = async () => {
   const page = await browser.newPage();
 
   let foundAuth = '';
+  let foundWidgetAuth = '';
   let skippedNonUserTokens = 0;
   let settled = false;
+  let captureInProgress = false;
+
+  const persistCapturedTokens = async ({ syncSheets = true } = {}) => {
+    const currentEnv = fs.readFileSync(envPath, 'utf8');
+    let nextEnv = currentEnv;
+
+    if (foundAuth) {
+      nextEnv = upsertEnvKey(nextEnv, 'ALTENAR_BOOKY_AUTH_TOKEN', foundAuth);
+      if (!keepRealPlacementEnabled) {
+        nextEnv = upsertEnvKey(nextEnv, 'BOOKY_REAL_PLACEMENT_ENABLED', 'false');
+      }
+    }
+
+    if (foundWidgetAuth) {
+      nextEnv = upsertEnvKey(nextEnv, 'ALTENAR_WIDGET_AUTH_TOKEN', foundWidgetAuth);
+    }
+
+    if (nextEnv !== currentEnv) {
+      fs.writeFileSync(envPath, nextEnv, 'utf8');
+    }
+
+    if (syncSheets && foundAuth) {
+      await syncTokenToGoogleSheets(foundAuth);
+    }
+  };
 
   const finish = async (ok, message) => {
     if (settled) return;
@@ -331,8 +361,13 @@ const run = async () => {
 
       const headers = request.headers();
       const authRaw = headers.authorization || headers.Authorization;
-      const auth = normalizeAuthToken(authRaw);
+      const auth = normalizeWidgetAuthToken(authRaw);
       if (!auth) return;
+
+      if (isWidgetApiRequest(url) && !foundWidgetAuth) {
+        foundWidgetAuth = auth;
+        console.log('   ✅ Token widget capturado (ALTENAR_WIDGET_AUTH_TOKEN).');
+      }
 
       const rawToken = auth.replace(/^Bearer\s+/i, '').trim();
       const payload = decodeJwtPayload(rawToken);
@@ -342,26 +377,27 @@ const run = async () => {
         return;
       }
 
-      foundAuth = auth;
+      if (captureInProgress || settled) return;
+      captureInProgress = true;
 
-      const currentEnv = fs.readFileSync(envPath, 'utf8');
-      let nextEnv = upsertEnvKey(currentEnv, 'ALTENAR_BOOKY_AUTH_TOKEN', foundAuth);
-      if (!keepRealPlacementEnabled) {
-        nextEnv = upsertEnvKey(nextEnv, 'BOOKY_REAL_PLACEMENT_ENABLED', 'false');
-      }
-      fs.writeFileSync(envPath, nextEnv, 'utf8');
-
-      // Sincronizar el nuevo token con Google Sheets automáticamente
-      await syncTokenToGoogleSheets(foundAuth);
-
-      await finish(true, 'Token capturado y guardado en .env (ALTENAR_BOOKY_AUTH_TOKEN).');
+      foundAuth = normalizeBookyJwtToken(auth);
+      await persistCapturedTokens({ syncSheets: true });
+      const extra = foundWidgetAuth ? ' + ALTENAR_WIDGET_AUTH_TOKEN' : '';
+      await finish(true, `Token capturado y guardado en .env (ALTENAR_BOOKY_AUTH_TOKEN${extra}).`);
     } catch (_) {}
   });
 
   browser.on('disconnected', async () => {
     if (settled) return;
     if (foundAuth) {
-      await finish(true, 'Token capturado y guardado en .env (ALTENAR_BOOKY_AUTH_TOKEN).');
+      await persistCapturedTokens({ syncSheets: true });
+      const extra = foundWidgetAuth ? ' + ALTENAR_WIDGET_AUTH_TOKEN' : '';
+      await finish(true, `Token capturado y guardado en .env (ALTENAR_BOOKY_AUTH_TOKEN${extra}).`);
+      return;
+    }
+    if (foundWidgetAuth) {
+      await persistCapturedTokens({ syncSheets: false });
+      await finish(true, 'Token widget capturado y guardado en .env (ALTENAR_WIDGET_AUTH_TOKEN). JWT de Booky no detectado en esta sesión.');
       return;
     }
     if (skippedNonUserTokens > 0) {
@@ -396,8 +432,14 @@ const run = async () => {
   }
 
   setTimeout(async () => {
-    if (!foundAuth) {
+    if (!foundAuth && !foundWidgetAuth) {
       await finish(false, 'No se detectó Authorization en el tiempo esperado. Usa --wait-close para esperar al cierre manual.');
+      return;
+    }
+
+    if (!foundAuth && foundWidgetAuth) {
+      await persistCapturedTokens({ syncSheets: false });
+      await finish(true, 'Token widget capturado en timeout (ALTENAR_WIDGET_AUTH_TOKEN). JWT de Booky no detectado en esta sesión.');
     }
   }, timeoutMs);
 };
