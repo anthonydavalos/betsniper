@@ -1463,6 +1463,25 @@ function App() {
     const id = getOpportunityId(opportunity); // ID único por selección (eventId + selection)
         const optimisticIsSnipe = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE';
 
+        const recoverPreparedTicket = async () => {
+            const ticketsRes = await axios.get('/api/booky/tickets', { timeout: 7000 });
+            const pending = Array.isArray(ticketsRes?.data?.pending) ? ticketsRes.data.pending : [];
+            const nowMs = Date.now();
+
+            return pending.find((t) => {
+                if (String(t?.status || '').toUpperCase() !== 'DRAFT') return false;
+                const expMs = new Date(t?.expiresAt || '').getTime();
+                if (!Number.isFinite(expMs) || expMs <= nowMs) return false;
+
+                const tOpp = t?.opportunity || {};
+                const sameEvent = String(tOpp?.eventId || '') === String(opportunity?.eventId || '');
+                const sameSelection = String(tOpp?.selection || '').trim().toLowerCase() === String(opportunity?.selection || '').trim().toLowerCase();
+                const sameMarket = String(tOpp?.market || '').trim().toLowerCase() === String(opportunity?.market || '').trim().toLowerCase();
+
+                return sameEvent && sameSelection && sameMarket;
+            });
+        };
+
         const releaseLocalOptimisticLock = () => {
             localPlacedBetIdsRef.current.delete(id);
             delete pendingBetDetailsRef.current[id];
@@ -1509,24 +1528,6 @@ function App() {
 
         const prepareTimeoutMs = 45000;
         const doPrepare = () => axios.post('/api/booky/prepare', opportunity, { timeout: prepareTimeoutMs });
-        const recoverPreparedTicket = async () => {
-            const ticketsRes = await axios.get('/api/booky/tickets', { timeout: 7000 });
-            const pending = Array.isArray(ticketsRes?.data?.pending) ? ticketsRes.data.pending : [];
-            const nowMs = Date.now();
-
-            return pending.find((t) => {
-                if (String(t?.status || '').toUpperCase() !== 'DRAFT') return false;
-                const expMs = new Date(t?.expiresAt || '').getTime();
-                if (!Number.isFinite(expMs) || expMs <= nowMs) return false;
-
-                const tOpp = t?.opportunity || {};
-                const sameEvent = String(tOpp?.eventId || '') === String(opportunity?.eventId || '');
-                const sameSelection = String(tOpp?.selection || '').trim().toLowerCase() === String(opportunity?.selection || '').trim().toLowerCase();
-                const sameMarket = String(tOpp?.market || '').trim().toLowerCase() === String(opportunity?.market || '').trim().toLowerCase();
-
-                return sameEvent && sameSelection && sameMarket;
-            });
-        };
 
         let prepRes;
         try {
@@ -1798,8 +1799,25 @@ function App() {
                 } else {
                     const normalizedMsg = String(msg || '').toLowerCase();
                     if (normalizedMsg.includes('ticket no encontrado')) {
-                        alert('⚠️ El ticket ya no existe (posible doble clic o desincronización temporal).\nActualiza datos y vuelve a intentar con la oportunidad vigente.');
-                        await fetchData({ forceBookyRefresh: true });
+                        let recoveredAndConfirmed = false;
+                        try {
+                            const recovered = await recoverPreparedTicket();
+                            if (recovered?.id) {
+                                const recoveredType = String(recovered?.opportunity?.type || opportunity?.type || '').toUpperCase();
+                                const recoveredMode = recoveredType === 'LIVE_SNIPE' ? 'confirm-fast' : 'confirm';
+                                const retryRes = await axios.post(`/api/booky/real/${recoveredMode}/${recovered.id}`, undefined, { timeout: 30000 });
+                                if (retryRes?.data?.success) {
+                                    recoveredAndConfirmed = true;
+                                    alert('✅ Ticket recuperado y confirmado tras desincronización temporal.');
+                                    await fetchData({ forceBookyRefresh: true });
+                                }
+                            }
+                        } catch (_) {}
+
+                        if (!recoveredAndConfirmed) {
+                            alert('⚠️ El ticket ya no existe (posible doble clic o desincronización temporal).\nActualiza datos y vuelve a intentar con la oportunidad vigente.');
+                            await fetchData({ forceBookyRefresh: true });
+                        }
                     } else if (normalizedMsg.includes('timeout')) {
                         alert('⏳ La preparación del ticket tardó más de lo esperado (timeout).\nLa cuota puede seguir vigente: intenta nuevamente en 2-3 segundos.');
                         await fetchData({ forceBookyRefresh: true });

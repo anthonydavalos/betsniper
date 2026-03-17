@@ -1,5 +1,6 @@
 import db, { initDB, writeDBWithRetry } from '../db/database.js';
 import altenarClient from '../config/axiosClient.js';
+import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../config/altenarPublicConfig.js';
 import { refreshOpportunity } from './oddsService.js';
 import { placeAutoBet } from './paperTradingService.js';
 import fs from 'fs';
@@ -213,6 +214,8 @@ const getTokenHealth = () => {
       exists: false,
       jwtValid: false,
       authenticated: false,
+      tokenIntegration: null,
+      tokenUserName: null,
       expIso: null,
       remainingMinutes: null,
       expired: true
@@ -230,6 +233,8 @@ const getTokenHealth = () => {
       exists: true,
       jwtValid,
       authenticated,
+      tokenIntegration: String(payload?.Integration || '').trim().toLowerCase() || null,
+      tokenUserName: String(payload?.UserName || '').trim() || null,
       expIso: null,
       remainingMinutes: null,
       expired: true
@@ -242,6 +247,8 @@ const getTokenHealth = () => {
     exists: true,
     jwtValid,
     authenticated,
+    tokenIntegration: String(payload?.Integration || '').trim().toLowerCase() || null,
+    tokenUserName: String(payload?.UserName || '').trim() || null,
     expIso: new Date(expMs).toISOString(),
     remainingMinutes,
     expired: remainingMinutes <= 0
@@ -317,9 +324,15 @@ const ensureTokenFreshOrThrow = () => {
   const enabled = getRuntimeEnvValue('BOOKY_AUTO_TOKEN_REFRESH_ENABLED', '').toLowerCase() === 'true';
   const minMinutes = Number(getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', String(DEFAULT_MIN_TOKEN_MINUTES)));
   const health = getTokenHealth();
+  const expectedIntegration = String(
+    getRuntimeEnvValue('ALTENAR_INTEGRATION', altenarClient?.defaults?.params?.integration || '')
+  ).trim().toLowerCase();
+  const tokenIntegration = String(health?.tokenIntegration || '').trim().toLowerCase();
+  const integrationMismatch = Boolean(expectedIntegration && tokenIntegration && expectedIntegration !== tokenIntegration);
 
   const mustRenew = !health.exists || !health.jwtValid || !health.authenticated || health.expired ||
-    (Number.isFinite(health.remainingMinutes) && health.remainingMinutes < (Number.isFinite(minMinutes) ? minMinutes : DEFAULT_MIN_TOKEN_MINUTES));
+    (Number.isFinite(health.remainingMinutes) && health.remainingMinutes < (Number.isFinite(minMinutes) ? minMinutes : DEFAULT_MIN_TOKEN_MINUTES)) ||
+    integrationMismatch;
 
   if (!mustRenew) {
     return {
@@ -342,7 +355,9 @@ const ensureTokenFreshOrThrow = () => {
         ? 'Token no pertenece a una sesión autenticada de usuario.'
         : (health.expired
           ? `Token vencido (exp=${health.expIso || 'n/a'}).`
-          : `Token por vencer en ${health.remainingMinutes} min (exp=${health.expIso || 'n/a'}).`)));
+          : (integrationMismatch
+            ? `Token de integración no coincide (token=${tokenIntegration || 'n/a'} env=${expectedIntegration || 'n/a'}).`
+            : `Token por vencer en ${health.remainingMinutes} min (exp=${health.expIso || 'n/a'}).`))));
 
   throw createBookyError(
     `${reason} Renueva token antes de confirmar apuesta real.`,
@@ -351,6 +366,8 @@ const ensureTokenFreshOrThrow = () => {
       code: 'BOOKY_TOKEN_RENEWAL_REQUIRED',
       diagnostic: {
         ...health,
+        expectedIntegration: expectedIntegration || null,
+        integrationMismatch,
         minRequiredMinutes: Number.isFinite(minMinutes) ? minMinutes : DEFAULT_MIN_TOKEN_MINUTES,
         autoRefreshEnabled: enabled,
         renewalTriggered,
@@ -364,13 +381,19 @@ export const getBookyTokenHealth = () => {
   const health = getTokenHealth();
   const profile = getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase();
   const integration = altenarClient?.defaults?.params?.integration || profile;
+  const expectedIntegration = String(getRuntimeEnvValue('ALTENAR_INTEGRATION', integration || '')).trim().toLowerCase();
+  const tokenIntegration = String(health?.tokenIntegration || '').trim().toLowerCase();
   const renewalCommand = `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${profile}`;
   return {
     profile,
     integration,
+    expectedIntegration,
     exists: health.exists,
     jwtValid: health.jwtValid,
     authenticated: health.authenticated,
+    tokenIntegration: health.tokenIntegration,
+    tokenUserName: health.tokenUserName,
+    integrationMismatch: Boolean(expectedIntegration && tokenIntegration && expectedIntegration !== tokenIntegration),
     expIso: health.expIso,
     remainingMinutes: health.remainingMinutes,
     expired: health.expired,
@@ -807,10 +830,37 @@ const prepareRealPlacementDraftInternal = async (ticketId, options = {}) => {
   const template = getPlaceWidgetTemplateFromCapture(capture);
   if (!template) throw new Error('No se encontró template placeWidget en la captura latest.');
 
-  const detailsResp = await altenarClient.get('/GetEventDetails', {
-    params: { eventId: refreshed.eventId, _: Date.now() }
-  });
-  const details = detailsResp?.data;
+  let details = null;
+  try {
+    const detailsResp = await altenarClient.get(
+      '/GetEventDetails',
+      getAltenarPublicRequestConfig({ eventId: refreshed.eventId, _: Date.now() })
+    );
+    details = detailsResp?.data;
+  } catch (error) {
+    const renewal = maybeAutoRenewWidgetToken(error, `bookyRealPlacement.GetEventDetails:${refreshed.eventId}`);
+    const status = Number(error?.response?.status || 0);
+    if (status === 401 || status === 403) {
+      throw createBookyError(
+        'No se pudo preparar apuesta real: GetEventDetails rechazó autenticación del widget (401/403). Renueva token widget y reintenta.',
+        {
+          statusCode: 428,
+          code: 'BOOKY_WIDGET_TOKEN_RENEWAL_REQUIRED',
+          diagnostic: {
+            source: 'GetEventDetails',
+            eventId: refreshed.eventId,
+            providerStatus: status,
+            autoRenewTriggered: Boolean(renewal?.triggered),
+            autoRenewBusy: Boolean(renewal?.busy),
+            retryAfterSeconds: renewal?.retryAfterSeconds || null,
+            observedAt: nowIso()
+          }
+        }
+      );
+    }
+    throw error;
+  }
+
   if (!details) throw new Error('No se pudo obtener GetEventDetails para armar payload real.');
 
   const target = resolveTargetOddFromDetails(refreshed, details);
@@ -1230,6 +1280,28 @@ export const confirmRealPlacement = async (ticketId) => {
   try {
     data = await postPlaceWidgetWithRetry({ draft, auth, ticketId, fastMode: false });
   } catch (error) {
+    const providerStatus = Number(error?.diagnostic?.providerStatus || error?.statusCode || 0);
+    if (providerStatus === 401 || providerStatus === 403) {
+      const renewal = requestBookyTokenRenewal();
+      throw createBookyError(
+        'Token de placeWidget rechazado por provider (401/403). Renueva token y reintenta; no se archivó como rechazo definitivo.',
+        {
+          statusCode: 428,
+          code: 'BOOKY_TOKEN_RENEWAL_REQUIRED',
+          diagnostic: {
+            ...(error?.diagnostic || {}),
+            providerStatus,
+            ticketId,
+            requestId: draft?.payload?.requestId || null,
+            autoRenewRequested: Boolean(renewal?.started),
+            renewalBusy: Boolean(renewal?.busy),
+            renewalMessage: renewal?.message || null,
+            renewalCommand: renewal?.renewalCommand || null
+          }
+        }
+      );
+    }
+
     if (error?.code === 'BOOKY_PLACEWIDGET_UNCERTAIN') {
       await archiveUncertainRealPlacement({ idx, ticket, draft, fastMode: false, error });
       throw createBookyError(
@@ -1358,6 +1430,28 @@ export const confirmRealPlacementFast = async (ticketId) => {
   try {
     data = await postPlaceWidgetWithRetry({ draft, auth, ticketId, fastMode: true });
   } catch (error) {
+    const providerStatus = Number(error?.diagnostic?.providerStatus || error?.statusCode || 0);
+    if (providerStatus === 401 || providerStatus === 403) {
+      const renewal = requestBookyTokenRenewal();
+      throw createBookyError(
+        'Token de placeWidget rechazado por provider (401/403). Renueva token y reintenta; no se archivó como rechazo definitivo.',
+        {
+          statusCode: 428,
+          code: 'BOOKY_TOKEN_RENEWAL_REQUIRED',
+          diagnostic: {
+            ...(error?.diagnostic || {}),
+            providerStatus,
+            ticketId,
+            requestId: draft?.payload?.requestId || null,
+            autoRenewRequested: Boolean(renewal?.started),
+            renewalBusy: Boolean(renewal?.busy),
+            renewalMessage: renewal?.message || null,
+            renewalCommand: renewal?.renewalCommand || null
+          }
+        }
+      );
+    }
+
     if (error?.code === 'BOOKY_PLACEWIDGET_UNCERTAIN') {
       await archiveUncertainRealPlacement({ idx, ticket, draft, fastMode: true, error });
       throw createBookyError(

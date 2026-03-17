@@ -28,6 +28,8 @@ const API_URL_PREMATCH_ODDS = "https://api.arcadia.pinnacle.com/0.1/sports/29/ma
 const API_URL_PREMATCH_FIXTURES = "https://api.arcadia.pinnacle.com/0.1/sports/29/matchups";
 const BASE_MIN_HTTP_GAP_MS = 600; // ~1.6 RPS global en este proceso
 const MAX_HTTP_GAP_MS = 3500;
+const DEFAULT_LIVE_HTTP_MAX_STALE_MS = 20000; // Snapshot de seguridad: forzar refresh cada 20s aunque WS esté sano
+const DEFAULT_LIVE_WS_FRESH_WINDOW_MS = 8000; // Consideramos WS "fresco" si hubo frame reciente
 const DEFAULT_PREMATCH_PRIMARY_HOURS = 6;
 const DEFAULT_PREMATCH_PREFETCH_HOURS = 6;
 const DEFAULT_PREMATCH_OVERLAP_MINUTES = 30;
@@ -98,6 +100,11 @@ class PinnacleLight {
         this.minHttpGapMs = BASE_MIN_HTTP_GAP_MS;
         this.httpBackoffUntil = 0;
         this.lockAcquired = false;
+        this.lastWsFrameAt = 0;
+        this.lastLiveHttpSyncAt = 0;
+        this.liveHttpMaxStaleMs = parsePositiveNumber(process.env.PINNACLE_LIVE_HTTP_MAX_STALE_MS, DEFAULT_LIVE_HTTP_MAX_STALE_MS);
+        this.liveWsFreshWindowMs = parsePositiveNumber(process.env.PINNACLE_LIVE_WS_FRESH_WINDOW_MS, DEFAULT_LIVE_WS_FRESH_WINDOW_MS);
+        this.liveHttpSkipCount = 0;
     }
 
     isProcessAlive(pid) {
@@ -402,9 +409,27 @@ class PinnacleLight {
     async fetchOdds() {
         if (!this.headers) return;
 
+        const now = Date.now();
+        const wsOpen = Boolean(this.ws && this.ws.readyState === 1);
+        const wsFresh = wsOpen && this.lastWsFrameAt > 0 && (now - this.lastWsFrameAt) <= this.liveWsFreshWindowMs;
+        const httpIsFresh = this.lastLiveHttpSyncAt > 0 && (now - this.lastLiveHttpSyncAt) <= this.liveHttpMaxStaleMs;
+
+        // Optimización quirúrgica:
+        // si el WS está activo y con frames recientes, evitamos snapshot HTTP redundante.
+        // Aun así forzamos un HTTP periódico (max stale) para GC/consistencia.
+        if (wsFresh && httpIsFresh) {
+            this.liveHttpSkipCount += 1;
+            if (this.liveHttpSkipCount % 30 === 0) {
+                console.log(`🧊 Live HTTP throttled by healthy WS (${this.liveHttpSkipCount} skips).`);
+            }
+            return;
+        }
+
         try {
             const { data } = await this.arcadiaGet(API_URL_ODDS, { headers: this.headers });
             if (data && Array.isArray(data)) {
+                this.lastLiveHttpSyncAt = Date.now();
+                this.liveHttpSkipCount = 0;
                 
                 // [FIX] ESTRATEGIA DE REEMPLAZO "SNAPSHOT" (Anti-Zombies)
                 // En lugar de hacer merge incremental, agrupamos por MatchID y REEMPLAZAMOS la lista.
@@ -600,6 +625,7 @@ class PinnacleLight {
 
             this.ws.on('message', (data) => {
                 try {
+                    this.lastWsFrameAt = Date.now();
                     const msg = JSON.parse(data.toString());
                     
                     // 1. UPDATE (Cambios incrementales)
