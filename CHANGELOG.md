@@ -7,6 +7,60 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.12] -- 2026-03-17 -- Sprint: Real Placement Resilience + Arcadia Live Poll Throttling
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Recuperación automática de ticket DRAFT en UI
+- **`client/src/App.jsx`**:
+  - Ante error `ticket no encontrado` durante confirmación real, el frontend intenta recuperar un ticket `DRAFT` vigente de la misma oportunidad (`eventId + market + selection`) y re-confirmarlo una sola vez.
+  - Si la recuperación confirma correctamente, se evita falso negativo de UX y se refresca estado en caliente.
+
+#### Diagnóstico extendido de token real Booky
+- **`src/services/bookySemiAutoService.js`**:
+  - `getBookyTokenHealth()` ahora expone `tokenIntegration`, `tokenUserName` e `integrationMismatch`.
+  - Validación temprana de mismatch entre integración del JWT y `ALTENAR_INTEGRATION` activo.
+
+#### Knobs de throttling live HTTP cuando WS está sano
+- **`services/pinnacleLight.js`**:
+  - Se introducen parámetros opcionales:
+    - `PINNACLE_LIVE_HTTP_MAX_STALE_MS` (default interno `20000`)
+    - `PINNACLE_LIVE_WS_FRESH_WINDOW_MS` (default interno `8000`)
+  - Permiten reducir snapshots HTTP redundantes manteniendo refresh periódico de seguridad.
+
+### 🔄 Changed
+
+#### Real placement: manejo explícito de 401/403 provider
+- **`src/services/bookySemiAutoService.js`**:
+  - Si `placeWidget` retorna `401/403`, la respuesta pasa a `BOOKY_TOKEN_RENEWAL_REQUIRED` (428) con intento de renovación asistida y diagnóstico.
+  - Se evita clasificar auth-fail como rechazo definitivo de mercado.
+
+#### Preparación de apuesta real usa config pública Altenar
+- **`src/services/bookySemiAutoService.js`**:
+  - `GetEventDetails` migra a `getAltenarPublicRequestConfig(...)` para consistencia de auth widget.
+  - Si `GetEventDetails` falla con `401/403`, retorna `BOOKY_WIDGET_TOKEN_RENEWAL_REQUIRED` con `eventId` y estado de auto-renew.
+
+#### Arcadia Live: menor carga HTTP con WS estable
+- **`services/pinnacleLight.js`**:
+  - `fetchOdds()` salta polling cuando el websocket está abierto, con frames recientes, y snapshot HTTP aún fresco.
+  - Se preserva snapshot HTTP periódico para garbage-collection y anti-zombies.
+
+### 🐛 Fixed
+
+#### Falsos errores de "ticket no encontrado" en confirmación real
+- Se reduce el escenario de desincronización temporal entre `prepare` y `confirm` con reintento de recuperación controlado en frontend.
+
+#### Falsos rechazos definitivos por auth en placement
+- Auth failures (`401/403`) dejan de archivarse inmediatamente como `REAL_REJECTED` cuando la causa es renovación de token.
+
+#### Cobertura de alias dinámicos
+- **`src/utils/dynamicAliases.json`**:
+  - Se amplía catálogo con aliases operativos adicionales para mejorar matching en ligas/juveniles y variantes reportadas.
+
+---
+
 ## [v3.4.11] -- 2026-03-16 -- Sprint: Widget Token Auto-Renew Policy Documentation
 
 > Rama: `master`

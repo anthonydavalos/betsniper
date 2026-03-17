@@ -202,6 +202,39 @@ Guía de tuning:
 - Debug puntual: `30000` temporalmente.
 - Evitar valores demasiado bajos (`<15000`) para no abrir flujos Puppeteer en ráfaga.
 
+### 17) Real placement más robusto ante 401/403 y mismatch de integración
+
+- `src/services/bookySemiAutoService.js` ahora distingue explícitamente auth failures (`401/403`) de rechazos de mercado.
+- Si `placeWidget` devuelve `401/403`, el backend responde `BOOKY_TOKEN_RENEWAL_REQUIRED` (428) con diagnóstico y disparo de renovación asistida.
+- Se valida que la integración del JWT (`payload.Integration`) coincida con `ALTENAR_INTEGRATION`; si no coincide, se bloquea confirmación con motivo claro.
+- `GET /api/booky/token-health` expone señales adicionales:
+  - `tokenIntegration`
+  - `tokenUserName`
+  - `integrationMismatch`
+
+### 18) Preparación de apuesta real alineada con auth widget
+
+- En preparación de real placement, `GetEventDetails` usa configuración pública unificada (`getAltenarPublicRequestConfig`) para evitar desalineación de headers/auth.
+- Si `GetEventDetails` responde `401/403`, se retorna `BOOKY_WIDGET_TOKEN_RENEWAL_REQUIRED` con `eventId` y estado de auto-renew.
+
+### 19) Recuperación automática de ticket en desincronización UI
+
+- `client/src/App.jsx` añade recuperación controlada cuando aparece `ticket no encontrado` al confirmar:
+  - Busca un `DRAFT` vigente de la misma oportunidad (`eventId + selection + market`).
+  - Reintenta `confirm` una sola vez con ese ticket recuperado.
+  - Si confirma, evita falso negativo y refresca estado en caliente.
+
+### 20) Arcadia Live: throttling HTTP cuando el WS está sano
+
+- `services/pinnacleLight.js` reduce polling HTTP live redundante cuando:
+  - el websocket está abierto,
+  - hubo frames recientes,
+  - el último snapshot HTTP sigue fresco.
+- Se mantiene refresh HTTP periódico para consistencia y limpieza de mercados huérfanos.
+- Nuevos knobs opcionales:
+  - `PINNACLE_LIVE_HTTP_MAX_STALE_MS` (default interno `20000`)
+  - `PINNACLE_LIVE_WS_FRESH_WINDOW_MS` (default interno `8000`)
+
 ## 🚀 Características Principales
 
 ### 🧠 Motor Cuantitativo (Quant Core)
