@@ -7,6 +7,54 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.13] -- 2026-03-17 -- Sprint: ACity Feed Token Reliability + Monitor Polling Optimization
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Renovación automática de token feed en modo widget-only
+- **`src/config/altenarPublicConfig.js`**:
+  - La auto-renovación reactiva del token widget (ante `401/403`) ahora invoca el extractor con `--widget-only`.
+  - Se mantiene ejecución desacoplada (`--no-wait-close`) con timeout configurable para evitar bloqueo del backend.
+
+- **`scripts/extract-booky-auth-token.js`**:
+  - Nuevo flag `--widget-only` para capturar y persistir **solo** `ALTENAR_WIDGET_AUTH_TOKEN`.
+  - Nuevo log de modo de captura (`CaptureMode=widget-only|booky+jwt`) para diagnóstico operativo.
+
+#### Selector de frecuencia de polling en Monitor (frontend)
+- **`client/src/components/MonitorDashboard.jsx`**:
+  - Nuevo control de intervalo en UI con presets `5s`, `10s`, `15s`.
+  - Persistencia de preferencia de usuario vía `localStorage` (`monitorPollMs`).
+
+### 🔄 Changed
+
+#### Cierre temprano del navegador en renovación de feed
+- **`scripts/extract-booky-auth-token.js`**:
+  - Cuando está activo `--widget-only`, al capturar `ALTENAR_WIDGET_AUTH_TOKEN` se persiste inmediatamente y se cierra el navegador sin esperar JWT de Booky.
+  - Resultado: menor permanencia de ventanas Puppeteer en ACity y menor ventana de exposición a `403` durante renovación.
+
+#### Polling Monitor más eficiente y robusto
+- **`client/src/components/MonitorDashboard.jsx`**:
+  - Polling base ajustado a `10s` por defecto.
+  - Se pausa polling cuando la pestaña no está visible (`document.visibilityState`) y se reanuda al volver al foco.
+  - Se evita solapamiento de requests con lock `fetchInFlightRef`.
+
+#### Cache corta para detalle de eventos en Monitor
+- **`src/services/liveValueScanner.js`**:
+  - Se incorpora cache en memoria para `GetEventDetails` del flujo Monitor (`MONITOR_EVENT_DETAILS_TTL_MS=5000`).
+  - Se reutiliza respuesta reciente por `eventId` para reducir llamadas repetidas a Altenar entre ciclos consecutivos.
+
+### 🐛 Fixed
+
+#### Renovación de token feed que dejaba ventana Puppeteer abierta más tiempo del necesario
+- Se corrige el flujo de renovación automática para que no dependa de capturar JWT de Booky cuando el objetivo es recuperar feed scanner.
+
+#### Sobrecarga evitable en Monitor por polling en background y llamadas repetidas
+- Se corrige consumo innecesario de red/backend al desactivar polling en background y reutilizar detalles recientes por evento.
+
+---
+
 ## [v3.4.12] -- 2026-03-17 -- Sprint: Real Placement Resilience + Arcadia Live Poll Throttling
 
 > Rama: `master`

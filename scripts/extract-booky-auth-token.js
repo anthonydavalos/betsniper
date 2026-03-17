@@ -18,6 +18,7 @@ const timeoutMsArg = args.find(a => a.startsWith('--timeout='));
 const captureMsArg = args.find(a => a.startsWith('--capture-ms='));
 const waitCloseArg = args.includes('--wait-close');
 const explicitNoWaitCloseArg = args.includes('--no-wait-close');
+const widgetOnlyMode = args.includes('--widget-only');
 const rawTimeoutMs = Number(timeoutMsArg?.split('=')[1] || captureMsArg?.split('=')[1] || 0);
 const waitUntilClose = explicitNoWaitCloseArg
   ? false
@@ -286,6 +287,7 @@ const run = async () => {
   console.log(`   BOOK_PROFILE=${bookProfile}`);
   console.log(`   URL=${targetUrl}`);
   console.log(`   Modo=${headless ? 'headless' : 'headed'}`);
+  console.log(`   CaptureMode=${widgetOnlyMode ? 'widget-only' : 'booky+jwt'}`);
   console.log(`   Estrategia=${waitUntilClose ? 'esperar cierre manual del navegador' : `timeout ${timeoutMs}ms`}`);
   console.log(`   BOOKY_KEEP_REAL_PLACEMENT_ON_TOKEN_REFRESH=${keepRealPlacementEnabled}`);
 
@@ -367,6 +369,13 @@ const run = async () => {
       if (isWidgetApiRequest(url) && !foundWidgetAuth) {
         foundWidgetAuth = auth;
         console.log('   ✅ Token widget capturado (ALTENAR_WIDGET_AUTH_TOKEN).');
+
+        await persistCapturedTokens({ syncSheets: false });
+
+        if (widgetOnlyMode) {
+          await finish(true, 'Token widget capturado y guardado en .env (ALTENAR_WIDGET_AUTH_TOKEN).');
+          return;
+        }
       }
 
       const rawToken = auth.replace(/^Bearer\s+/i, '').trim();

@@ -3,15 +3,29 @@ import axios from 'axios';
 import { RefreshCw, ExternalLink, Activity, AlertTriangle, ArrowUp, ArrowDown, Triangle } from 'lucide-react';
 
 export default function MonitorDashboard() {
+    const POLL_OPTIONS = [5000, 10000, 15000];
+    const getStoredPollMs = () => {
+        try {
+            const raw = Number(localStorage.getItem('monitorPollMs') || 10000);
+            return POLL_OPTIONS.includes(raw) ? raw : 10000;
+        } catch (_) {
+            return 10000;
+        }
+    };
+
     const [data, setData] = useState([]);
     const [loading, setLoading] = useState(false);
     const [lastUpdate, setLastUpdate] = useState(null);
     const [error, setError] = useState(null);
     const [monitorDisabled, setMonitorDisabled] = useState(false);
+    const [pollMs, setPollMs] = useState(getStoredPollMs);
     const prevOddsRef = useRef({}); // Store previous odds for trend calculation
+    const fetchInFlightRef = useRef(false);
 
     const fetchData = async () => {
         if (monitorDisabled) return;
+        if (fetchInFlightRef.current) return;
+        fetchInFlightRef.current = true;
         setLoading(true);
         try {
             const res = await axios.get('/api/monitor/live-odds');
@@ -88,16 +102,47 @@ export default function MonitorDashboard() {
                 setError("Error conectando con el servidor Monitor.");
             }
         } finally {
+            fetchInFlightRef.current = false;
             setLoading(false);
         }
     };
 
     useEffect(() => {
-        fetchData();
         if (monitorDisabled) return undefined;
-        const interval = setInterval(fetchData, 5000); // Poll every 5s (Standard Live)
-        return () => clearInterval(interval);
-    }, [monitorDisabled]);
+
+        let intervalId = null;
+
+        const runPoll = () => {
+            if (document.visibilityState !== 'visible') return;
+            fetchData();
+        };
+
+        const startPolling = () => {
+            if (intervalId) clearInterval(intervalId);
+            runPoll();
+            intervalId = setInterval(runPoll, pollMs);
+        };
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState === 'visible') {
+                runPoll();
+            }
+        };
+
+        startPolling();
+        document.addEventListener('visibilitychange', onVisibilityChange);
+
+        return () => {
+            if (intervalId) clearInterval(intervalId);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+        };
+    }, [monitorDisabled, pollMs]);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem('monitorPollMs', String(pollMs));
+        } catch (_) {}
+    }, [pollMs]);
 
     // Helper to format price
     const fmt = (p) => p ? p.toFixed(2) : '-';
@@ -112,6 +157,21 @@ export default function MonitorDashboard() {
                     </h1>
                 </div>
                 <div className="flex items-center gap-4">
+                    <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 rounded-md p-1">
+                        {POLL_OPTIONS.map((ms) => {
+                            const isActive = pollMs === ms;
+                            return (
+                                <button
+                                    key={ms}
+                                    onClick={() => setPollMs(ms)}
+                                    className={`px-2 py-1 rounded text-[10px] font-bold transition-colors ${isActive ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-gray-700'}`}
+                                    title={`Actualizar cada ${Math.round(ms / 1000)} segundos`}
+                                >
+                                    {Math.round(ms / 1000)}s
+                                </button>
+                            );
+                        })}
+                    </div>
                     <span className="text-gray-400 text-xs">
                         Última act: {lastUpdate ? lastUpdate.toLocaleTimeString() : '...'}
                     </span>

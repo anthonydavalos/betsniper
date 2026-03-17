@@ -149,7 +149,13 @@ const triggerWidgetTokenRenewal = () => {
   const scriptPath = path.join(projectRoot, 'scripts', 'extract-booky-auth-token.js');
   const logDir = path.join(projectRoot, 'data', 'booky');
   const logPath = path.join(logDir, 'widget-token-renew.log');
-  const args = ['--headed', '--no-wait-close', `--timeout=${TOKEN_RENEW_TIMEOUT_MS}`, `--require-profile=${profile}`];
+  const args = [
+    '--headed',
+    '--no-wait-close',
+    '--widget-only',
+    `--timeout=${TOKEN_RENEW_TIMEOUT_MS}`,
+    `--require-profile=${profile}`
+  ];
 
   try {
     fs.mkdirSync(logDir, { recursive: true });
