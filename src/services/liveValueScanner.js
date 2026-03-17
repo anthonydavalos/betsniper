@@ -52,6 +52,8 @@ const liveOpportunityStability = new Map();
 const STABILITY_WINDOW_MS = 25000;
 let lastStaleTriggerAt = 0;
 const staleClockLagHits = new Map();
+const monitorEventDetailsCache = new Map();
+const MONITOR_EVENT_DETAILS_TTL_MS = 5000;
 
 const triggerPinnacleStaleReload = (reason = 'live-value-desync') => {
     const nowMs = Date.now();
@@ -114,6 +116,30 @@ const pruneStabilityCache = () => {
             liveOpportunityStability.delete(key);
         }
     }
+};
+
+const getMonitorEventDetailsCached = async (eventId) => {
+    const key = String(eventId || '').trim();
+    if (!key) return null;
+
+    const now = Date.now();
+    const cached = monitorEventDetailsCache.get(key);
+    if (cached && (now - cached.at) < MONITOR_EVENT_DETAILS_TTL_MS) {
+        return cached.data;
+    }
+
+    const details = await getEventDetails(eventId);
+    monitorEventDetailsCache.set(key, { at: now, data: details || null });
+
+    if (monitorEventDetailsCache.size > 500) {
+        for (const [cacheKey, entry] of monitorEventDetailsCache.entries()) {
+            if ((now - Number(entry?.at || 0)) > MONITOR_EVENT_DETAILS_TTL_MS * 6) {
+                monitorEventDetailsCache.delete(cacheKey);
+            }
+        }
+    }
+
+    return details;
 };
 
 const normalizeMarketText = (value = '') => String(value)
@@ -879,7 +905,7 @@ export const getLiveOddsComparison = async () => {
         // 2. Fetch Details (SIEMPRE intentar extraer Altenar para diagnóstico)
         let details = null;
         try {
-            details = await getEventDetails(event.id);
+            details = await getMonitorEventDetailsCached(event.id);
         } catch (e) {
              // console.error(`Err detail ${event.id}`); 
         }
