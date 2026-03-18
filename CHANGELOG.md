@@ -7,6 +7,44 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.14] -- 2026-03-18 -- Sprint: Booky UI Fallbacks (Start Time + League) for Active/Finished Bets
+
+> Rama: `master`
+
+### 🔄 Changed
+
+#### Frontend: fallback robusto de hora de inicio por ticket
+- **`client/src/App.jsx`**:
+  - Para filas `EN JUEGO` y finalizadas, la hora de inicio ahora usa fallback por `providerBetId` (ticket) contra `bookyAccount.history`.
+  - Si `op`/`activeBet` no trae `matchDate/eventDate`, la UI recupera `selections[0].eventDate` del historial remoto y evita `--:--`.
+
+#### Frontend: fallback de liga en filas vivas/abiertas
+- **`client/src/App.jsx`**:
+  - La visualización de liga ahora prioriza `op.league` y cae a `betData.league` cuando el registro principal viene incompleto.
+  - Se reduce aparición de `-` en tickets activos con metadatos parciales.
+
+#### Backend: enriquecimiento remoto/local más completo
+- **`src/services/bookyAccountService.js`**:
+  - En merge de historial remoto + local se conservan y rellenan campos descriptivos faltantes (`match`, `league`, `eventId`, `market`, `selection`, `placedAt`) desde fuente local.
+  - También se preserva `pinnacleInfo/pinnaclePrice` cuando el remoto viene sparse.
+  - Corrección de derivación de `pick` en filas remotas usando `selectionTypeIdToPick(selectionTypeId, firstSelection)` para respetar línea en `Totals` y mejorar match por `eventId+pick`.
+
+### ✅ Added
+
+#### Ajustes de aliases dinámicos operativos
+- **`src/utils/dynamicAliases.json`**:
+  - Se incluyen aliases adicionales para mejorar cobertura de matching en eventos/ligas con naming divergente reportado en operación.
+
+### 🐛 Fixed
+
+#### Tickets activos con hora de inicio vacía pese a tener `eventDate` remoto
+- Se corrige escenario donde la tarjeta mostraba `--:--` aunque el dato existía en `bookyAccount.history`.
+
+#### Ligas vacías en tarjetas activas por payload remoto incompleto
+- Se corrige la visualización `-` cuando la liga estaba disponible en snapshot local/histórico del mismo ticket.
+
+---
+
 ## [v3.4.13] -- 2026-03-17 -- Sprint: ACity Feed Token Reliability + Monitor Polling Optimization
 
 > Rama: `master`

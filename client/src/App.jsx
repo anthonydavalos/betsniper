@@ -2266,7 +2266,20 @@ function App() {
   };
 
     const filteredOps = getFilteredData();
-    const remoteOpenBookyRows = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
+    const bookyHistoryRows = Array.isArray(bookyAccount?.history) ? bookyAccount.history : [];
+    const bookyEventStartIsoByProvider = new Map();
+    for (const row of bookyHistoryRows) {
+        const providerBetId = row?.providerBetId;
+        const providerKey = providerBetId !== null && providerBetId !== undefined && String(providerBetId).trim() !== ''
+            ? String(providerBetId).trim()
+            : null;
+        if (!providerKey || bookyEventStartIsoByProvider.has(providerKey)) continue;
+
+        const startIso = resolveBookyEventStartIso(row) || resolveOpEventStartIso(row);
+        if (startIso) bookyEventStartIsoByProvider.set(providerKey, startIso);
+    }
+
+    const remoteOpenBookyRows = bookyHistoryRows
         .filter(row => isBookyOpenStatus(row?.status));
 
     const remoteOpenBookyByKey = new Map();
@@ -2686,8 +2699,22 @@ function App() {
                                         !isStatusCompleted &&
                                         !isExplicitlyFinished &&
                                         (isReallyLiveType || hasTrustedVisualLiveClock || isInPlayNow);
-                                    const eventStartIso = op.isBookyHistory ? (resolveBookyEventStartIso(op) || resolveOpEventStartIso(op)) : resolveOpEventStartIso(op);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
+                                    const eventStartIsoFromHistory = ticketIdForRow
+                                        ? (bookyEventStartIsoByProvider.get(String(ticketIdForRow)) || null)
+                                        : null;
+                                    const eventStartIso = op.isBookyHistory
+                                        ? (
+                                            resolveBookyEventStartIso(op) ||
+                                            resolveOpEventStartIso(op) ||
+                                            resolveOpEventStartIso(betData || {}) ||
+                                            eventStartIsoFromHistory
+                                        )
+                                        : (
+                                            resolveOpEventStartIso(op) ||
+                                            resolveOpEventStartIso(betData || {}) ||
+                                            eventStartIsoFromHistory
+                                        );
                                     const entryMeta = ticketIdForRow ? (entryOrderByTicketId.get(String(ticketIdForRow)) || null) : null;
                                     const betTimeIso = resolveOpBetTimeIso(betData, op);
                                     const marketLabel = normalizeMarketLabel(op.market);
@@ -2883,7 +2910,7 @@ function App() {
                                             <div className="text-slate-200 font-bold text-sm text-wrap max-w-50 md:max-w-none">{op.match}</div>
                                             {(op.isBookyHistory || activeTab === 'LIVE' || ticketIdForRow) ? (
                                                 <div className="text-slate-500 text-[10px] flex gap-2 flex-wrap items-center">
-                                                    <span>{op.league || '-'}</span>
+                                                    <span>{op.league || betData?.league || '-'}</span>
                                                     <span className="text-slate-600">|</span>
                                                     <span>{(entryMeta && entryMeta.total > 1) ? formatTimeWithSecondsSafe(betTimeIso || op.date) : formatTimeSafe(betTimeIso || op.date)}</span>
                                                     {ticketIdForRow && (

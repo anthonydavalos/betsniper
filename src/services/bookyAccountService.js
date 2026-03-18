@@ -2024,9 +2024,19 @@ export const getBookyHistory = async (limit = 60) => {
     const remoteRow = merged.get(key) || {};
     merged.set(key, {
       ...remoteRow,
+      match: remoteRow.match || row.match || null,
+      league: remoteRow.league || row.league || null,
+      eventId: remoteRow.eventId || row.eventId || null,
+      market: remoteRow.market || row.market || null,
+      selection: remoteRow.selection || row.selection || null,
+      placedAt: remoteRow.placedAt || row.placedAt || null,
       type: remoteRow.type || row.type || null,
       strategy: remoteRow.strategy || row.strategy || null,
-      opportunityType: remoteRow.opportunityType || row.opportunityType || null
+      opportunityType: remoteRow.opportunityType || row.opportunityType || null,
+      pinnacleInfo: remoteRow.pinnacleInfo || row.pinnacleInfo || null,
+      pinnaclePrice: Number.isFinite(Number(remoteRow.pinnaclePrice))
+        ? Number(remoteRow.pinnaclePrice)
+        : (Number.isFinite(Number(row.pinnaclePrice)) ? Number(row.pinnaclePrice) : null)
     });
   }
 
@@ -2158,8 +2168,9 @@ export const getBookyHistory = async (limit = 60) => {
       : (profileStickyByProvider.get(String(providerBetId)) || null);
 
     const eventId = Number(row?.eventId);
-    const selectionTypeId = Number(row?.selections?.[0]?.selectionTypeId);
-    const pick = selectionTypeIdToPick(selectionTypeId);
+    const firstSelection = row?.selections?.[0] || null;
+    const selectionTypeId = Number(firstSelection?.selectionTypeId);
+    const pick = selectionTypeIdToPick(selectionTypeId, firstSelection);
     const eventPickKey = Number.isFinite(eventId) && pick ? `${eventId}_${pick}` : null;
 
     const eventLocalMeta = eventPickKey ? (localTypeByEventPick.get(eventPickKey) || null) : null;
