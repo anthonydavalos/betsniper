@@ -29,6 +29,39 @@ export const getPortfolio = async () => {
 // Global Set to track bets currently being processed (Prevent Race Conditions)
 const processingBets = new Set();
 
+const parseLineFromText = (value = '') => {
+    const match = String(value || '').replace(',', '.').match(/(\d+(?:\.\d+)?)/);
+    if (!match) return NaN;
+    const n = Number(match[1]);
+    return Number.isFinite(n) ? n : NaN;
+};
+
+const isOverPick = (pick = '') => {
+    const p = String(pick || '').toLowerCase();
+    return p === 'over' || p.startsWith('over_');
+};
+
+const isUnderPick = (pick = '') => {
+    const p = String(pick || '').toLowerCase();
+    return p === 'under' || p.startsWith('under_');
+};
+
+const resolveTotalsLineForBet = (bet = {}) => {
+    const pick = String(bet?.pick || '').toLowerCase();
+    if (pick.startsWith('over_') || pick.startsWith('under_')) {
+        const raw = Number(pick.split('_')[1]);
+        if (Number.isFinite(raw)) return raw;
+    }
+
+    const byMarket = parseLineFromText(bet?.market || '');
+    if (Number.isFinite(byMarket)) return byMarket;
+
+    const bySelection = parseLineFromText(bet?.selection || '');
+    if (Number.isFinite(bySelection)) return bySelection;
+
+    return NaN;
+};
+
 /**
  * Coloca una apuesta automática si no existe ya una para ese evento.
  */
@@ -62,19 +95,19 @@ export const placeAutoBet = async (opportunity) => {
 
     // B) Totals (Over/Under)
     if (selectionStr.includes('OVER') || selectionStr.includes('MÁS')) {
-        let line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+           let line = parseLineFromText(selectionStr);
         // Fallback: Mirar en Market Name si la selección no tiene número (ej. "Over")
-        if (line === 0 && opportunity.market) {
-             line = parseFloat(opportunity.market.match(/\d+(\.\d+)?/)?.[0] || 0);
+           if (!Number.isFinite(line) && opportunity.market) {
+               line = parseLineFromText(opportunity.market);
         }
-        pick = `over_${line}`; 
+           pick = Number.isFinite(line) ? `over_${line}` : 'over'; 
     } else if (selectionStr.includes('UNDER') || selectionStr.includes('MENOS')) {
-        let line = parseFloat(selectionStr.match(/\d+(\.\d+)?/)?.[0] || 0);
+           let line = parseLineFromText(selectionStr);
         // Fallback: Mirar en Market Name si la selección no tiene número (ej. "Under")
-        if (line === 0 && opportunity.market) {
-             line = parseFloat(opportunity.market.match(/\d+(\.\d+)?/)?.[0] || 0);
+           if (!Number.isFinite(line) && opportunity.market) {
+               line = parseLineFromText(opportunity.market);
         }
-        pick = `under_${line}`; 
+           pick = Number.isFinite(line) ? `under_${line}` : 'under'; 
     }
 
     // C) BTTS
@@ -242,12 +275,16 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
         if (bet.pick === 'unknown' && bet.selection) {
             const sel = bet.selection.toUpperCase();
             if (sel.includes('OVER') || sel.includes('MÁS')) {
-                const line = parseFloat(sel.match(/\d+(\.\d+)?/)?.[0] || 0);
-                bet.pick = `over_${line}`;
+                const line = Number.isFinite(parseLineFromText(sel))
+                    ? parseLineFromText(sel)
+                    : parseLineFromText(bet.market || '');
+                bet.pick = Number.isFinite(line) ? `over_${line}` : 'over';
                 hasChanges = true;
             } else if (sel.includes('UNDER') || sel.includes('MENOS')) {
-                const line = parseFloat(sel.match(/\d+(\.\d+)?/)?.[0] || 0);
-                bet.pick = `under_${line}`;
+                const line = Number.isFinite(parseLineFromText(sel))
+                    ? parseLineFromText(sel)
+                    : parseLineFromText(bet.market || '');
+                bet.pick = Number.isFinite(line) ? `under_${line}` : 'under';
                 hasChanges = true;
             } else if (sel.includes('HOME') || sel.includes('LOCAL')) {
                 bet.pick = 'home';
@@ -358,8 +395,8 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             const currentTotal = scH + scA;
             
             // 1. Check Over
-            if (bet.pick && bet.pick.startsWith('over_')) {
-                const line = parseFloat(bet.pick.split('_')[1]);
+            if (isOverPick(bet.pick)) {
+                const line = resolveTotalsLineForBet(bet);
                 if (currentTotal > line) earlyWin = true;
             }
             
@@ -376,8 +413,8 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             const minsSinceLastUpdate = (Date.now() - new Date(bet.lastUpdate || bet.createdAt).getTime()) / 60000;
             
             // 1. Under perdido matemáticamente (más goles que la línea)
-            if (bet.pick && bet.pick.startsWith('under_')) {
-                const line = parseFloat(bet.pick.split('_')[1]);
+            if (isUnderPick(bet.pick)) {
+                const line = resolveTotalsLineForBet(bet);
                 if (currentTotal > line) earlyLoss = true;
             }
             
@@ -462,12 +499,12 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
                 else if (bet.pick === 'draw' && homeGoals === awayGoals) outcome = 'WIN';
                 
                 // B) Totals Logic
-                else if (bet.pick && bet.pick.startsWith('over_')) {
-                    const line = parseFloat(bet.pick.split('_')[1]);
+                else if (isOverPick(bet.pick)) {
+                    const line = resolveTotalsLineForBet(bet);
                     if (currentTotal > line) outcome = 'WIN';
                 }
-                else if (bet.pick && bet.pick.startsWith('under_')) {
-                    const line = parseFloat(bet.pick.split('_')[1]);
+                else if (isUnderPick(bet.pick)) {
+                    const line = resolveTotalsLineForBet(bet);
                     if (currentTotal < line) outcome = 'WIN';
                 }
                 
@@ -748,12 +785,12 @@ const settleBet = (bet, score) => {
     else if (pick === 'draw' && homeGoals === awayGoals) outcome = 'WIN';
 
     // B) Totals Logic (over_2.5, under_3.5)
-    else if (pick.startsWith('over_')) {
-        const line = parseFloat(pick.split('_')[1]);
+    else if (isOverPick(pick)) {
+        const line = resolveTotalsLineForBet(bet);
         if (totalGoals > line) outcome = 'WIN';
     }
-    else if (pick.startsWith('under_')) {
-        const line = parseFloat(pick.split('_')[1]);
+    else if (isUnderPick(pick)) {
+        const line = resolveTotalsLineForBet(bet);
         if (totalGoals < line) outcome = 'WIN';
     }
 

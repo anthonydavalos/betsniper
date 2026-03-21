@@ -109,6 +109,8 @@ const getKellyBaseMode = () => {
   const raw = String(
     getRuntimeEnvValue('KELLY_BASE_MODE', getRuntimeEnvValue('BOOKY_KELLY_BASE_MODE', 'NAV'))
   ).trim().toUpperCase();
+  if (raw === 'PORTFOLIO') return 'PORTFOLIO';
+  if (raw === 'CONFIG') return 'CONFIG';
   if (raw === 'BALANCE') return 'BALANCE';
   return 'NAV';
 };
@@ -953,6 +955,187 @@ const reconcilePortfolioActiveBetsFromRemote = (remoteRows = [], { integration =
     patchedCount,
     removedCount,
     removedIds
+  };
+};
+
+const resolveRemoteSettlementForPortfolio = (row = {}) => {
+  const providerStatus = Number(row?.status);
+  if (!BOOKY_SETTLED_PROVIDER_STATUSES.has(providerStatus)) return null;
+
+  const stake = Number(row?.stake);
+  const payout = Number(row?.payout);
+  const potentialReturn = Number(row?.potentialReturn);
+  const safeStake = Number.isFinite(stake) ? stake : 0;
+
+  let localStatus = 'LOST';
+  let returnAmt = 0;
+
+  if (providerStatus === 2) {
+    localStatus = 'LOST';
+    returnAmt = 0;
+  } else if (providerStatus === 4 || providerStatus === 18) {
+    localStatus = 'VOID';
+    returnAmt = safeStake;
+  } else if (providerStatus === 8) {
+    localStatus = Number.isFinite(payout) && payout >= safeStake ? 'WON' : 'LOST';
+    returnAmt = Number.isFinite(payout) ? payout : 0;
+  } else if (providerStatus === 1) {
+    localStatus = 'WON';
+    if (Number.isFinite(payout) && payout > 0) {
+      returnAmt = payout;
+    } else if (Number.isFinite(potentialReturn) && potentialReturn > 0) {
+      returnAmt = potentialReturn;
+    }
+  } else {
+    if (Number.isFinite(payout) && payout > 0) returnAmt = payout;
+  }
+
+  const profit = returnAmt - safeStake;
+
+  return {
+    providerStatus,
+    localStatus,
+    stake: safeStake,
+    returnAmt,
+    profit,
+    payout: Number.isFinite(payout) ? payout : null,
+    potentialReturn: Number.isFinite(potentialReturn) ? potentialReturn : null
+  };
+};
+
+const applyRemoteSettlementPatch = (bet = {}, remote = {}, resolved = null) => {
+  if (!resolved) return bet;
+
+  const remoteStake = Number(remote?.stake);
+  const normalizedStake = Number.isFinite(remoteStake) && remoteStake > 0
+    ? remoteStake
+    : (Number.isFinite(Number(bet?.stake)) ? Number(bet.stake) : resolved.stake);
+
+  const remoteOdd = Number(remote?.odd);
+  const normalizedOdd = Number.isFinite(remoteOdd) && remoteOdd > 1
+    ? remoteOdd
+    : (Number.isFinite(Number(bet?.odd)) ? Number(bet.odd) : null);
+
+  const placedAt = remote?.placedAt || bet?.createdAt || bet?.date || nowIso();
+
+  return {
+    ...bet,
+    status: resolved.localStatus,
+    stake: normalizedStake,
+    kellyStake: normalizedStake,
+    odd: normalizedOdd || bet?.odd || null,
+    price: normalizedOdd || bet?.price || null,
+    payout: resolved.payout,
+    potentialReturn: resolved.potentialReturn,
+    return: Number(resolved.returnAmt.toFixed(4)),
+    profit: Number(resolved.profit.toFixed(4)),
+    providerBetId: remote?.providerBetId ?? bet?.providerBetId ?? null,
+    providerStatus: resolved.providerStatus,
+    providerLastSyncAt: nowIso(),
+    providerPotentialReturn: resolved.potentialReturn,
+    fullTimeSettlement: true,
+    settledFromRemote: true,
+    closedAt: bet?.closedAt || nowIso(),
+    createdAt: bet?.createdAt || placedAt
+  };
+};
+
+const reconcilePortfolioSettlementsFromRemote = (remoteRows = [], { integration = null } = {}) => {
+  const rows = Array.isArray(remoteRows) ? remoteRows : [];
+  if (rows.length === 0) {
+    return {
+      historyPatched: 0,
+      activeSettled: 0,
+      movedToHistory: 0,
+      touchedCount: 0
+    };
+  }
+
+  const settledByProviderBetId = new Map();
+  for (const row of rows) {
+    const providerBetId = row?.providerBetId;
+    if (providerBetId === null || providerBetId === undefined || providerBetId === '') continue;
+
+    const resolved = resolveRemoteSettlementForPortfolio(row);
+    if (!resolved) continue;
+
+    settledByProviderBetId.set(String(providerBetId), { row, resolved });
+  }
+
+  if (settledByProviderBetId.size === 0) {
+    return {
+      historyPatched: 0,
+      activeSettled: 0,
+      movedToHistory: 0,
+      touchedCount: 0
+    };
+  }
+
+  const normalizedIntegration = integration ? normalizeBookProfile(integration) : null;
+  const historyRows = Array.isArray(db.data?.portfolio?.history) ? db.data.portfolio.history : [];
+  const activeRows = Array.isArray(db.data?.portfolio?.activeBets) ? db.data.portfolio.activeBets : [];
+
+  let historyPatched = 0;
+  let activeSettled = 0;
+  let movedToHistory = 0;
+
+  const shouldSkipByIntegration = (bet = {}) => {
+    if (!normalizedIntegration) return false;
+    const raw = String(bet?.integration || '').trim();
+    if (!raw) return false;
+    return normalizeBookProfile(raw) !== normalizedIntegration;
+  };
+
+  for (let i = 0; i < historyRows.length; i += 1) {
+    const bet = historyRows[i];
+    if (!bet || typeof bet !== 'object') continue;
+    if (shouldSkipByIntegration(bet)) continue;
+
+    const providerBetId = bet?.providerBetId;
+    if (providerBetId === null || providerBetId === undefined || providerBetId === '') continue;
+
+    const found = settledByProviderBetId.get(String(providerBetId));
+    if (!found) continue;
+
+    historyRows[i] = applyRemoteSettlementPatch(bet, found.row, found.resolved);
+    historyPatched += 1;
+  }
+
+  const removeActiveIndexes = [];
+  for (let i = 0; i < activeRows.length; i += 1) {
+    const bet = activeRows[i];
+    if (!bet || typeof bet !== 'object') continue;
+    if (shouldSkipByIntegration(bet)) continue;
+
+    const providerBetId = bet?.providerBetId;
+    if (providerBetId === null || providerBetId === undefined || providerBetId === '') continue;
+
+    const found = settledByProviderBetId.get(String(providerBetId));
+    if (!found) continue;
+
+    const patched = applyRemoteSettlementPatch(bet, found.row, found.resolved);
+    activeSettled += 1;
+
+    const historyIdx = historyRows.findIndex((h) => String(h?.id || '') === String(patched?.id || ''));
+    if (historyIdx >= 0) {
+      historyRows[historyIdx] = patched;
+    } else {
+      historyRows.unshift(patched);
+      movedToHistory += 1;
+    }
+
+    removeActiveIndexes.push(i);
+  }
+
+  for (let i = removeActiveIndexes.length - 1; i >= 0; i -= 1) {
+    activeRows.splice(removeActiveIndexes[i], 1);
+  }
+
+  return {
+    historyPatched,
+    activeSettled,
+    movedToHistory,
+    touchedCount: historyPatched + activeSettled
   };
 };
 
@@ -1999,7 +2182,11 @@ export const getBookyHistory = async (limit = 60) => {
   const reconcileStats = reconcilePortfolioActiveBetsFromRemote(remoteRows, {
     integration: ctx.integration
   });
-  if (Number(reconcileStats?.touchedCount || 0) > 0) {
+  const settleStats = reconcilePortfolioSettlementsFromRemote(remoteRows, {
+    integration: ctx.integration
+  });
+
+  if ((Number(reconcileStats?.touchedCount || 0) + Number(settleStats?.touchedCount || 0)) > 0) {
     await db.write();
   }
 
@@ -2498,6 +2685,32 @@ export const getKellyBankrollBase = async ({ skipDbRefresh = false, useCachedOnl
   ensureBookyStore();
   const ctx = getActiveProfileContext();
   const baseMode = getKellyBaseMode();
+
+  // Modo manual: usar exclusivamente balance del portfolio (paper/manual capital).
+  if (baseMode === 'PORTFOLIO') {
+    const portfolioBalance = safeNumber(db.data?.portfolio?.balance, NaN);
+    if (Number.isFinite(portfolioBalance) && portfolioBalance > 0) {
+      return {
+        amount: portfolioBalance,
+        source: 'portfolio-manual',
+        updatedAt: null,
+        openExposure: 0,
+        baseMode
+      };
+    }
+  }
+
+  // Modo manual fijo: usar bankroll de config como base rígida.
+  if (baseMode === 'CONFIG') {
+    const configBankroll = safeNumber(db.data?.config?.bankroll, 100);
+    return {
+      amount: Number.isFinite(configBankroll) && configBankroll > 0 ? configBankroll : 100,
+      source: 'config-manual',
+      updatedAt: null,
+      openExposure: 0,
+      baseMode
+    };
+  }
 
   const real = useCachedOnly
     ? getCachedDbBalance(ctx.key)

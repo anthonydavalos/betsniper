@@ -383,6 +383,7 @@ export const getBookyTokenHealth = () => {
   const integration = altenarClient?.defaults?.params?.integration || profile;
   const expectedIntegration = String(getRuntimeEnvValue('ALTENAR_INTEGRATION', integration || '')).trim().toLowerCase();
   const tokenIntegration = String(health?.tokenIntegration || '').trim().toLowerCase();
+  const realPlacementEnabled = getRuntimeEnvValue('BOOKY_REAL_PLACEMENT_ENABLED', '').toLowerCase() === 'true';
   const renewalCommand = `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${profile}`;
   return {
     profile,
@@ -399,6 +400,7 @@ export const getBookyTokenHealth = () => {
     expired: health.expired,
     minRequiredMinutes: Number(getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', String(DEFAULT_MIN_TOKEN_MINUTES))),
     autoRefreshEnabled: getRuntimeEnvValue('BOOKY_AUTO_TOKEN_REFRESH_ENABLED', '').toLowerCase() === 'true',
+    realPlacementEnabled,
     renewalCommand
   };
 };

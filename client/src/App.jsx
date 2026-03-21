@@ -1379,6 +1379,24 @@ function App() {
         const kellyRecPrematch = Number(kellyDiagnostics?.fractions?.recommended?.PREMATCH_VALUE);
         const kellyRecLive = Number(kellyDiagnostics?.fractions?.recommended?.LIVE_VALUE);
         const kellyDiagTime = kellyDiagnostics?.fetchedAt;
+    const isManualKellyMode = kellyBaseMode === 'PORTFOLIO' || kellyBaseMode === 'CONFIG';
+    const portfolioHistoryRows = Array.isArray(portfolio?.history) ? portfolio.history : [];
+    const portfolioInitialCapital = Number(portfolio?.initialCapital);
+    const portfolioRealizedPnL = portfolioHistoryRows.reduce((acc, row) => acc + resolveFinishedOpPnl(row), 0);
+    const manualCapitalAmount = Number.isFinite(portfolioInitialCapital)
+        ? Number((portfolioInitialCapital + portfolioRealizedPnL).toFixed(2))
+        : NaN;
+
+    const headerCapitalAmount = isManualKellyMode
+        ? (Number.isFinite(kellyBaseAmount) ? kellyBaseAmount : manualCapitalAmount)
+        : realBalanceAmount;
+    const headerCapitalCurrency = isManualKellyMode ? kellyBaseCurrency : realBalanceCurrency;
+    const portfolioDeltaPnL = (Number.isFinite(headerCapitalAmount) && Number.isFinite(portfolioInitialCapital))
+        ? Number((headerCapitalAmount - portfolioInitialCapital).toFixed(2))
+        : portfolioRealizedPnL;
+    const headerPnlAmount = isManualKellyMode ? portfolioDeltaPnL : realBookyPnL;
+    const headerPnlClass = headerPnlAmount >= 0 ? 'text-emerald-400' : 'text-red-400';
+    const headerPnlLabel = isManualKellyMode ? 'PnL (SIM NAV)' : `PnL (${activeBookyLabel})`;
     const [tokenRenewing, setTokenRenewing] = useState(false);
     const tokenRenewingRef = useRef(false);
 
@@ -1462,6 +1480,7 @@ function App() {
   const handlePlaceBet = async (opportunity) => {
     const id = getOpportunityId(opportunity); // ID único por selección (eventId + selection)
         const optimisticIsSnipe = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE';
+                let useRealPlacement = true;
 
         const recoverPreparedTicket = async () => {
             const ticketsRes = await axios.get('/api/booky/tickets', { timeout: 7000 });
@@ -1611,9 +1630,18 @@ function App() {
         const evDeltaLine = showDelta(oldEv, ev, 2);
         const probDeltaLine = showDelta(oldRealProb, realProb, 2);
         const tokenMins = getTokenRemainingMinutes(token);
+        useRealPlacement = Boolean(token?.realPlacementEnabled);
+        const placementTitle = useRealPlacement ? 'Apuesta REAL Booky' : 'Apuesta SIMULADA (Paper)';
+        const placementQuestion = useRealPlacement
+            ? '¿Confirmar envío REAL a Booky?'
+            : '¿Confirmar apuesta SIMULADA al historial local?';
         const tokenLine = tokenCheckAvailable
-            ? `Token restante: ${tokenMins.toFixed(1)} min\n\n`
-            : 'Token: verificación rápida no disponible (se validará al confirmar)\n\n';
+            ? (useRealPlacement
+                ? `Token restante: ${tokenMins.toFixed(1)} min\n\n`
+                : 'Modo simulado: no se enviará placeWidget al provider.\n\n')
+            : (useRealPlacement
+                ? 'Token: verificación rápida no disponible (se validará al confirmar)\n\n'
+                : 'Modo simulado: verificación de token no requerida para placement real.\n\n');
 
         const refreshLines = [
             'Recalculo previo a confirmación:',
@@ -1632,12 +1660,12 @@ function App() {
         const refreshBlock = `${refreshLines.join('\n')}\n\n`;
 
         const ok = window.confirm(
-            `Apuesta REAL Booky\n\n` +
+            `${placementTitle}\n\n` +
             `Partido: ${ticket?.opportunity?.match || '-'}\n` +
             `Selección: ${ticket?.opportunity?.selection || '-'}\n` +
             refreshBlock +
             tokenLine +
-            `¿Confirmar envío REAL a Booky?`
+            `${placementQuestion}`
         );
 
         if (!ok) {
@@ -1650,6 +1678,9 @@ function App() {
 
         const isLiveSnipe = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase() === 'LIVE_SNIPE';
         const confirmMode = isLiveSnipe ? 'confirm-fast' : 'confirm';
+        const confirmEndpoint = useRealPlacement
+            ? `/api/booky/real/${confirmMode}/${ticket.id}`
+            : `/api/booky/confirm/${ticket.id}`;
 
         if (pendingBetDetailsRef.current[id]) {
             pendingBetDetailsRef.current[id] = {
@@ -1660,8 +1691,31 @@ function App() {
             forceUpdate();
         }
 
-        const confirmRes = await axios.post(`/api/booky/real/${confirmMode}/${ticket.id}`, undefined, { timeout: 30000 });
+        const confirmRes = await axios.post(confirmEndpoint, undefined, { timeout: 30000 });
         if (confirmRes.data?.success) {
+            if (!useRealPlacement) {
+                pendingBetDetailsRef.current[id] = {
+                    ...(pendingBetDetailsRef.current[id] || opportunity),
+                    odd,
+                    price: odd,
+                    stake,
+                    kellyStake: stake,
+                    potentialReturn: stake * odd,
+                    confirmedAt: new Date().toISOString(),
+                    optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
+                    optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (isLiveSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
+                    optimisticIsSnipe: pendingBetDetailsRef.current[id]?.optimisticIsSnipe ?? isLiveSnipe,
+                    optimisticInFlight: false,
+                    optimisticFlow: 'confirmed',
+                    optimisticConfirmedAt: new Date().toISOString(),
+                    optimisticMissingRemoteChecks: 0
+                };
+                forceUpdate();
+                alert('✅ Apuesta simulada confirmada y registrada en portfolio local.');
+                await fetchData();
+                return;
+            }
+
             const providerBetId =
                 confirmRes?.data?.ticket?.realPlacement?.accepted?.providerBetId ||
                 confirmRes?.data?.providerResponse?.bets?.[0]?.id ||
@@ -1771,7 +1825,7 @@ function App() {
                 return;
             }
             const msg = confirmRes.data?.message || 'Error desconocido';
-            alert(`⚠️ Confirmación real falló: ${msg}`);
+            alert(`⚠️ ${useRealPlacement ? 'Confirmación real' : 'Confirmación simulada'} falló: ${msg}`);
             localPlacedBetIdsRef.current.delete(id);
             delete pendingBetDetailsRef.current[id];
             forceUpdate();
@@ -1805,7 +1859,10 @@ function App() {
                             if (recovered?.id) {
                                 const recoveredType = String(recovered?.opportunity?.type || opportunity?.type || '').toUpperCase();
                                 const recoveredMode = recoveredType === 'LIVE_SNIPE' ? 'confirm-fast' : 'confirm';
-                                const retryRes = await axios.post(`/api/booky/real/${recoveredMode}/${recovered.id}`, undefined, { timeout: 30000 });
+                                const retryEndpoint = useRealPlacement
+                                    ? `/api/booky/real/${recoveredMode}/${recovered.id}`
+                                    : `/api/booky/confirm/${recovered.id}`;
+                                const retryRes = await axios.post(retryEndpoint, undefined, { timeout: 30000 });
                                 if (retryRes?.data?.success) {
                                     recoveredAndConfirmed = true;
                                     alert('✅ Ticket recuperado y confirmado tras desincronización temporal.');
@@ -1822,7 +1879,7 @@ function App() {
                         alert('⏳ La preparación del ticket tardó más de lo esperado (timeout).\nLa cuota puede seguir vigente: intenta nuevamente en 2-3 segundos.');
                         await fetchData({ forceBookyRefresh: true });
                     } else {
-                    alert(`❌ Error de apuesta real: ${msg}${diagText}`);
+                    alert(`❌ Error de ${useRealPlacement ? 'apuesta real' : 'apuesta simulada'}: ${msg}${diagText}`);
                     }
                     // Si falló de forma definitiva, lo quitamos de la lista local
                     localPlacedBetIdsRef.current.delete(id);
@@ -1925,63 +1982,38 @@ function App() {
   };
 
   const getFinishedDataForSelectedDate = () => {
-        const settledBookyHistory = (Array.isArray(bookyAccount?.history) ? bookyAccount.history : [])
-            .filter(h => BOOKY_SETTLED_STATUSES.has(Number(h?.status)));
+        const historyData = (Array.isArray(portfolio?.history) ? portfolio.history : [])
+            .filter((h) => {
+                if (!h || typeof h !== 'object') return false;
+                if (h?.isBookyHistory || h?.source === 'remote') return false;
+                // Si trae estructura de selección remota, tratarlo como no-simulado.
+                if (Array.isArray(h?.selections) && h.selections.length > 0) return false;
 
-        const portfolioHistoryRows = Array.isArray(portfolio?.history) ? portfolio.history : [];
-        const historyByTicketId = new Map();
-        const historyBySelectionKey = new Map();
-
-        for (const row of portfolioHistoryRows) {
-            const ticketId = resolveOpTicketId(row);
-            if (ticketId) historyByTicketId.set(String(ticketId), row);
-
-            const selectionKey = getOpportunityId(row);
-            if (selectionKey) historyBySelectionKey.set(selectionKey, row);
-        }
-
-        const bookyHistoryData = settledBookyHistory.map((h, idx) => ({
-            ...(() => {
-                const ticketId = resolveOpTicketId(h);
-                const selectionKey = getOpportunityId(h);
-                const linkedByTicket = ticketId ? historyByTicketId.get(String(ticketId)) : null;
-                const linkedBySelection = selectionKey ? historyBySelectionKey.get(selectionKey) : null;
-                const linked = linkedByTicket || linkedBySelection || null;
-
-                const evCandidate = Number(
-                    h?.ev ??
-                    linked?.ev ??
-                    linked?.realPlacement?.ev ??
-                    linked?.opportunity?.ev
-                );
-
-                return {
-                    ...h,
-                    id: h.ticketId || `booky_${idx}`,
-                    date: h.placedAt || new Date().toISOString(),
-                    isFinished: true,
-                    isBookyHistory: true,
-                    type: String(h.type || h.strategy || h.opportunityType || 'BOOKY_REAL').toUpperCase(),
-                    finalScore: resolveBookyFinalScore(h),
-                    liveTime: resolveBookyGameTime(h),
-                    ev: Number.isFinite(evCandidate) ? evCandidate : null
-                };
-            })()
-        }));
-
-        if (bookyHistoryData.length > 0) {
-            return bookyHistoryData
-                .sort((a,b) => new Date(b.date) - new Date(a.date))
-                .filter(op => isSameDay(new Date(op.date), dateFilter));
-        }
-
-        const historyData = portfolio.history.map(h => ({
+                const statusTxt = String(h?.status || '').toUpperCase();
+                const isSimSettled = statusTxt === 'WON' || statusTxt === 'LOST' || statusTxt === 'VOID';
+                const hasSimProfit = Number.isFinite(Number(h?.profit));
+                return isSimSettled || hasSimProfit;
+            })
+            .map(h => ({
             ...h,
             date: h.matchDate || h.createdAt || h.date || h.closedAt,
-            isFinished: true
+            isFinished: true,
+            isSimulatedHistory: true
         }));
 
-        const pendingFinishData = (portfolio.activeBets || []).filter(b => {
+           const pendingFinishData = (portfolio.activeBets || []).filter(b => {
+               if (!b || typeof b !== 'object') return false;
+               if (b?.isBookyHistory || b?.source === 'remote') return false;
+               if (Array.isArray(b?.selections) && b.selections.length > 0) return false;
+
+               const hasProviderMarkers = Boolean(
+                  b?.providerBetId ||
+                  b?.providerSelectionId ||
+                  b?.providerMarketId ||
+                  b?.providerAcceptedAt
+               );
+               if (hasProviderMarkers) return false;
+
              if (b.liveTime === 'Final' || b.liveTime === 'FT') return true;
 
              const betTime = new Date(b.createdAt).getTime();
@@ -2374,14 +2406,14 @@ function App() {
                         <div>
                             <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-0.5">Capital</p>
                             <p className="text-lg font-mono font-bold text-white flex items-center leading-none">
-                                <span className="text-sm text-slate-500 mr-1">{realBalanceCurrency}</span>
-                                {Number.isFinite(realBalanceAmount) ? realBalanceAmount.toFixed(2) : '--'}
+                                <span className="text-sm text-slate-500 mr-1">{headerCapitalCurrency}</span>
+                                {Number.isFinite(headerCapitalAmount) ? headerCapitalAmount.toFixed(2) : '--'}
                             </p>
                         </div>
                         <div className="text-right">
-                            <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-0.5">PnL ({activeBookyLabel})</p>
-                            <p className={`text-base font-mono font-bold flex items-center justify-end leading-none ${realBookyPnLClass}`}>
-                                {realBookyPnL >= 0 ? '+' : ''}{realBookyPnL.toFixed(2)}
+                            <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-0.5">{headerPnlLabel}</p>
+                            <p className={`text-base font-mono font-bold flex items-center justify-end leading-none ${headerPnlClass}`}>
+                                {headerPnlAmount >= 0 ? '+' : ''}{headerPnlAmount.toFixed(2)}
                             </p>
                         </div>
                     </div>
@@ -2700,6 +2732,9 @@ function App() {
                                         !isExplicitlyFinished &&
                                         (isReallyLiveType || hasTrustedVisualLiveClock || isInPlayNow);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
+                                    const showTicketId = Boolean(
+                                        ticketIdForRow && !(activeTab === 'FINISHED' && !op.isBookyHistory)
+                                    );
                                     const eventStartIsoFromHistory = ticketIdForRow
                                         ? (bookyEventStartIsoByProvider.get(String(ticketIdForRow)) || null)
                                         : null;
@@ -2913,7 +2948,7 @@ function App() {
                                                     <span>{op.league || betData?.league || '-'}</span>
                                                     <span className="text-slate-600">|</span>
                                                     <span>{(entryMeta && entryMeta.total > 1) ? formatTimeWithSecondsSafe(betTimeIso || op.date) : formatTimeSafe(betTimeIso || op.date)}</span>
-                                                    {ticketIdForRow && (
+                                                    {showTicketId && (
                                                         <>
                                                             <span className="text-slate-600">|</span>
                                                             <span>Ticket {ticketIdForRow}</span>
@@ -3200,7 +3235,7 @@ function App() {
                                                             ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                                                             : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
                                                     }`}>
-                                                        {op.isBookyHistory ? 'BOOKY' : 'API'}
+                                                        {op.isBookyHistory ? 'BOOKY' : 'SIM'}
                                                     </span>
                                                     {op.isBookyHistory ? (
                                                         (() => {
