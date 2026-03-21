@@ -451,6 +451,127 @@ class PinnacleGateway {
         }, 4000);
     }
 
+    async findFirstVisibleElement(frame, selectors = []) {
+        for (const sel of selectors) {
+            let handles = [];
+            try {
+                handles = await frame.$$(sel);
+            } catch (_) {
+                continue;
+            }
+
+            for (const handle of handles) {
+                try {
+                    const visible = await frame.evaluate((el) => {
+                        if (!el || !el.isConnected) return false;
+                        const style = window.getComputedStyle(el);
+                        if (!style) return false;
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        const rect = el.getBoundingClientRect();
+                        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+                        const hiddenByAria = el.getAttribute('aria-hidden') === 'true';
+                        return !hiddenByAria;
+                    }, handle);
+
+                    if (visible) {
+                        return handle;
+                    }
+                } catch (_) {
+                    // seguir buscando
+                }
+            }
+        }
+
+        return null;
+    }
+
+    async fillInputRobust(frame, inputHandle, value) {
+        if (!inputHandle) return false;
+
+        try {
+            await inputHandle.click({ clickCount: 3 });
+            await frame.keyboard.press('Backspace');
+            await inputHandle.type(String(value || ''), { delay: 18 });
+
+            const ok = await frame.evaluate((el, expected) => {
+                return String(el?.value || '') === String(expected || '');
+            }, inputHandle, value);
+
+            if (ok) return true;
+        } catch (_) {
+            // fallback js setter
+        }
+
+        try {
+            await frame.evaluate((el, nextValue) => {
+                if (!el) return;
+                el.focus();
+
+                const prototype = Object.getPrototypeOf(el);
+                const valueSetter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+                if (valueSetter) {
+                    valueSetter.call(el, String(nextValue || ''));
+                } else {
+                    el.value = String(nextValue || '');
+                }
+
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }, inputHandle, value);
+
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    async submitVisibleLoginForm(frame, passEl, submitSelectors) {
+        const submitEl = await this.findFirstVisibleElement(frame, submitSelectors);
+
+        if (submitEl) {
+            const clicked = await frame.evaluate((el) => {
+                const txt = String(el?.innerText || el?.textContent || '').trim().toLowerCase();
+                if (txt.includes('mostrar')) return false;
+                el.click();
+                return true;
+            }, submitEl);
+
+            if (clicked) return true;
+        }
+
+        const submittedByForm = await passEl.evaluate((el) => {
+            const form = el?.form || el?.closest?.('form');
+            if (!form) return false;
+
+            const btnCandidates = Array.from(form.querySelectorAll('button, [role="button"]'));
+            const submitBtn = btnCandidates.find((btn) => {
+                const txt = String(btn?.innerText || btn?.textContent || '').trim().toLowerCase();
+                if (!txt || txt.includes('mostrar')) return false;
+                if (txt.includes('iniciar sesi') || txt.includes('login') || txt.includes('sign in')) return true;
+                return btn?.type === 'submit';
+            });
+
+            if (submitBtn) {
+                submitBtn.click();
+                return true;
+            }
+
+            if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+                return true;
+            }
+
+            form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            return true;
+        });
+
+        if (!submittedByForm) {
+            await passEl.press('Enter');
+        }
+
+        return true;
+    }
+
     async tryAutoLoginOnce() {
         if (this.autoLoginInFlight) return false;
 
@@ -472,6 +593,8 @@ class PinnacleGateway {
             'button[data-test-id="Button"]'
         ];
         const userSelectors = [
+            '#modal [data-test-id="Forms-Element-text"] input[name="username"]',
+            '#modal input[name="username"]',
             '[data-test-id="Forms-Element-username"] input',
             'input#username',
             'input[name="username"]',
@@ -480,12 +603,16 @@ class PinnacleGateway {
             'input[type="text"]'
         ];
         const passSelectors = [
+            '#modal [data-test-id="Forms-Element-password"] input[name="password"]',
+            '#modal input[name="password"]',
             '[data-test-id="Forms-Element-password"] input',
             'input#password',
             'input[name="password"]',
             'input[type="password"]'
         ];
         const submitSelectors = [
+            '#modal button[type="submit"]',
+            '#modal [data-test-id="Loginform-SubmitButton"] button',
             '[data-test-id="header-login-loginButton"] button',
             'div[data-test-id="header-login-loginButton"] button',
             'button[type="submit"]',
@@ -512,22 +639,19 @@ class PinnacleGateway {
         if (!hasVisibleLoginForm) {
             for (const frame of frames) {
                 try {
-                    for (const sel of loginTriggerSelectors) {
-                        const triggerEl = await frame.$(sel);
-                        if (!triggerEl) continue;
-
-                        // Evitar clicks ciegos: si es un boton generico, exigir texto relacionado a login.
+                    const triggerEl = await this.findFirstVisibleElement(frame, loginTriggerSelectors);
+                    if (triggerEl) {
                         const shouldClick = await frame.evaluate((el) => {
                             const txt = String(el?.innerText || el?.textContent || '').trim().toLowerCase();
                             if (!txt) return false;
                             return txt.includes('iniciar sesi') || txt.includes('login') || txt.includes('sign in');
                         }, triggerEl);
-                        if (!shouldClick) continue;
-
-                        await triggerEl.click();
-                        await new Promise((r) => setTimeout(r, 250));
-                        break;
+                        if (shouldClick) {
+                            await triggerEl.click();
+                            await new Promise((r) => setTimeout(r, 350));
+                        }
                     }
+
                 } catch (_) {
                     // Intentar siguiente frame
                 }
@@ -536,89 +660,28 @@ class PinnacleGateway {
 
         for (const frame of frames) {
             try {
-                let userEl = null;
-                for (const sel of userSelectors) {
-                    userEl = await frame.$(sel);
-                    if (userEl) break;
-                }
-
-                let passEl = null;
-                for (const sel of passSelectors) {
-                    passEl = await frame.$(sel);
-                    if (passEl) break;
-                }
+                const userEl = await this.findFirstVisibleElement(frame, userSelectors);
+                const passEl = await this.findFirstVisibleElement(frame, passSelectors);
 
                 if (!userEl || !passEl) continue;
 
-                // Evita concatenaciones por re-render/controlado: reemplaza valor de forma atómica.
-                await frame.evaluate((el, value) => {
-                    if (!el) return;
-                    el.focus();
-                    el.value = '';
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.value = value;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                }, userEl, this.autoLoginUsername);
+                const userFilled = await this.fillInputRobust(frame, userEl, this.autoLoginUsername);
+                const passFilled = await this.fillInputRobust(frame, passEl, this.autoLoginPassword);
+                if (!userFilled || !passFilled) continue;
 
-                await frame.evaluate((el, value) => {
-                    if (!el) return;
-                    el.focus();
-                    el.value = '';
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.value = value;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                }, passEl, this.autoLoginPassword);
+                await this.submitVisibleLoginForm(frame, passEl, submitSelectors);
 
-                let submitEl = null;
-                for (const sel of submitSelectors) {
-                    submitEl = await frame.$(sel);
-                    if (submitEl) break;
-                }
-
-                if (submitEl) {
-                    const clicked = await frame.evaluate((el) => {
-                        const txt = String(el?.innerText || el?.textContent || '').trim().toLowerCase();
-                        // Evitar click en botones auxiliares como MOSTRAR.
-                        if (txt.includes('mostrar')) return false;
-                        el.click();
-                        return true;
-                    }, submitEl);
-
-                    if (!clicked) {
-                        await passEl.press('Enter');
-                    }
-                } else {
-                    const submittedByForm = await passEl.evaluate((el) => {
-                        const form = el?.form || el?.closest?.('form');
-                        if (!form) return false;
-
-                        const btnCandidates = Array.from(form.querySelectorAll('button, [role="button"]'));
-                        const submitBtn = btnCandidates.find((btn) => {
-                            const txt = String(btn?.innerText || btn?.textContent || '').trim().toLowerCase();
-                            if (!txt || txt.includes('mostrar')) return false;
-                            if (txt.includes('iniciar sesi') || txt.includes('login') || txt.includes('sign in')) return true;
-                            return btn?.type === 'submit';
-                        });
-
-                        if (submitBtn) {
-                            submitBtn.click();
-                            return true;
-                        }
-
-                        if (typeof form.requestSubmit === 'function') {
-                            form.requestSubmit();
-                            return true;
-                        }
-
-                        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-                        return true;
-                    });
-
-                    if (!submittedByForm) {
-                        await passEl.press('Enter');
-                    }
+                // Algunos flujos abren modal después del submit inicial; intentar 2do submit si aparece.
+                await new Promise((r) => setTimeout(r, 500));
+                const modalPassEl = await this.findFirstVisibleElement(frame, [
+                    '#modal [data-test-id="Forms-Element-password"] input[name="password"]',
+                    '#modal input[name="password"]'
+                ]);
+                if (modalPassEl) {
+                    await this.submitVisibleLoginForm(frame, modalPassEl, [
+                        '#modal button[type="submit"]',
+                        '#modal [data-test-id="Loginform-SubmitButton"] button'
+                    ]);
                 }
 
                 this.lastAutoLoginSubmitAtMs = Date.now();

@@ -7,6 +7,24 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.16] -- 2026-03-21 -- Sprint: Pinnacle Intermittent Modal Login Recovery
+
+> Rama: `master`
+
+### 🔄 Changed
+
+#### Gateway Pinnacle: auto-login robusto para flujo header + modal
+- **`services/pinnacleGateway.js`**:
+  - El autologin ahora prioriza campos visibles y selectores del modal (`#modal`) cuando aparece el formulario emergente.
+  - Se incorpora llenado robusto de inputs (typed + fallback setter) para evitar concatenacion de credenciales en reintentos.
+  - Se centraliza el submit del formulario con fallback por boton, `requestSubmit` y `Enter`.
+
+### 🐛 Fixed
+
+#### Login intermitente en Pinnacle que exigia Enter doble por modal tardio
+- Se corrige escenario donde el primer submit abre modal y dejaba sesion sin completar.
+- Se agrega segundo submit automatico de respaldo cuando se detecta modal post-submit.
+
 ## [v3.4.15] -- 2026-03-21 -- Sprint: Sim/Real Flow Separation + Remote Settlement Reconciliation + Pinnacle Auto-Login Hardening
 
 > Rama: `master`
