@@ -64,6 +64,11 @@ class PinnacleGateway {
         this.autoLoginPassword = String(process.env.PINNACLE_LOGIN_PASSWORD || '').trim();
         this.autoLoginAttempts = 0;
         this.autoLoginTimer = null;
+        this.autoLoginInFlight = false;
+        this.lastAutoLoginSubmitAtMs = 0;
+        this.autoLoginSubmitCooldownMs = Math.max(5000, Number(process.env.PINNACLE_AUTO_LOGIN_SUBMIT_COOLDOWN_MS || 12000));
+        this.sessionWatchdogTimer = null;
+        this.lastHeaderSessionState = 'unknown';
         this.startedAtMs = Date.now();
         this.autoCloseTriggered = false;
         this.socketDetected = false;
@@ -144,6 +149,11 @@ class PinnacleGateway {
         if (this.autoLoginTimer) {
             clearInterval(this.autoLoginTimer);
             this.autoLoginTimer = null;
+        }
+
+        if (this.sessionWatchdogTimer) {
+            clearInterval(this.sessionWatchdogTimer);
+            this.sessionWatchdogTimer = null;
         }
 
         try {
@@ -254,6 +264,7 @@ class PinnacleGateway {
             });
 
             this.scheduleAutoLogin();
+            this.startSessionWatchdog();
             
             console.log("✅ Navigation Complete. Waiting for socket traffic...");
             if (this.autoCloseEnabled) {
@@ -284,6 +295,7 @@ class PinnacleGateway {
                             .then(() => {
                                 console.log("✅ Página Recargada.");
                                 this.scheduleAutoLogin();
+                                this.startSessionWatchdog();
                             })
                             .catch(err => console.error("❌ Error recargando:", err));
                     }
@@ -342,7 +354,113 @@ class PinnacleGateway {
         }, 7000);
     }
 
+    async getHeaderSessionSnapshot() {
+        const page = this.page;
+        if (!page) {
+            return {
+                loggedIn: false,
+                loginVisible: false,
+                hasAccountMenu: false,
+                hasBankroll: false,
+                hasDeposit: false,
+                hasLoginButton: false,
+                hasUserInput: false,
+                hasPassInput: false
+            };
+        }
+
+        try {
+            return await page.evaluate(() => {
+                const hasAccountMenu = Boolean(document.querySelector('[data-test-id="Account-Menu"]'));
+                const hasBankroll = Boolean(document.querySelector('[data-test-id="QuickCashier-BankRoll"]'));
+                const hasDeposit = Boolean(document.querySelector('a[href*="/account/deposit"], .deposit-oF4Fv8zY5I'));
+                const hasLoginButton = Boolean(document.querySelector('[data-test-id="header-login-loginButton"] button'));
+                const hasUserInput = Boolean(document.querySelector('input#username, [data-test-id="Forms-Element-username"] input'));
+                const hasPassInput = Boolean(document.querySelector('input#password, [data-test-id="Forms-Element-password"] input'));
+
+                const loggedIn = hasAccountMenu || (hasBankroll && hasDeposit);
+                const loginVisible = hasLoginButton || (hasUserInput && hasPassInput);
+
+                return {
+                    loggedIn,
+                    loginVisible,
+                    hasAccountMenu,
+                    hasBankroll,
+                    hasDeposit,
+                    hasLoginButton,
+                    hasUserInput,
+                    hasPassInput
+                };
+            });
+        } catch (_) {
+            return {
+                loggedIn: false,
+                loginVisible: false,
+                hasAccountMenu: false,
+                hasBankroll: false,
+                hasDeposit: false,
+                hasLoginButton: false,
+                hasUserInput: false,
+                hasPassInput: false
+            };
+        }
+    }
+
+    startSessionWatchdog() {
+        if (!this.autoLoginEnabled) return;
+        if (!this.page) return;
+
+        if (this.sessionWatchdogTimer) {
+            clearInterval(this.sessionWatchdogTimer);
+            this.sessionWatchdogTimer = null;
+        }
+
+        this.sessionWatchdogTimer = setInterval(async () => {
+            const snapshot = await this.getHeaderSessionSnapshot();
+
+            if (snapshot.loggedIn) {
+                if (this.lastHeaderSessionState !== 'logged_in') {
+                    console.log('✅ [Pinnacle] Header confirma sesión activa.');
+                }
+                this.lastHeaderSessionState = 'logged_in';
+                this.sessionDetected = true;
+                return;
+            }
+
+            if (!snapshot.loginVisible) {
+                this.lastHeaderSessionState = 'unknown';
+                return;
+            }
+
+            if (this.lastHeaderSessionState === 'logged_in' || this.sessionDetected) {
+                console.warn('⚠️ [Pinnacle] Sesión cayó a estado logout después de cargar. Reintentando autologin...');
+            }
+
+            this.lastHeaderSessionState = 'logged_out';
+            this.sessionDetected = false;
+
+            // Reinicia ventana de intentos para cubrir logout tardío sin intervención manual.
+            this.autoLoginAttempts = 0;
+            this.scheduleAutoLogin();
+
+            // Ejecutar un intento inmediato acelera recuperación cuando el form ya está visible.
+            const attempted = await this.tryAutoLoginOnce();
+            if (attempted) {
+                console.log('🔐 [Pinnacle] Auto-login de recuperación disparado por watchdog de sesión.');
+            }
+        }, 4000);
+    }
+
     async tryAutoLoginOnce() {
+        if (this.autoLoginInFlight) return false;
+
+        const now = Date.now();
+        if ((now - this.lastAutoLoginSubmitAtMs) < this.autoLoginSubmitCooldownMs) {
+            return false;
+        }
+
+        this.autoLoginInFlight = true;
+        try {
         const page = this.page;
         if (!page) return false;
 
@@ -379,24 +497,16 @@ class PinnacleGateway {
         ];
 
         // Paso 0: detectar estado de sesion en header Pinnacle.
-        const alreadyLoggedIn = await page.evaluate(() => {
-            const hasAccountMenu = Boolean(document.querySelector('[data-test-id="Account-Menu"]'));
-            const hasBankroll = Boolean(document.querySelector('[data-test-id="QuickCashier-BankRoll"]'));
-            const hasDeposit = Boolean(document.querySelector('a[href*="/account/deposit"], .deposit-oF4Fv8zY5I'));
-            return hasAccountMenu || (hasBankroll && hasDeposit);
-        }).catch(() => false);
+        const snapshot = await this.getHeaderSessionSnapshot();
+        const alreadyLoggedIn = snapshot.loggedIn;
 
         if (alreadyLoggedIn) {
             this.sessionDetected = true;
+            this.lastHeaderSessionState = 'logged_in';
             return true;
         }
 
-        const hasVisibleLoginForm = await page.evaluate(() => {
-            const hasHeaderLoginBtn = Boolean(document.querySelector('[data-test-id="header-login-loginButton"] button'));
-            const hasUser = Boolean(document.querySelector('input#username, [data-test-id="Forms-Element-username"] input'));
-            const hasPass = Boolean(document.querySelector('input#password, [data-test-id="Forms-Element-password"] input'));
-            return hasHeaderLoginBtn && hasUser && hasPass;
-        }).catch(() => false);
+        const hasVisibleLoginForm = snapshot.hasLoginButton && snapshot.hasUserInput && snapshot.hasPassInput;
 
         // Paso 0: abrir modal/login panel cuando el boton superior es type="button".
         if (!hasVisibleLoginForm) {
@@ -440,10 +550,26 @@ class PinnacleGateway {
 
                 if (!userEl || !passEl) continue;
 
-                await userEl.click({ clickCount: 3 });
-                await userEl.type(this.autoLoginUsername, { delay: 25 });
-                await passEl.click({ clickCount: 3 });
-                await passEl.type(this.autoLoginPassword, { delay: 25 });
+                // Evita concatenaciones por re-render/controlado: reemplaza valor de forma atómica.
+                await frame.evaluate((el, value) => {
+                    if (!el) return;
+                    el.focus();
+                    el.value = '';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.value = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }, userEl, this.autoLoginUsername);
+
+                await frame.evaluate((el, value) => {
+                    if (!el) return;
+                    el.focus();
+                    el.value = '';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.value = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }, passEl, this.autoLoginPassword);
 
                 let submitEl = null;
                 for (const sel of submitSelectors) {
@@ -495,6 +621,8 @@ class PinnacleGateway {
                     }
                 }
 
+                this.lastAutoLoginSubmitAtMs = Date.now();
+
                 return true;
             } catch (_) {
                 // Intentar siguiente frame/selectores
@@ -502,6 +630,9 @@ class PinnacleGateway {
         }
 
         return false;
+        } finally {
+            this.autoLoginInFlight = false;
+        }
     }
 
     handleFrame({ requestId, response }) {

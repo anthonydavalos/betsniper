@@ -7,6 +7,75 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.15] -- 2026-03-21 -- Sprint: Sim/Real Flow Separation + Remote Settlement Reconciliation + Pinnacle Auto-Login Hardening
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Reconciliacion remota de settlements hacia portfolio local
+- **`src/services/bookyAccountService.js`**:
+  - Se agrega reconciliacion por `providerBetId` para trasladar resultados confirmados por provider al portfolio local.
+  - Nuevo parche de cierre remoto sobre historial local (`status`, `profit`, `return`, `closedAt`, `providerStatus`) para evitar tickets colgados como activos cuando ya figuran liquidados en Booky/ACity.
+  - La reconciliacion se integra en el flujo de `getBookyHistory()` para ejecutarse junto al sync de cuenta/historial.
+
+#### Señal explicita de modo real en token health
+- **`src/services/bookySemiAutoService.js`**:
+  - `getBookyTokenHealth()` ahora expone `realPlacementEnabled` para que frontend distinga, sin ambiguedad, entre confirmacion real y simulada.
+
+### 🔄 Changed
+
+#### Frontend: confirmacion manual separa flujo REAL vs SIMULADO
+- **`client/src/App.jsx`**:
+  - La confirmacion manual ya no fuerza endpoint real cuando `BOOKY_REAL_PLACEMENT_ENABLED=false`.
+  - Se introduce routing condicional de confirmacion:
+    - Real: `/api/booky/real/confirm` o `/api/booky/real/confirm-fast`.
+    - Simulado: `/api/booky/confirm/:id`.
+  - Mensajes de modal/alertas se ajustan al modo activo (REAL/SIM) para evitar confusion operativa.
+  - Se mejora recuperacion/reintento de ticket preparado para respetar tambien el endpoint segun modo activo.
+
+#### Frontend: cabecera de capital/PnL coherente con modo Kelly manual
+- **`client/src/App.jsx`**:
+  - Cuando `KELLY_BASE_MODE` esta en `PORTFOLIO` o `CONFIG`, el header usa base manual para `Capital` y `PnL (SIM NAV)`.
+  - Se evita mezclar visualmente PnL real remoto con capital manual de simulacion.
+
+#### Frontend: Finalizados prioriza historial simulado limpio
+- **`client/src/App.jsx`**:
+  - El armado de finalizados excluye filas remotas (`source=remote`, `isBookyHistory`, tickets con `selections[]`) para no contaminar la vista de simulado.
+  - Se endurece el filtro en activos/finalizados para evitar doble conteo entre snapshots remotos y portfolio local.
+
+#### Gateway Pinnacle: watchdog de sesion + anti-loop de autologin
+- **`services/pinnacleGateway.js`**:
+  - Se agrega deteccion de transicion tardia a estado logged-out via header y trigger controlado de relogin automatico.
+  - Se refuerza anti-loop con lock `autoLoginInFlight` y seteo atomico de credenciales para evitar concatenacion repetida en inputs.
+  - Se respeta cooldown configurable de submit para estabilizar retries (`PINNACLE_AUTO_LOGIN_SUBMIT_COOLDOWN_MS`).
+
+#### Paper trading Totals: resolucion de linea mas robusta
+- **`src/services/paperTradingService.js`**:
+  - Se fortalece parseo de linea para Over/Under desde `pick`, `market` y `selection`.
+  - Liquidaciones tempranas/finales usan resolucion de linea consistente para reducir falsos `PUSH/LOSS` por mismatch de linea.
+  - Se evita degradar picks sin numero a claves artificiales (`over_0`/`under_0`).
+
+#### Cobertura de aliases dinamicos ampliada
+- **`src/utils/dynamicAliases.json`**:
+  - Se incorporan aliases adicionales para corregir no-matchs reportados en operacion y mejorar vinculo Pinnacle vs Altenar en ligas/equipos con nomenclatura divergente.
+
+### 🐛 Fixed
+
+#### Confirmacion manual en modo simulado intentaba placement real
+- Se corrige bug donde la UI seguia llamando `/api/booky/real/*` aun con real placement deshabilitado.
+
+#### Historial local desalineado con settlement remoto
+- Se corrigen casos donde Booky/ACity mostraba ticket liquidado pero `portfolio.history` permanecia abierto o con PnL desactualizado.
+
+#### Auto-login Pinnacle inestable tras logout tardio
+- Se corrige escenario de perdida de sesion detectada tarde que dejaba gateway sin relogin efectivo.
+
+#### Auto-login con escritura repetida de usuario
+- Se corrige comportamiento de concatenacion de username durante reintentos rapidos de login.
+
+---
+
 ## [v3.4.14] -- 2026-03-18 -- Sprint: Booky UI Fallbacks (Start Time + League) for Active/Finished Bets
 
 > Rama: `master`
