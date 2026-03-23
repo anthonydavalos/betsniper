@@ -49,6 +49,15 @@
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-03-22 (v3.4.17)
+
+- Finalizados REAL ahora soporta historial completo sin truncamiento por ventana corta (`historyLimit=0`) y con hidratación forzada inicial en pestaña FINISHED.
+- Se corrigió cierre stale en polling de frontend para que el intervalo respete tab/modo actual al decidir límites de historial.
+- Se endureció sincronización remota con detección de caché parcial (`limitBound`) y bypass automático cuando se requiere `fetchAll`.
+- Auto-snipe agrega confirmación SIM explícita y reintento único ante re-quote.
+- Drift de odds en confirmación Booky pasa a ser configurable por entorno (`BOOKY_LIVE_MAX_ODD_DRIFT`, `BOOKY_PREMATCH_MAX_ODD_DRIFT`).
+- Detalle completo en [CHANGELOG.md](CHANGELOG.md), entrada `v3.4.17`.
+
 ### 1) Arcadia Gateway: auto-refresh estable y sin bucles
 
 - `server.js` ahora puede levantar `services/pinnacleGateway.js` automáticamente (`PINNACLE_GATEWAY_AUTOSTART=true`).

@@ -638,6 +638,9 @@ function App() {
     const lastPrematchFetchAtRef = useRef(0);
     const latestPortfolioActiveBetsRef = useRef([]);
     const latestBookyHistoryRef = useRef([]);
+    const activeTabRef = useRef(activeTab);
+    const tokenHealthRef = useRef(tokenHealth);
+    const realFinishedHydratedRef = useRef(false);
     const blockedBetIdsRef = useRef(new Set());
     const remoteOpenBetIdsRef = useRef(new Set());
     const remoteOpenEventIdsRef = useRef(new Set());
@@ -647,6 +650,7 @@ function App() {
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
     const BOOKY_HISTORY_LIMIT = 120;
+    const BOOKY_HISTORY_LIMIT_FINISHED_REAL = 0;
     const TOKEN_CLOCK_TICK_MS = 1000;
     const TOKEN_AUTO_RENEW_COOLDOWN_MS = 45000;
     const TOKEN_AUTO_RENEW_RETRY_ON_FAILURE_MS = 8000;
@@ -661,6 +665,10 @@ function App() {
   // Trigger re-render when we update refs (hacky but works for instant feedback)
   const [, setTick] = useState(0);
   const forceUpdate = () => setTick(t => t + 1);
+
+        // Mantener refs vivas para evitar cierres stale dentro de setInterval(fetchData).
+        activeTabRef.current = activeTab;
+        tokenHealthRef.current = tokenHealth;
 
     const hasPrematchContext = (info = null) => {
         const ctx = info?.prematchContext;
@@ -851,12 +859,19 @@ function App() {
         setLoading(true);
 
         try {
+            const currentActiveTab = String(activeTabRef.current || 'ALL');
+            const currentIsSimulatedDisplayMode = !(tokenHealthRef.current?.realPlacementEnabled === true);
             const nowMs = Date.now();
+            const shouldForceRealFinishedHydration = (!currentIsSimulatedDisplayMode && currentActiveTab === 'FINISHED' && !realFinishedHydratedRef.current);
             const shouldFetchBooky = forceBookyRefresh || (nowMs - lastBookyAccountFetchAtRef.current) >= 15000;
             const shouldFetchKellyDiagnostics = forceBookyRefresh || (nowMs - lastKellyDiagnosticsFetchAtRef.current) >= 60000;
-            const bookyAccountUrl = forceBookyRefresh
-                ? `/api/booky/account?refresh=1&historyLimit=${BOOKY_HISTORY_LIMIT}`
-                : `/api/booky/account?historyLimit=${BOOKY_HISTORY_LIMIT}`;
+            const selectedHistoryLimit = (!currentIsSimulatedDisplayMode && currentActiveTab === 'FINISHED')
+                ? BOOKY_HISTORY_LIMIT_FINISHED_REAL
+                : BOOKY_HISTORY_LIMIT;
+            const mustRefreshBookyNow = forceBookyRefresh || shouldForceRealFinishedHydration;
+            const bookyAccountUrl = mustRefreshBookyNow
+                ? `/api/booky/account?refresh=1&historyLimit=${selectedHistoryLimit}`
+                : `/api/booky/account?historyLimit=${selectedHistoryLimit}`;
 
             const settled = await Promise.allSettled([
                 axios.get('/api/opportunities/live'),
@@ -864,7 +879,7 @@ function App() {
             ]);
             const [liveReq, portfolioReq] = settled;
 
-            if (shouldFetchBooky) {
+            if (shouldFetchBooky || shouldForceRealFinishedHydration) {
                 void axios
                     .get(bookyAccountUrl, { timeout: forceBookyRefresh ? 30000 : 12000 })
                     .then((bookyRes) => {
@@ -880,6 +895,10 @@ function App() {
                         blockedBetIdsRef.current = refreshedBlockingSets.blockedBetIds;
                         remoteOpenBetIdsRef.current = refreshedBlockingSets.remoteOpenBetIds;
                         remoteOpenEventIdsRef.current = refreshedBlockingSets.remoteOpenEventIds;
+
+                        if (!currentIsSimulatedDisplayMode && currentActiveTab === 'FINISHED') {
+                            realFinishedHydratedRef.current = true;
+                        }
                     })
                     .catch((error) => {
                         console.warn('⚠️ Booky account fetch falló. Se mantiene snapshot previo.', error?.message || error);
@@ -976,7 +995,9 @@ function App() {
 
                     const optimisticTtlMs = resolveOptimisticTtlMs(optimisticMeta);
                     const isInFlight = Boolean(optimisticMeta?.optimisticInFlight);
-                    const hasFreshRemoteCheck = (Date.now() - Number(lastBookyAccountFetchAtRef.current || 0)) <= 25000;
+                    const optimisticPlacementMode = String(optimisticMeta?.optimisticPlacementMode || 'UNKNOWN').toUpperCase();
+                    const requiresBookyConfirmation = optimisticPlacementMode === 'REAL';
+                    const hasFreshRemoteCheck = !requiresBookyConfirmation || ((Date.now() - Number(lastBookyAccountFetchAtRef.current || 0)) <= 25000);
 
                     const confirmedAtMs = new Date(optimisticMeta?.optimisticConfirmedAt || 0).getTime();
                     const hasConfirmedMark = Number.isFinite(confirmedAtMs) && confirmedAtMs > 0;
@@ -988,6 +1009,27 @@ function App() {
                     }
 
                     if (hasConfirmedMark) {
+                        if (!requiresBookyConfirmation) {
+                            // En SIM no reconciliamos contra Open Bets remoto.
+                            if (shouldExpireByTtl) {
+                                localPlacedBetIdsRef.current.delete(id);
+                                delete pendingBetDetailsRef.current[id];
+
+                                if (!optimisticWarnedIdsRef.current.has(id)) {
+                                    optimisticWarnedIdsRef.current.add(id);
+                                    alert(
+                                        '⚠️ La apuesta simulada no se confirmó en portfolio local dentro de la ventana de gracia.\n\n' +
+                                        'Se retiró de EN JUEGO para evitar stake fantasma local.\n' +
+                                        'Actualiza datos y reintenta si la oportunidad sigue vigente.'
+                                    );
+                                }
+                                return;
+                            }
+
+                            stillPendingLocalIds.push(id);
+                            return;
+                        }
+
                         if (!hasFreshRemoteCheck) {
                             stillPendingLocalIds.push(id);
                             return;
@@ -1031,12 +1073,19 @@ function App() {
 
                         if (!optimisticWarnedIdsRef.current.has(id)) {
                             optimisticWarnedIdsRef.current.add(id);
-                            const reasonText = 'no apareció en Booky dentro de la ventana de gracia extendida.';
-                            alert(
-                                `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
-                                'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
-                                'Verifica Open Bets en Booky antes de reintentar.'
-                            );
+                            if (requiresBookyConfirmation) {
+                                const reasonText = 'no apareció en Booky dentro de la ventana de gracia extendida.';
+                                alert(
+                                    `⚠️ Apuesta no confirmada en Booky (${reasonText})\n\n` +
+                                    'Se retiró de EN JUEGO para evitar stake fantasma.\n' +
+                                    'Verifica Open Bets en Booky antes de reintentar.'
+                                );
+                            } else {
+                                alert(
+                                    '⚠️ La apuesta simulada no se confirmó en portfolio local dentro de la ventana de gracia.\n\n' +
+                                    'Se retiró de EN JUEGO para evitar stake fantasma local.'
+                                );
+                            }
                         }
                         return;
                     }
@@ -1380,23 +1429,34 @@ function App() {
         const kellyRecLive = Number(kellyDiagnostics?.fractions?.recommended?.LIVE_VALUE);
         const kellyDiagTime = kellyDiagnostics?.fetchedAt;
     const isManualKellyMode = kellyBaseMode === 'PORTFOLIO' || kellyBaseMode === 'CONFIG';
+    const tokenRealPlacementEnabled = tokenHealth?.realPlacementEnabled === true;
+    const isSimulatedDisplayMode = !tokenRealPlacementEnabled;
     const portfolioHistoryRows = Array.isArray(portfolio?.history) ? portfolio.history : [];
+    const simulatedHistoryRows = portfolioHistoryRows.filter((row) => {
+        const hasProviderBetId = row?.providerBetId !== null && row?.providerBetId !== undefined && String(row.providerBetId).trim() !== '';
+        const isRemoteHistory = row?.isBookyHistory === true || String(row?.source || '').toLowerCase() === 'remote';
+        return !hasProviderBetId && !isRemoteHistory;
+    });
     const portfolioInitialCapital = Number(portfolio?.initialCapital);
-    const portfolioRealizedPnL = portfolioHistoryRows.reduce((acc, row) => acc + resolveFinishedOpPnl(row), 0);
-    const manualCapitalAmount = Number.isFinite(portfolioInitialCapital)
-        ? Number((portfolioInitialCapital + portfolioRealizedPnL).toFixed(2))
+    const simulatedRealizedPnL = simulatedHistoryRows.reduce((acc, row) => acc + resolveFinishedOpPnl(row), 0);
+    const simulatedCapitalByHistory = Number.isFinite(portfolioInitialCapital)
+        ? Number((portfolioInitialCapital + simulatedRealizedPnL).toFixed(2))
         : NaN;
+    const simulatedCapitalAmount = simulatedCapitalByHistory;
+    const simulatedPnlAmount = Number.isFinite(simulatedRealizedPnL)
+        ? Number(simulatedRealizedPnL.toFixed(2))
+        : 0;
 
-    const headerCapitalAmount = isManualKellyMode
-        ? (Number.isFinite(kellyBaseAmount) ? kellyBaseAmount : manualCapitalAmount)
+    const showSimInHeader = isSimulatedDisplayMode || isManualKellyMode;
+    const headerCapitalAmount = showSimInHeader
+        ? (Number.isFinite(simulatedCapitalAmount)
+            ? simulatedCapitalAmount
+            : (Number.isFinite(kellyBaseAmount) ? kellyBaseAmount : NaN))
         : realBalanceAmount;
-    const headerCapitalCurrency = isManualKellyMode ? kellyBaseCurrency : realBalanceCurrency;
-    const portfolioDeltaPnL = (Number.isFinite(headerCapitalAmount) && Number.isFinite(portfolioInitialCapital))
-        ? Number((headerCapitalAmount - portfolioInitialCapital).toFixed(2))
-        : portfolioRealizedPnL;
-    const headerPnlAmount = isManualKellyMode ? portfolioDeltaPnL : realBookyPnL;
+    const headerCapitalCurrency = showSimInHeader ? kellyBaseCurrency : realBalanceCurrency;
+    const headerPnlAmount = showSimInHeader ? simulatedPnlAmount : realBookyPnL;
     const headerPnlClass = headerPnlAmount >= 0 ? 'text-emerald-400' : 'text-red-400';
-    const headerPnlLabel = isManualKellyMode ? 'PnL (SIM NAV)' : `PnL (${activeBookyLabel})`;
+    const headerPnlLabel = showSimInHeader ? 'PnL (SIM NAV)' : `PnL (${activeBookyLabel})`;
     const [tokenRenewing, setTokenRenewing] = useState(false);
     const tokenRenewingRef = useRef(false);
 
@@ -1531,6 +1591,7 @@ function App() {
         optimisticCreatedAt: Date.now(),
         optimisticTtlMs: optimisticIsSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS,
         optimisticIsSnipe,
+        optimisticPlacementMode: 'UNKNOWN',
         optimisticInFlight: true,
         optimisticFlow: 'preparing',
         optimisticConfirmedAt: null,
@@ -1600,6 +1661,7 @@ function App() {
             optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
             optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (optimisticIsSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
             optimisticIsSnipe,
+            optimisticPlacementMode: useRealPlacement ? 'REAL' : 'SIM',
             optimisticInFlight: true,
             optimisticFlow: 'prepared',
             optimisticConfirmedAt: null,
@@ -1705,6 +1767,7 @@ function App() {
                     optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
                     optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (isLiveSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
                     optimisticIsSnipe: pendingBetDetailsRef.current[id]?.optimisticIsSnipe ?? isLiveSnipe,
+                    optimisticPlacementMode: 'SIM',
                     optimisticInFlight: false,
                     optimisticFlow: 'confirmed',
                     optimisticConfirmedAt: new Date().toISOString(),
@@ -1780,6 +1843,7 @@ function App() {
                 optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
                 optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (isLiveSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
                 optimisticIsSnipe: pendingBetDetailsRef.current[id]?.optimisticIsSnipe ?? isLiveSnipe,
+                optimisticPlacementMode: 'REAL',
                 optimisticInFlight: false,
                 optimisticFlow: 'confirmed',
                 optimisticConfirmedAt: new Date().toISOString(),
@@ -1982,66 +2046,139 @@ function App() {
   };
 
   const getFinishedDataForSelectedDate = () => {
-        const historyData = (Array.isArray(portfolio?.history) ? portfolio.history : [])
+        const portfolioHistoryRows = Array.isArray(portfolio?.history) ? portfolio.history : [];
+        const remoteHistoryRows = Array.isArray(bookyAccount?.history) ? bookyAccount.history : [];
+
+        const isSettledByTextStatus = (row = {}) => {
+            const statusTxt = String(row?.status || '').toUpperCase();
+            return statusTxt === 'WON' || statusTxt === 'LOST' || statusTxt === 'VOID';
+        };
+
+        const hasProviderMarkers = (row = {}) => Boolean(
+            row?.providerBetId ||
+            row?.providerSelectionId ||
+            row?.providerMarketId ||
+            row?.providerAcceptedAt ||
+            row?.realPlacement
+        );
+
+        const isRemoteLikeRow = (row = {}) => Boolean(
+            row?.isBookyHistory ||
+            row?.source === 'remote' ||
+            (Array.isArray(row?.selections) && row.selections.length > 0)
+        );
+
+        if (isSimulatedDisplayMode) {
+            const simHistoryData = portfolioHistoryRows
+                .filter((h) => {
+                    if (!h || typeof h !== 'object') return false;
+                    if (hasProviderMarkers(h) || isRemoteLikeRow(h)) return false;
+
+                    const hasSimProfit = Number.isFinite(Number(h?.profit));
+                    return isSettledByTextStatus(h) || hasSimProfit;
+                })
+                .map(h => ({
+                    ...h,
+                    date: h.matchDate || h.createdAt || h.date || h.closedAt,
+                    isFinished: true,
+                    isSimulatedHistory: true
+                }));
+
+            const pendingFinishData = (portfolio.activeBets || []).filter(b => {
+                if (!b || typeof b !== 'object') return false;
+                if (isRemoteLikeRow(b)) return false;
+                if (hasProviderMarkers(b)) return false;
+
+                if (b.liveTime === 'Final' || b.liveTime === 'FT') return true;
+
+                const betTime = new Date(b.createdAt).getTime();
+                const minutesSinceBet = (Date.now() - betTime) / 60000;
+
+                if (b.liveTime) {
+                    const lastKnownMinute = parseInt(b.liveTime) || 0;
+                    const lastUpdate = new Date(b.lastUpdate || b.createdAt).getTime();
+                    const minutesSinceUpdate = (Date.now() - lastUpdate) / 60000;
+
+                    const estimatedCurrentMinute = lastKnownMinute + minutesSinceUpdate;
+                    if (estimatedCurrentMinute > 115) return true;
+                    if (lastKnownMinute > 85 && minutesSinceUpdate > 15) return true;
+                } else {
+                    const eventStartTime = new Date(b.matchDate || b.createdAt).getTime();
+                    const minutesSinceStart = (Date.now() - eventStartTime) / 60000;
+                    if (minutesSinceStart > 140) return true;
+                }
+
+                return false;
+            }).map(b => ({
+                ...b,
+                date: b.createdAt,
+                manualStatus: 'WAIT_RES'
+            }));
+
+            const allFinished = [...pendingFinishData, ...simHistoryData].sort((a,b) => new Date(b.date) - new Date(a.date));
+            return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
+        }
+
+        // MODO REAL: incluir solo finalizadas reales (portfolio + remotas Booky), excluyendo abiertas actuales.
+        const openProviderBetIds = new Set(
+            remoteHistoryRows
+                .filter(row => isBookyOpenStatus(row?.status))
+                .map(row => String(row?.providerBetId || '').trim())
+                .filter(Boolean)
+        );
+
+        const realHistoryFromPortfolio = portfolioHistoryRows
             .filter((h) => {
                 if (!h || typeof h !== 'object') return false;
-                if (h?.isBookyHistory || h?.source === 'remote') return false;
-                // Si trae estructura de selección remota, tratarlo como no-simulado.
-                if (Array.isArray(h?.selections) && h.selections.length > 0) return false;
+                if (!hasProviderMarkers(h)) return false;
 
-                const statusTxt = String(h?.status || '').toUpperCase();
-                const isSimSettled = statusTxt === 'WON' || statusTxt === 'LOST' || statusTxt === 'VOID';
-                const hasSimProfit = Number.isFinite(Number(h?.profit));
-                return isSimSettled || hasSimProfit;
+                const providerStatusSettled = BOOKY_SETTLED_STATUSES.has(Number(h?.providerStatus));
+                const settled = isSettledByTextStatus(h) || providerStatusSettled;
+                if (!settled) return false;
+
+                const providerId = String(h?.providerBetId || '').trim();
+                if (providerId && openProviderBetIds.has(providerId)) return false;
+                return true;
             })
-            .map(h => ({
-            ...h,
-            date: h.matchDate || h.createdAt || h.date || h.closedAt,
-            isFinished: true,
-            isSimulatedHistory: true
-        }));
+            .map((h) => ({
+                ...h,
+                date: h.closedAt || h.providerAcceptedAt || h.createdAt || h.date || h.matchDate,
+                isFinished: true,
+                isRealHistory: true
+            }));
 
-           const pendingFinishData = (portfolio.activeBets || []).filter(b => {
-               if (!b || typeof b !== 'object') return false;
-               if (b?.isBookyHistory || b?.source === 'remote') return false;
-               if (Array.isArray(b?.selections) && b.selections.length > 0) return false;
+        const existingProviderIds = new Set(
+            realHistoryFromPortfolio
+                .map((row) => String(row?.providerBetId || '').trim())
+                .filter(Boolean)
+        );
 
-               const hasProviderMarkers = Boolean(
-                  b?.providerBetId ||
-                  b?.providerSelectionId ||
-                  b?.providerMarketId ||
-                  b?.providerAcceptedAt
-               );
-               if (hasProviderMarkers) return false;
+        const realHistoryFromRemote = remoteHistoryRows
+            .filter((row) => {
+                if (!row || typeof row !== 'object') return false;
+                if (isBookyOpenStatus(row?.status)) return false;
 
-             if (b.liveTime === 'Final' || b.liveTime === 'FT') return true;
+                const settledByProvider = BOOKY_SETTLED_STATUSES.has(Number(row?.status));
+                const finishedByClock = isBookyMatchFinished(row);
+                if (!settledByProvider && !finishedByClock) return false;
 
-             const betTime = new Date(b.createdAt).getTime();
-             const minutesSinceBet = (Date.now() - betTime) / 60000;
+                const providerId = String(row?.providerBetId || '').trim();
+                if (providerId && existingProviderIds.has(providerId)) return false;
+                return true;
+            })
+            .map((row, idx) => ({
+                ...row,
+                id: row?.id || `booky_finished_${row?.providerBetId || idx}`,
+                isBookyHistory: true,
+                isFinished: true,
+                isRealHistory: true,
+                date: row?.settledAt || row?.closedAt || row?.placedAt || resolveBookyEventStartIso(row) || row?.date || row?.createdAt
+            }));
 
-             if (b.liveTime) {
-                 const lastKnownMinute = parseInt(b.liveTime) || 0;
-                 const lastUpdate = new Date(b.lastUpdate || b.createdAt).getTime();
-                 const minutesSinceUpdate = (Date.now() - lastUpdate) / 60000;
+        const allRealFinished = [...realHistoryFromPortfolio, ...realHistoryFromRemote]
+            .sort((a,b) => new Date(b.date) - new Date(a.date));
 
-                 const estimatedCurrentMinute = lastKnownMinute + minutesSinceUpdate;
-                 if (estimatedCurrentMinute > 115) return true;
-                 if (lastKnownMinute > 85 && minutesSinceUpdate > 15) return true;
-             } else {
-                const eventStartTime = new Date(b.matchDate || b.createdAt).getTime();
-                const minutesSinceStart = (Date.now() - eventStartTime) / 60000;
-                if (minutesSinceStart > 140) return true;
-             }
-
-             return false;
-        }).map(b => ({
-            ...b,
-            date: b.createdAt,
-            manualStatus: 'WAIT_RES'
-        }));
-
-        const allFinished = [...pendingFinishData, ...historyData].sort((a,b) => new Date(b.date) - new Date(a.date));
-        return allFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
+        return allRealFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
   };
 
   const getOpenBookyRemoteBets = () => {
@@ -2571,7 +2708,7 @@ function App() {
                 </div>
             )}
 
-            {activeTab === 'FINISHED' && (
+            {activeTab === 'FINISHED' && !isSimulatedDisplayMode && (
                 <div className="bg-slate-800 border-b border-slate-700 px-3 py-2 flex items-center justify-end gap-2">
                     <span className="text-[10px] uppercase tracking-wide text-slate-500 font-bold">Vista selección</span>
                     <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
@@ -2882,9 +3019,13 @@ function App() {
                                                      <span className="font-mono font-bold text-slate-300 text-xs pl-0.5">
                                                         {betData.finalScore || betData.lastKnownScore || betData.score || '?-?'}
                                                      </span>
-                                                     {/* DATE BELOW SCORE */}
+                                                     {/* HORA DE APUESTA */}
+                                                     <span className="text-[9px] text-slate-400 leading-tight" title="Hora de Apuesta">
+                                                         AP {formatTimeSafe(betTimeIso || op.createdAt || op.date)}
+                                                     </span>
+                                                     {/* HORA DE INICIO */}
                                                      <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
-                                                                          {formatTimeSafe(op.isBookyHistory ? (resolveBookyEventStartIso(op) || op.matchDate || op.date) : (op.matchDate || op.date))}
+                                                         INI {formatTimeSafe(op.isBookyHistory ? (resolveBookyEventStartIso(op) || op.matchDate || op.date) : (op.matchDate || op.date))}
                                                      </span>
                                                 </div>
                                             ) : (op.manualStatus === 'WAIT_RES' || minutesElapsed > 150) ? (
@@ -2943,7 +3084,7 @@ function App() {
                                                 </div>
                                             )}
                                             <div className="text-slate-200 font-bold text-sm text-wrap max-w-50 md:max-w-none">{op.match}</div>
-                                            {(op.isBookyHistory || activeTab === 'LIVE' || ticketIdForRow) ? (
+                                            {(op.isBookyHistory || activeTab === 'LIVE' || activeTab === 'FINISHED' || ticketIdForRow) ? (
                                                 <div className="text-slate-500 text-[10px] flex gap-2 flex-wrap items-center">
                                                     <span>{op.league || betData?.league || '-'}</span>
                                                     <span className="text-slate-600">|</span>

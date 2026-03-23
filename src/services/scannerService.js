@@ -4,7 +4,7 @@ import db, { initDB } from '../db/database.js';
 import { scanLiveOpportunities as performValueScan, getLiveOverview } from './liveValueScanner.js';
 import { scanLiveOpportunities as performTurnaroundScan } from './liveScannerService.js'; 
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
-import { prepareSemiAutoTicket, confirmRealPlacementFast } from './bookySemiAutoService.js';
+import { prepareSemiAutoTicket, confirmSemiAutoTicket, confirmRealPlacementFast } from './bookySemiAutoService.js';
 
 const parseBooleanFromEnv = (rawValue, fallback = false) => {
     if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
@@ -202,25 +202,88 @@ const maybeRunAutoSnipe = async (opportunity) => {
             return { triggered: true, dryRun: true };
         }
 
-        const ticket = await prepareSemiAutoTicket(opportunity);
-        const ticketId = ticket?.id;
-        ticketIdForLog = ticketId || 'n/a';
-        if (!ticketId) {
-            return { triggered: false, reason: 'ticket-missing-id' };
+        const placementMode = BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim';
+        const runPlacementOnce = async () => {
+            const ticket = await prepareSemiAutoTicket(opportunity);
+            const ticketId = ticket?.id;
+            ticketIdForLog = ticketId || 'n/a';
+            if (!ticketId) {
+                return { ok: false, reason: 'ticket-missing-id' };
+            }
+
+            const placementResult = BOOKY_REAL_PLACEMENT_ENABLED
+                ? await confirmRealPlacementFast(ticketId)
+                : await confirmSemiAutoTicket(ticketId);
+            return { ok: true, ticketId, placementResult };
+        };
+
+        let placementAttempt = await runPlacementOnce();
+        if (!placementAttempt.ok) {
+            return { triggered: false, reason: placementAttempt.reason || 'ticket-missing-id' };
         }
 
-        const placementResult = await confirmRealPlacementFast(ticketId);
+        const extractMsg = (err) => String(err?.message || '').toLowerCase();
+        const shouldRetryRequote = (err) => extractMsg(err).includes('re-quote requerido') || extractMsg(err).includes('cuota cambió demasiado');
+
+        try {
+            // noop: ya tenemos resultado del primer intento
+        } catch (_) {
+            // unreachable
+        }
+
+        const placementResult = placementAttempt.placementResult;
         autoSnipePlacedAtHistory.push(Date.now());
-        const status = String(placementResult?.ticket?.status || 'REAL_CONFIRMED_FAST');
-        const portfolioBetId = placementResult?.mirroredBet?.id || placementResult?.ticket?.portfolioBetId || 'n/a';
+        const status = String(placementResult?.ticket?.status || (placementMode === 'real' ? 'REAL_CONFIRMED_FAST' : 'CONFIRMED'));
+        const portfolioBetId = placementResult?.mirroredBet?.id || placementResult?.bet?.id || placementResult?.ticket?.portfolioBetId || 'n/a';
         console.log(
-            `✅ [AUTO_SNIPE] Resultado final=CONFIRMED | ${opportunity.match} (${opportunity.selection}) ` +
-            `ticket=${ticketId} status=${status} portfolioBetId=${portfolioBetId}`
+            `✅ [AUTO_SNIPE] Resultado final=CONFIRMED mode=${placementMode.toUpperCase()} | ${opportunity.match} (${opportunity.selection}) ` +
+            `ticket=${placementAttempt.ticketId} status=${status} portfolioBetId=${portfolioBetId}`
         );
-        return { triggered: true, dryRun: false, ticketId, outcome: 'confirmed', status, portfolioBetId };
+        return { triggered: true, dryRun: false, ticketId: placementAttempt.ticketId, outcome: 'confirmed', status, portfolioBetId, placementMode };
     } catch (error) {
+        const placementMode = BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim';
         const msg = error?.message || 'Error desconocido';
         const code = String(error?.code || '');
+
+        const lowerMsg = String(msg || '').toLowerCase();
+        const isRequote = lowerMsg.includes('re-quote requerido') || lowerMsg.includes('cuota cambió demasiado');
+        if (isRequote) {
+            try {
+                console.warn(`↻ [AUTO_SNIPE] Re-quote detectado. Reintentando una vez con cuota refrescada: ${opportunity?.match || 'n/a'}`);
+                const retryTicket = await prepareSemiAutoTicket(opportunity);
+                const retryTicketId = retryTicket?.id;
+                ticketIdForLog = retryTicketId || ticketIdForLog;
+                if (!retryTicketId) {
+                    return { triggered: false, reason: 'ticket-missing-id' };
+                }
+
+                const retryResult = BOOKY_REAL_PLACEMENT_ENABLED
+                    ? await confirmRealPlacementFast(retryTicketId)
+                    : await confirmSemiAutoTicket(retryTicketId);
+
+                autoSnipePlacedAtHistory.push(Date.now());
+                const retryStatus = String(retryResult?.ticket?.status || (placementMode === 'real' ? 'REAL_CONFIRMED_FAST' : 'CONFIRMED'));
+                const retryPortfolioBetId = retryResult?.mirroredBet?.id || retryResult?.bet?.id || retryResult?.ticket?.portfolioBetId || 'n/a';
+                console.log(
+                    `✅ [AUTO_SNIPE] Resultado final=CONFIRMED mode=${placementMode.toUpperCase()} (retry) | ${opportunity.match} (${opportunity.selection}) ` +
+                    `ticket=${retryTicketId} status=${retryStatus} portfolioBetId=${retryPortfolioBetId}`
+                );
+                return {
+                    triggered: true,
+                    dryRun: false,
+                    ticketId: retryTicketId,
+                    outcome: 'confirmed',
+                    status: retryStatus,
+                    portfolioBetId: retryPortfolioBetId,
+                    placementMode,
+                    retry: true
+                };
+            } catch (retryErr) {
+                const retryMsg = retryErr?.message || msg;
+                console.warn(`⚠️ [AUTO_SNIPE] Reintento por re-quote falló para ${opportunity?.match || 'n/a'}: ${retryMsg}`);
+                return { triggered: false, reason: 'execution-error', error: retryMsg };
+            }
+        }
 
         if (code === 'BOOKY_REAL_PLACEMENT_REJECTED') {
             console.warn(

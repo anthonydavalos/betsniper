@@ -1252,6 +1252,7 @@ const getCachedRemoteHistory = (limit = 60, profileKey = null) => {
     updatedAt,
     source: cache.source || 'cache',
     stale: true,
+    limitBound: Boolean(cache.limitBound),
     error: cache.error || null,
     endpoint: cache.endpoint || null,
     method: cache.method || null
@@ -1773,7 +1774,9 @@ const requestRemoteBetHistory = async (auth, limit = 60, integrationKey = null, 
     return {
       rows: Array.from(dedup.values()).slice(0, target),
       endpoint,
-      method: 'POST'
+      method: 'POST',
+      // Si se pidió con límite fijo, el resultado puede ser parcial respecto al total remoto.
+      limitBound: !fetchAll && requested > 0
     };
   }
 
@@ -1816,8 +1819,9 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
   const refreshMs = getHistoryRefreshMs();
   const now = Date.now();
   const memoryHistoryCache = memoryHistoryCacheByProfile.get(key) || null;
+  const memoryLooksPartial = Boolean(memoryHistoryCache?.value?.limitBound);
 
-  if (!forceRefresh && memoryHistoryCache?.updatedAtMs && (now - memoryHistoryCache.updatedAtMs) < refreshMs) {
+  if (!forceRefresh && memoryHistoryCache?.updatedAtMs && (now - memoryHistoryCache.updatedAtMs) < refreshMs && !(fetchAll && memoryLooksPartial)) {
     const max = Number.isFinite(Number(limit))
       ? (Number(limit) > 0 ? Math.max(1, Number(limit)) : null)
       : 60;
@@ -1829,7 +1833,8 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
   }
 
   const cached = getCachedRemoteHistory(limit, key);
-  if (!forceRefresh && cached?.updatedAt) {
+  const cachedLooksPartial = Boolean(cached?.limitBound);
+  if (!forceRefresh && cached?.updatedAt && !(fetchAll && cachedLooksPartial)) {
     const cachedTs = new Date(cached.updatedAt).getTime();
     if (Number.isFinite(cachedTs) && (now - cachedTs) < refreshMs) {
       memoryHistoryCacheByProfile.set(key, {
@@ -1901,6 +1906,7 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
       stale: false,
       endpoint: remote.endpoint,
       method: remote.method,
+      limitBound: Boolean(remote?.limitBound),
       error: null,
       openBets
     };
@@ -2166,7 +2172,10 @@ export const getBookyHistory = async (limit = 60) => {
 
   const ctx = getActiveProfileContext();
 
-  const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 60;
+  const parsedLimit = Number(limit);
+  const max = Number.isFinite(parsedLimit)
+    ? (parsedLimit <= 0 ? null : Math.max(1, parsedLimit))
+    : 60;
   const history = Array.isArray(db.data.booky.history) ? db.data.booky.history : [];
   const localRowsAll = history
     .filter(item => item?.realPlacement)
@@ -2191,7 +2200,7 @@ export const getBookyHistory = async (limit = 60) => {
   }
 
   if (remoteRows.length === 0) {
-    return localRowsAll.slice(0, max);
+    return max === null ? localRowsAll : localRowsAll.slice(0, max);
   }
 
   const merged = new Map();
@@ -2404,7 +2413,7 @@ export const getBookyHistory = async (limit = 60) => {
   replaceProfileHistory(ctx.key, enrichedRows);
   await db.write();
 
-  return enrichedRows.slice(0, max);
+  return max === null ? enrichedRows : enrichedRows.slice(0, max);
 };
 
 export const cleanupBookyOrphanActiveBets = async ({
@@ -2611,13 +2620,19 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
   if (cleanupOld) {
     await cleanupBookyHistoricalData({ retentionDays });
   }
-  const history = await getBookyHistory(historyLimit);
+  await getBookyHistory(historyLimit);
+  const parsedLimit = Number(historyLimit);
+  const maxHistoryItems = Number.isFinite(parsedLimit)
+    ? (parsedLimit <= 0 ? null : Math.max(1, parsedLimit))
+    : 60;
   const profileStore = getProfileStore(ctx.key, false);
   const fullProfileHistory = Array.isArray(profileStore?.history) ? profileStore.history : [];
   const finishedFromDateRaw = getConfiguredFinishedFromDate();
   const finishedFromDateIso = parseEnvDateStartIso(finishedFromDateRaw);
-  const filteredHistory = filterRowsFromIsoDate(history, finishedFromDateIso);
   const filteredFullProfileHistory = filterRowsFromIsoDate(fullProfileHistory, finishedFromDateIso);
+  const filteredHistory = maxHistoryItems === null
+    ? filteredFullProfileHistory
+    : filteredFullProfileHistory.slice(0, maxHistoryItems);
   const localBookyHistory = Array.isArray(db.data?.booky?.history) ? db.data.booky.history : [];
   const allowedProviderBetIds = new Set(
     localBookyHistory
