@@ -1,5 +1,13 @@
 # Registro de Retoques y Correcciones
 
+## [2026-03-22] Finalizados REAL + Auto-Snipe + Cache History
+- **Finalizados REAL sin truncamiento:** se habilitó `historyLimit=0` en `/api/booky/account`, con hidratación completa en pestaña Finalizados REAL y bypass de caché parcial cuando se pide `fetchAll`.
+- **Filtro por fecha robusto en snapshot:** `getBookyAccountSnapshot()` ahora filtra por `BOOKY_CASHFLOW_FROM_DATE` / `BOOKY_FINISHED_FROM_DATE` sobre historial completo antes de aplicar recorte.
+- **Fix de stale closure en polling UI:** `fetchData()` usa refs (`activeTabRef`, `tokenHealthRef`) para que el intervalo respete tab/modo actual y no pida límites antiguos.
+- **Auto-snipe resiliente:** soporte explícito SIM (`confirmSemiAutoTicket`) y reintento único ante re-quote.
+- **Drift configurable en Booky:** `BOOKY_LIVE_MAX_ODD_DRIFT` y `BOOKY_PREMATCH_MAX_ODD_DRIFT` leídos desde entorno.
+- **Aliases operativos nuevos:** `gimpo citizen -> gimpo`, `university of macau -> universidade de macau`.
+
 ## [Frontend] App.jsx
 - **Fix Visual (Odds):** Se modificó la tarjeta de oportunidad para priorizar `op.price` (la cuota de Altenar/DoradoBet) en lugar de `op.odd`. Esto corrige el bug donde salía `0.00`.
 - **Fix Tabs:** Se separó la lógica de filtrado. "Live" muestra solo `LIVE_VALUE` y `Pre-match` muestra solo `PREMATCH_VALUE`. "Todos" muestra ambos.

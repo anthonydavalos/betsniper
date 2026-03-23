@@ -70,7 +70,9 @@ router.get('/account', async (req, res) => {
     const forceRefresh = refresh === '1' || refresh === 'true' || refresh === 'yes';
     const historyLimitRaw = Number(req.query?.historyLimit || 300);
     const historyLimit = Number.isFinite(historyLimitRaw)
-      ? Math.max(10, Math.min(500, historyLimitRaw))
+      ? (historyLimitRaw <= 0
+        ? 0
+        : Math.max(10, Math.min(5000, historyLimitRaw)))
       : 300;
     const cleanup = String(req.query?.cleanup || '').toLowerCase();
     const cleanupOld = cleanup === '1' || cleanup === 'true' || cleanup === 'yes';

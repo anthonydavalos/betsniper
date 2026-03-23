@@ -16,8 +16,13 @@ const envPath = path.join(projectRoot, '.env');
 const LIVE_TICKET_EXPIRY_MS = 30 * 1000;
 const PREMATCH_TICKET_EXPIRY_MS = 3 * 60 * 1000;
 
-const LIVE_MAX_ODD_DRIFT = 0.08;
-const PREMATCH_MAX_ODD_DRIFT = 0.2;
+const parsePositiveNumberFromEnv = (rawValue, fallback) => {
+  const n = Number(rawValue);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const LIVE_MAX_ODD_DRIFT = parsePositiveNumberFromEnv(process.env.BOOKY_LIVE_MAX_ODD_DRIFT, 0.08);
+const PREMATCH_MAX_ODD_DRIFT = parsePositiveNumberFromEnv(process.env.BOOKY_PREMATCH_MAX_ODD_DRIFT, 0.2);
 const PLACE_WIDGET_URL = 'https://sb2betgateway-altenar2.biahosted.com/api/widget/placeWidget';
 const DEFAULT_MIN_TOKEN_MINUTES = 2;
 const prepareTicketInFlight = new Map();

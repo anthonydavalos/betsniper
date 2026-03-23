@@ -7,6 +7,88 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.17] -- 2026-03-22 -- Sprint: Finalizados REAL Full-History + Auto-Snipe Requote + SIM/REAL Reconciliation Hardening
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Finalizados REAL: hidratacion completa bajo demanda
+- **`client/src/App.jsx`**:
+  - Se agrega `BOOKY_HISTORY_LIMIT_FINISHED_REAL=0` para solicitar historial completo en pestaña Finalizados (modo REAL).
+  - Primera carga de Finalizados REAL fuerza refresh remoto (`refresh=1`) una vez por sesion de UI para evitar quedarse con snapshot recortado.
+
+#### Auto-snipe: confirmacion simulada y reintento por re-quote
+- **`src/services/scannerService.js`**:
+  - Se habilita ruta de confirmacion SIM (`confirmSemiAutoTicket`) cuando `BOOKY_REAL_PLACEMENT_ENABLED=false`.
+  - Ante error de re-quote, se agrega un reintento automatico con nuevo ticket para reducir caidas a manual por volatilidad transitoria.
+  - Logs finales incluyen `mode=REAL|SIM`, `status`, `portfolioBetId` y bandera de `retry` cuando aplica.
+
+### 🔄 Changed
+
+#### Frontend Finalizados: separacion estricta SIM vs REAL
+- **`client/src/App.jsx`**:
+  - `getFinishedDataForSelectedDate()` ahora bifurca por modo:
+    - **SIM:** solo historial paper/local + heuristica `WAIT_RES` local.
+    - **REAL:** portfolio real liquidado + remoto Booky liquidado, excluyendo abiertas y evitando duplicados por `providerBetId`.
+  - En modo REAL se oculta control de vista de seleccion cuando el modo es simulado para evitar confusion de fuentes.
+  - Se muestra hora de apuesta (`AP`) y hora de inicio (`INI`) en filas finalizadas para trazabilidad temporal.
+
+#### Polling UI: correccion de cierre stale en intervalos
+- **`client/src/App.jsx`**:
+  - `fetchData()` ahora usa refs vivas (`activeTabRef`, `tokenHealthRef`) para evaluar tab/modo actual dentro de `setInterval`.
+  - Se corrige escenario donde el polling seguia pidiendo `historyLimit` de tab antigua (ej. `ALL`) tras cambiar a `FINISHED`.
+
+#### Snapshot account: filtro por fecha antes del recorte
+- **`src/services/bookyAccountService.js`**:
+  - `getBookyAccountSnapshot()` construye `history` desde historial completo del perfil filtrado por `BOOKY_FINISHED_FROM_DATE`/`BOOKY_CASHFLOW_FROM_DATE` y recorta despues.
+  - Con `historyLimit<=0`, retorna historial completo filtrado por fecha sin truncamiento.
+
+#### Historial remoto: deteccion de cache parcial y bypass en fetchAll
+- **`src/services/bookyAccountService.js`**:
+  - Se introduce metadato `limitBound` para distinguir snapshots potencialmente parciales.
+  - Si una solicitud requiere `fetchAll`, se evita reutilizar cache parcial (memoria/DB) y se fuerza sincronizacion completa.
+
+#### Endpoint account: soporte ampliado de historyLimit
+- **`src/routes/booky.js`**:
+  - `historyLimit=0` ahora significa "sin limite".
+  - Se amplía tope superior de limite positivo hasta `5000` para diagnosticos/operacion.
+
+#### Drift configurable por entorno para confirmacion Booky
+- **`src/services/bookySemiAutoService.js`**:
+  - `LIVE_MAX_ODD_DRIFT` y `PREMATCH_MAX_ODD_DRIFT` pasan a leerse desde `.env` (`BOOKY_LIVE_MAX_ODD_DRIFT`, `BOOKY_PREMATCH_MAX_ODD_DRIFT`) con fallback seguro.
+
+#### .env example alineado a operación real/sim
+- **`.env.example`**:
+  - Se documentan variables de drift (`BOOKY_LIVE_MAX_ODD_DRIFT`, `BOOKY_PREMATCH_MAX_ODD_DRIFT`).
+  - Se corrige receta SIM auto para placement simulado realista (`AUTO_SNIPE_DRY_RUN=false`).
+
+#### Matching operativo
+- **`src/utils/dynamicAliases.json`**:
+  - Nuevos aliases:
+    - `gimpo citizen -> gimpo`
+    - `university of macau -> universidade de macau`
+
+### 🐛 Fixed
+
+#### Finalizados REAL recortaba histórico y ocultaba días 23-Feb a 08-Mar
+- Se corrige truncamiento por ventana corta (`historyLimit=120`) en flujo de polling y cache parcial heredada.
+
+#### Al cambiar de pestaña, polling continuaba con lógica de tab antigua
+- Se corrige cierre stale de estado en `fetchData`, evitando decisiones de modo/tab desactualizadas.
+
+#### Auto-snipe caía a manual por re-quote transitorio
+- Se agrega reintento único y outcome final explicito para disminuir rechazos operativos por ruido de mercado.
+
+### 🧪 Validated
+
+- Verificacion local de API:
+  - `GET /api/booky/account?historyLimit=0` devolviendo historial completo desde `BOOKY_CASHFLOW_FROM_DATE=2026-02-23`.
+- Verificacion de rango en datos:
+  - Presencia confirmada de filas entre `2026-02-23` y `2026-03-08` en historial de perfil `acity`.
+- Diagnostico estatico:
+  - Sin errores en archivos modificados (`App.jsx`, `booky.js`, `bookyAccountService.js`).
+
 ## [v3.4.16] -- 2026-03-21 -- Sprint: Pinnacle Intermittent Modal Login Recovery
 
 > Rama: `master`
