@@ -586,6 +586,34 @@ const isTransientProviderError = (error) => {
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+const getProviderErrorTypeMeta = (rawErrorType) => {
+  const errorType = Number(rawErrorType);
+  if (!Number.isFinite(errorType)) {
+    return {
+      code: null,
+      reason: null,
+      isRequote: false,
+      message: 'Provider devolvió error sin errorType numérico.'
+    };
+  }
+
+  if (errorType === 4) {
+    return {
+      code: 4,
+      reason: 'selection_changed_or_unavailable',
+      isRequote: true,
+      message: 'Provider indicó re-quote/selección no vigente (errorType=4).'
+    };
+  }
+
+  return {
+    code: errorType,
+    reason: 'provider_rejected',
+    isRequote: false,
+    message: `Provider rechazó la selección (errorType=${errorType}).`
+  };
+};
+
 const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = false }) => {
   const attempts = fastMode ? 2 : 1;
   let lastError = null;
@@ -607,6 +635,14 @@ const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = fals
         const statusCode = Number(response?.status) || 409;
         const providerError = body?.error || null;
         const headers = pickResponseHeaders(response?.headers || {});
+        const errorTypeMeta = getProviderErrorTypeMeta(providerError?.errorType);
+        const providerCode = errorTypeMeta.code;
+        const providerMessage = providerError
+          ? errorTypeMeta.message
+          : 'Response without accepted bets.';
+        const rejectCode = errorTypeMeta.isRequote
+          ? 'BOOKY_PLACEWIDGET_REQUOTE_REQUIRED'
+          : 'BOOKY_PLACEWIDGET_REJECTED';
 
         throw createBookyError(
           providerError
@@ -614,15 +650,16 @@ const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = fals
             : `placeWidget respondió sin confirmar apuesta (sin bets)${fastMode ? ' [fast]' : ''}.`,
           {
             statusCode,
-            code: 'BOOKY_PLACEWIDGET_REJECTED',
+            code: rejectCode,
             diagnostic: {
               ticketId,
               requestId: draft?.payload?.requestId || null,
               endpoint: draft?.endpoint || null,
               fastMode,
               providerStatus: statusCode,
-              providerCode: null,
-              providerMessage: providerError || 'Response without accepted bets.',
+              providerCode,
+              providerReason: errorTypeMeta.reason,
+              providerMessage,
               providerHeaders: headers,
               providerBody: body,
               providerError,
@@ -1143,6 +1180,27 @@ const archiveRejectedRealPlacement = async ({ idx, ticket, draft, fastMode = fal
   await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
 };
 
+const archiveRequoteRealPlacement = async ({ idx, ticket, draft, fastMode = false, error }) => {
+  ticket.status = fastMode ? 'REAL_REQUOTE_REQUIRED_FAST' : 'REAL_REQUOTE_REQUIRED';
+  ticket.updatedAt = nowIso();
+  ticket.realPlacement = {
+    placedAt: nowIso(),
+    endpoint: draft?.endpoint || PLACE_WIDGET_URL,
+    requestId: draft?.payload?.requestId || null,
+    fastMode,
+    requote: true,
+    diagnostic: error?.diagnostic || {
+      providerMessage: error?.message || null,
+      providerCode: error?.code || null,
+      observedAt: nowIso()
+    }
+  };
+
+  db.data.booky.history.push(ticket);
+  db.data.booky.pendingTickets.splice(idx, 1);
+  await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 120 });
+};
+
 const extractAcceptedPlacementMeta = (providerResponse = {}) => {
   const bet = Array.isArray(providerResponse?.bets) ? providerResponse.bets[0] : null;
   const selection = Array.isArray(bet?.selections) ? bet.selections[0] : null;
@@ -1326,6 +1384,23 @@ export const confirmRealPlacement = async (ticketId) => {
       );
     }
 
+    if (error?.code === 'BOOKY_PLACEWIDGET_REQUOTE_REQUIRED') {
+      await archiveRequoteRealPlacement({ idx, ticket, draft, fastMode: false, error });
+      throw createBookyError(
+        'Re-quote requerido por provider (selección/cuota cambió). Reprepara y confirma de nuevo.',
+        {
+          statusCode: 409,
+          code: 'BOOKY_REAL_REQUOTE_REQUIRED',
+          diagnostic: {
+            ...(error?.diagnostic || {}),
+            ticketId,
+            requestId: draft?.payload?.requestId || null,
+            archivedStatus: 'REAL_REQUOTE_REQUIRED'
+          }
+        }
+      );
+    }
+
     if (error?.code === 'BOOKY_PLACEWIDGET_REJECTED') {
       await archiveRejectedRealPlacement({ idx, ticket, draft, fastMode: false, error });
       throw createBookyError(
@@ -1471,6 +1546,23 @@ export const confirmRealPlacementFast = async (ticketId) => {
             ticketId,
             requestId: draft?.payload?.requestId || null,
             nextStep: 'VERIFY_OPEN_BETS'
+          }
+        }
+      );
+    }
+
+    if (error?.code === 'BOOKY_PLACEWIDGET_REQUOTE_REQUIRED') {
+      await archiveRequoteRealPlacement({ idx, ticket, draft, fastMode: true, error });
+      throw createBookyError(
+        'Re-quote requerido por provider (selección/cuota cambió). Reprepara y confirma de nuevo.',
+        {
+          statusCode: 409,
+          code: 'BOOKY_REAL_REQUOTE_REQUIRED',
+          diagnostic: {
+            ...(error?.diagnostic || {}),
+            ticketId,
+            requestId: draft?.payload?.requestId || null,
+            archivedStatus: 'REAL_REQUOTE_REQUIRED_FAST'
           }
         }
       );
