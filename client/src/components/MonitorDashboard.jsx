@@ -2,6 +2,45 @@ import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { RefreshCw, ExternalLink, Activity, AlertTriangle, ArrowUp, ArrowDown, Triangle } from 'lucide-react';
 
+const PIN_STICKY_TTL_MS = 120000;
+
+const parseScorePair = (value) => {
+    if (Array.isArray(value) && value.length >= 2) {
+        const home = Number(value[0]);
+        const away = Number(value[1]);
+        if (Number.isFinite(home) && Number.isFinite(away) && home >= 0 && away >= 0) {
+            return [Math.floor(home), Math.floor(away)];
+        }
+    }
+
+    if (typeof value === 'string') {
+        const match = value.trim().match(/(\d+)\s*[-:]\s*(\d+)/);
+        if (match) return [Number(match[1]), Number(match[2])];
+    }
+
+    if (value && typeof value === 'object') {
+        const home = Number(value.home ?? value.h ?? value.homeScore);
+        const away = Number(value.away ?? value.a ?? value.awayScore);
+        if (Number.isFinite(home) && Number.isFinite(away) && home >= 0 && away >= 0) {
+            return [Math.floor(home), Math.floor(away)];
+        }
+    }
+
+    return null;
+};
+
+const formatScore = (value) => {
+    const pair = parseScorePair(value);
+    return pair ? `${pair[0]}-${pair[1]}` : '?-?';
+};
+
+const hasScoreDesync = (pinScore, altScore) => {
+    const pin = parseScorePair(pinScore);
+    const alt = parseScorePair(altScore);
+    if (!pin || !alt) return false;
+    return pin[0] !== alt[0] || pin[1] !== alt[1];
+};
+
 export default function MonitorDashboard() {
     const POLL_OPTIONS = [5000, 10000, 15000];
     const getStoredPollMs = () => {
@@ -20,6 +59,7 @@ export default function MonitorDashboard() {
     const [monitorDisabled, setMonitorDisabled] = useState(false);
     const [pollMs, setPollMs] = useState(getStoredPollMs);
     const prevOddsRef = useRef({}); // Store previous odds for trend calculation
+    const pinLiveStickyRef = useRef({}); // Store last valid Pinnacle time/score per match
     const fetchInFlightRef = useRef(false);
 
     const fetchData = async () => {
@@ -38,6 +78,27 @@ export default function MonitorDashboard() {
 
                 // --- TREND CALCULATION ---
                 sorted = sorted.map(row => {
+                    const sticky = pinLiveStickyRef.current[row.id] || null;
+                    const pinTimeRaw = row.pinnacle?.time;
+                    const pinScoreRaw = row.pinnacle?.score;
+                    const pinScoreNow = formatScore(pinScoreRaw);
+                    const hasPinTimeNow = typeof pinTimeRaw === 'string' && pinTimeRaw.trim() !== '';
+                    const hasPinScoreNow = pinScoreNow !== '?-?';
+
+                    let effectivePinTime = hasPinTimeNow ? pinTimeRaw : null;
+                    let effectivePinScore = hasPinScoreNow ? pinScoreNow : null;
+
+                    if (hasPinTimeNow || hasPinScoreNow) {
+                        pinLiveStickyRef.current[row.id] = {
+                            time: hasPinTimeNow ? pinTimeRaw : (sticky?.time || null),
+                            score: hasPinScoreNow ? pinScoreNow : (sticky?.score || null),
+                            seenAt: Date.now()
+                        };
+                    } else if (sticky && (Date.now() - Number(sticky.seenAt || 0)) <= PIN_STICKY_TTL_MS) {
+                        effectivePinTime = sticky.time || null;
+                        effectivePinScore = sticky.score || null;
+                    }
+
                     const prev = prevOddsRef.current[row.id] || { pinnacle: {}, altenar: {} };
                     
                     // Pinnacle New
@@ -85,7 +146,23 @@ export default function MonitorDashboard() {
                         altenar: { home: altHome, draw: altDraw, away: altAway }
                     };
 
-                    return { ...row, trends };
+                    return {
+                        ...row,
+                        pinnacle: row.pinnacle ? {
+                            ...row.pinnacle,
+                            time: effectivePinTime || row.pinnacle.time || null,
+                            score: effectivePinScore || row.pinnacle.score || null
+                        } : (effectivePinTime || effectivePinScore ? {
+                            time: effectivePinTime,
+                            score: effectivePinScore,
+                            moneyline: null,
+                            totals: []
+                        } : null),
+                        trends,
+                        uiPinScore: effectivePinScore || formatScore(row.pinnacle?.score),
+                        uiAltScore: formatScore(row.score),
+                        uiHasScoreDesync: hasScoreDesync(effectivePinScore || row.pinnacle?.score, row.score)
+                    };
                 });
 
                 setData(sorted);
@@ -232,7 +309,12 @@ export default function MonitorDashboard() {
                                             <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/50 text-blue-200 border border-blue-500/30">
                                                 {row.pinnacle?.time || '?'}
                                             </span>
-                                            <span className="text-blue-300 text-xs font-mono">{row.pinnacle?.score || '0-0'}</span>
+                                            <span className="text-blue-300 text-xs font-mono">{row.uiPinScore}</span>
+                                            {row.pinnacle?.stale === true && (
+                                                <span className="text-[9px] text-amber-300 border border-amber-500/50 bg-amber-500/10 px-1 rounded">
+                                                    STALE
+                                                </span>
+                                            )}
                                         </div>
                                     )}
 
@@ -242,7 +324,12 @@ export default function MonitorDashboard() {
                                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${row.time === 'HT' ? 'bg-yellow-600 text-black' : 'bg-red-600'}`}>
                                             {row.time}
                                         </span>
-                                        <span className="text-gray-400 text-xs">{row.score}</span>
+                                        <span className="text-gray-400 text-xs">{row.uiAltScore}</span>
+                                        {row.linked && row.uiHasScoreDesync && (
+                                            <span className="text-[9px] text-amber-300 border border-amber-500/50 bg-amber-500/10 px-1 rounded">
+                                                DESYNC
+                                            </span>
+                                        )}
                                         {!row.linked && <span className="text-red-400 text-[10px] border border-red-500 px-1 rounded ml-auto">UNLINKED</span>}
                                     </div>
                                 </td>

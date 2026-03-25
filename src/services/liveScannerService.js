@@ -84,6 +84,38 @@ console.log(
     `requirePinLive=${LIVE_SNIPE_REQUIRE_PINNACLE_LIVE ? 1 : 0}`
 );
 
+const liveSnipeDiagnostics = {
+    cycleStartedAt: null,
+    cycleFinishedAt: null,
+    liveEventsSeen: 0,
+    candidatesDetected: 0,
+    pushed: 0,
+    reasonCounts: {}
+};
+
+const resetLiveSnipeDiagnostics = ({ liveEventsSeen = 0 } = {}) => {
+    liveSnipeDiagnostics.cycleStartedAt = new Date().toISOString();
+    liveSnipeDiagnostics.cycleFinishedAt = null;
+    liveSnipeDiagnostics.liveEventsSeen = Number(liveEventsSeen) || 0;
+    liveSnipeDiagnostics.candidatesDetected = 0;
+    liveSnipeDiagnostics.pushed = 0;
+    liveSnipeDiagnostics.reasonCounts = {};
+};
+
+const bumpLiveSnipeReason = (reason) => {
+    const key = String(reason || 'unknown');
+    liveSnipeDiagnostics.reasonCounts[key] = (liveSnipeDiagnostics.reasonCounts[key] || 0) + 1;
+};
+
+const finishLiveSnipeDiagnostics = () => {
+    liveSnipeDiagnostics.cycleFinishedAt = new Date().toISOString();
+};
+
+export const getLiveSnipeScanDiagnostics = () => ({
+    ...liveSnipeDiagnostics,
+    reasonCounts: { ...liveSnipeDiagnostics.reasonCounts }
+});
+
 const normalizeMarketText = (value = '') => String(value)
     .toLowerCase()
     .normalize('NFD')
@@ -393,6 +425,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
 
     // Usar eventos inyectados si existen, si no, buscar frescos
     const liveEvents = preFetchedEvents || await getLiveOverview();
+    resetLiveSnipeDiagnostics({ liveEventsSeen: liveEvents.length });
     const opportunities = [];
     const diagSummary = {
         unmatched: 0,
@@ -552,6 +585,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
             const condition = checkTurnaroundCondition(event, pinMatch);
             
             if (condition) {
+                liveSnipeDiagnostics.candidatesDetected += 1;
                 console.log(`   🧐 Candidato detectado: ${event.name} (${condition.currentScore})`);
                 
                 try {
@@ -757,6 +791,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         }
 
                         if (!Number.isFinite(realProb) || realProb <= 0 || realProb >= 100) {
+                            bumpLiveSnipeReason('real_prob_invalid');
                             console.log(`   ⚠️ Skip LIVE_SNIPE por realProb inválida: ${realProb}`);
                             continue;
                         }
@@ -764,6 +799,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         // Regla estricta: LIVE_SNIPE requiere cuota live real de Pinnacle.
                         // Evita colocar apuestas con EV estimado pero sin referencia PIN usable en UI/registro.
                         if (!isLivePinnacle && LIVE_SNIPE_REQUIRE_PINNACLE_LIVE) {
+                            bumpLiveSnipeReason('require_pinnacle_live_failed');
                             console.log(`   ⚠️ Skip LIVE_SNIPE sin cuota Pinnacle Live: ${event.name} (${condition.side})`);
                             continue;
                         }
@@ -771,7 +807,8 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                         // C) Validar EV+ y Kelly
                         // Si no hay cuota Altenar, no podemos apostar
                         if (altenarOdd <= 1) {
-                            // console.log("   ❌ Altenar Odd no disponible o bloqueada.");
+                            bumpLiveSnipeReason('altenar_odd_invalid');
+                            console.log(`   ⚠️ Skip LIVE_SNIPE por cuota Altenar inválida: ${altenarOdd}`);
                             continue; 
                         }
 
@@ -786,12 +823,24 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
 
                         const evPercent = (((realProb)/100 * altenarOdd) - 1) * 100;
                         if (!Number.isFinite(evPercent)) {
+                            bumpLiveSnipeReason('ev_invalid');
                             console.log(`   ⚠️ Skip LIVE_SNIPE por EV inválido: ${evPercent}`);
+                            continue;
+                        }
+
+                        if (evPercent <= 0) {
+                            bumpLiveSnipeReason('ev_non_positive');
+                            console.log(
+                                `   ⚠️ Skip LIVE_SNIPE por EV<=0: EV=${evPercent.toFixed(2)}% ` +
+                                `| realProb=${realProb.toFixed(2)}% | odd=${altenarOdd}`
+                            );
                             continue;
                         }
                         
                         // Solo push si hay valor positivo y min 1 Sol
                         if (kellyResult.amount >= 1) {
+                                liveSnipeDiagnostics.pushed += 1;
+                                bumpLiveSnipeReason('pushed');
                              opportunities.push({
                                 type: 'LIVE_SNIPE',
                                 eventId: event.id,
@@ -845,9 +894,18 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                                     }
                                 }
                             });
+                        } else {
+                            bumpLiveSnipeReason('stake_below_1');
+                            console.log(
+                                `   ⚠️ Skip LIVE_SNIPE por stake<1: stake=${Number(kellyResult.amount || 0).toFixed(2)} ` +
+                                `| EV=${evPercent.toFixed(2)}% | realProb=${realProb.toFixed(2)}% | odd=${altenarOdd}`
+                            );
                         }
+                    } else {
+                        bumpLiveSnipeReason('details_missing');
                     }
                 } catch(error) {
+                    bumpLiveSnipeReason('details_error');
                     console.error(`Error details ${event.id}`, error);
                 }
             }
@@ -1026,6 +1084,7 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
         );
     }
     
+    finishLiveSnipeDiagnostics();
     return opportunities;
 };
 

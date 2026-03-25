@@ -1537,8 +1537,12 @@ function App() {
   const [processingBets, setProcessingBets] = useState(new Set());
     const processingBetsRef = useRef(new Set());
 
-  const handlePlaceBet = async (opportunity) => {
+    const handlePlaceBet = async (opportunity, options = {}) => {
     const id = getOpportunityId(opportunity); // ID único por selección (eventId + selection)
+                const requoteRetryCount = Number(options?.requoteRetryCount || 0);
+                const forcedConfirmMode = options?.confirmModeHint === 'confirm-fast'
+                        ? 'confirm-fast'
+                        : (options?.confirmModeHint === 'confirm' ? 'confirm' : null);
         const optimisticIsSnipe = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE';
                 let useRealPlacement = true;
 
@@ -1566,6 +1570,28 @@ function App() {
             delete pendingBetDetailsRef.current[id];
             optimisticWarnedIdsRef.current.delete(id);
             forceUpdate();
+        };
+
+        const offerImmediateRequoteRetry = () => {
+            if (requoteRetryCount >= 1) return;
+
+            const suggestedMode = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE'
+                ? 'confirm-fast'
+                : 'confirm';
+
+            const wantsRetryNow = window.confirm(
+                '🔁 La casa devolvió re-quote (cuota/selección cambió en vivo).\n\n' +
+                '¿Deseas reintentar ahora con ticket refrescado?'
+            );
+
+            if (!wantsRetryNow) return;
+
+            setTimeout(() => {
+                handlePlaceBet(opportunity, {
+                    requoteRetryCount: requoteRetryCount + 1,
+                    confirmModeHint: suggestedMode
+                });
+            }, 1300);
         };
 
         const shouldKeepBlockedAfterForcedRefresh = () => {
@@ -1739,7 +1765,7 @@ function App() {
         }
 
         const isLiveSnipe = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase() === 'LIVE_SNIPE';
-        const confirmMode = isLiveSnipe ? 'confirm-fast' : 'confirm';
+        const confirmMode = forcedConfirmMode || (isLiveSnipe ? 'confirm-fast' : 'confirm');
         const confirmEndpoint = useRealPlacement
             ? `/api/booky/real/${confirmMode}/${ticket.id}`
             : `/api/booky/confirm/${ticket.id}`;
@@ -1888,6 +1914,22 @@ function App() {
                 }
                 return;
             }
+            if (confirmRes.data?.code === 'BOOKY_REAL_REQUOTE_REQUIRED') {
+                const diagnostic = confirmRes.data?.diagnostic;
+                const diagText = diagnostic
+                    ? `\n\nDiagnóstico:\n` +
+                      `providerStatus: ${diagnostic.providerStatus ?? 'n/a'}\n` +
+                      `providerCode: ${diagnostic.providerCode ?? 'n/a'}\n` +
+                      `requestId: ${diagnostic.requestId ?? 'n/a'}`
+                    : '';
+                alert(`🔁 Re-quote requerido: la cuota/selección cambió en vivo.\nReprepara y confirma nuevamente.${diagText}`);
+                await fetchData({ forceBookyRefresh: true });
+                localPlacedBetIdsRef.current.delete(id);
+                delete pendingBetDetailsRef.current[id];
+                forceUpdate();
+                offerImmediateRequoteRetry();
+                return;
+            }
             const msg = confirmRes.data?.message || 'Error desconocido';
             alert(`⚠️ ${useRealPlacement ? 'Confirmación real' : 'Confirmación simulada'} falló: ${msg}`);
             localPlacedBetIdsRef.current.delete(id);
@@ -1914,6 +1956,13 @@ function App() {
                     if (!shouldKeepBlockedAfterForcedRefresh()) {
                         releaseLocalOptimisticLock();
                     }
+                } else if (code === 'BOOKY_REAL_REQUOTE_REQUIRED') {
+                    alert(`🔁 Re-quote requerido: la cuota/selección cambió en vivo.\nReprepara y confirma nuevamente.${diagText}`);
+                    await fetchData({ forceBookyRefresh: true });
+                    localPlacedBetIdsRef.current.delete(id);
+                    delete pendingBetDetailsRef.current[id];
+                    forceUpdate();
+                    offerImmediateRequoteRetry();
                 } else {
                     const normalizedMsg = String(msg || '').toLowerCase();
                     if (normalizedMsg.includes('ticket no encontrado')) {

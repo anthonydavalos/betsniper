@@ -61,6 +61,14 @@ const americanToDecimal = (american) => {
     }
 };
 
+const parseScoreValue = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    if (n < 0) return null;
+    return Math.floor(n);
+};
+
 // HELPER: Calcular Double Chance desde 1x2 (para no depender de la API)
 const calculateDCFromMoneyline = (homeStr, drawStr, awayStr) => {
     // Input puede ser string o number
@@ -183,7 +191,7 @@ export const getAllPinnacleLiveOdds = async () => {
                 }
 
                 // [UPDATE] Extract Time & Score for Monitor
-                let scoreStr = "0-0";
+                let scoreStr = null;
                 let timeStr = "Live";
                 
                 // A) Score from Participants (Most reliable)
@@ -192,9 +200,11 @@ export const getAllPinnacleLiveOdds = async () => {
                     const aP = ev.participants.find(p => p.alignment === 'away');
                     if (hP && aP) {
                         // Sometimes score is inside 'state', sometimes inside 'stats' for periods
-                        const hS = hP.state?.score ?? (hP.stats?.find(s => s.period === 0)?.score) ?? 0;
-                        const aS = aP.state?.score ?? (aP.stats?.find(s => s.period === 0)?.score) ?? 0;
-                        scoreStr = `${hS}-${aS}`;
+                        const hS = parseScoreValue(hP.state?.score ?? (hP.stats?.find(s => s.period === 0)?.score) ?? null);
+                        const aS = parseScoreValue(aP.state?.score ?? (aP.stats?.find(s => s.period === 0)?.score) ?? null);
+                        if (hS !== null && aS !== null) {
+                            scoreStr = `${hS}-${aS}`;
+                        }
                     }
                 }
 
@@ -285,8 +295,8 @@ export const getAllPinnacleLiveOdds = async () => {
             // Extraer Score Correcto
             const home = m.participants.find(p => p.alignment === 'home');
             const away = m.participants.find(p => p.alignment === 'away');
-            const homeScore = home?.state?.score || 0;
-            const awayScore = away?.state?.score || 0;
+            const homeScore = parseScoreValue(home?.state?.score ?? null);
+            const awayScore = parseScoreValue(away?.state?.score ?? null);
             
             // Extraer Tiempo
             const stateMap = { 1: '1T', 2: 'HT', 3: '2T' };
@@ -300,7 +310,9 @@ export const getAllPinnacleLiveOdds = async () => {
 
             metaMap.set(m.id, {
                 match: `${home?.name} vs ${away?.name}`,
-                score: `${homeScore}-${awayScore}`,
+                score: (homeScore !== null && awayScore !== null)
+                    ? `${homeScore}-${awayScore}`
+                    : null,
                 time: `${phase} ${minutes}'`,
                 league: m.league?.name,
                 isLive: true

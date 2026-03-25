@@ -54,6 +54,8 @@ let lastStaleTriggerAt = 0;
 const staleClockLagHits = new Map();
 const monitorEventDetailsCache = new Map();
 const MONITOR_EVENT_DETAILS_TTL_MS = 5000;
+const monitorPinSignalCache = new Map();
+const MONITOR_PIN_SIGNAL_TTL_MS = 180000;
 
 const triggerPinnacleStaleReload = (reason = 'live-value-desync') => {
     const nowMs = Date.now();
@@ -192,11 +194,18 @@ const resolveDoubleChanceSide = (odd = {}) => {
     return null;
 };
 
+const parseScoreNumber = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return Math.floor(n);
+};
+
 const parseScorePair = (value) => {
     if (Array.isArray(value) && value.length >= 2) {
-        const home = parseInt(value[0], 10);
-        const away = parseInt(value[1], 10);
-        if (Number.isFinite(home) && Number.isFinite(away)) return [home, away];
+        const home = parseScoreNumber(value[0]);
+        const away = parseScoreNumber(value[1]);
+        if (home !== null && away !== null) return [home, away];
     }
 
     if (typeof value === 'string') {
@@ -209,12 +218,47 @@ const parseScorePair = (value) => {
     }
 
     if (value && typeof value === 'object') {
-        const home = Number(value.home ?? value.h ?? value.homeScore);
-        const away = Number(value.away ?? value.a ?? value.awayScore);
-        if (Number.isFinite(home) && Number.isFinite(away)) return [home, away];
+        const home = parseScoreNumber(value.home ?? value.h ?? value.homeScore);
+        const away = parseScoreNumber(value.away ?? value.a ?? value.awayScore);
+        if (home !== null && away !== null) return [home, away];
     }
 
     return null;
+};
+
+const formatScoreText = (value) => {
+    const pair = parseScorePair(value);
+    return pair ? `${pair[0]}-${pair[1]}` : null;
+};
+
+const rememberMonitorPinSignal = (eventId, payload = {}) => {
+    const key = String(eventId || '').trim();
+    if (!key) return;
+
+    const time = typeof payload.time === 'string' && payload.time.trim() ? payload.time.trim() : null;
+    const score = formatScoreText(payload.score);
+    if (!time && !score) return;
+
+    const prev = monitorPinSignalCache.get(key) || null;
+    monitorPinSignalCache.set(key, {
+        time: time || prev?.time || null,
+        score: score || prev?.score || null,
+        seenAt: Date.now()
+    });
+};
+
+const getMonitorPinSignal = (eventId) => {
+    const key = String(eventId || '').trim();
+    if (!key) return null;
+    const cached = monitorPinSignalCache.get(key);
+    if (!cached) return null;
+
+    if ((Date.now() - Number(cached.seenAt || 0)) > MONITOR_PIN_SIGNAL_TTL_MS) {
+        monitorPinSignalCache.delete(key);
+        return null;
+    }
+
+    return cached;
 };
 
 const isScoreSynchronized = (altenarScore, pinnacleScore) => {
@@ -728,7 +772,7 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
         
         // Priority Data Selection (Pinnacle > Altenar)
         const displayTime = pinLiveParent ? pinLiveParent.time : event.liveTime;
-        const displayScore = pinLiveParent ? pinLiveParent.score : (event.score || []).join("-");
+        const displayScore = formatScoreText(pinLiveParent?.score) || formatScoreText(event.score);
 
         // [NEW] Extract Prematch Odd from Pinnacle (Source of Truth) for comparison
         let pinPrematchPrice = null;
@@ -878,10 +922,12 @@ export const getLiveOddsComparison = async () => {
         // Eliminamos líneas que ya están matemáticamente resueltas.
         if (monitorPinOdds && monitorPinOdds.totals) {
             let totalGoals = 0;
-            const scoreStr = monitorPinOdds.score || event.score?.join("-") || "0-0";
-            const parts = scoreStr.split("-").map(p => parseInt(p));
-            if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
-                totalGoals = parts[0] + parts[1];
+            const scoreStr = formatScoreText(monitorPinOdds.score) || formatScoreText(event.score);
+            if (scoreStr) {
+                const parts = scoreStr.split("-").map(p => parseInt(p, 10));
+                if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+                    totalGoals = parts[0] + parts[1];
+                }
             }
 
             // Filtrar líneas
@@ -945,6 +991,13 @@ export const getLiveOddsComparison = async () => {
                     monitorPinOdds.score = `${event.score[0]}-${event.score[1]}`;
                  }
              }
+        }
+
+        if (monitorPinOdds) {
+            rememberMonitorPinSignal(event.id, {
+                time: monitorPinOdds.time,
+                score: monitorPinOdds.score
+            });
         }
 
         const altenarData = {
@@ -1050,13 +1103,24 @@ export const getLiveOddsComparison = async () => {
         
         // Si no hay link, lo agregamos como "Unlinked" (o Linked pero sin datos Live)
         if (!pinLiveOdds) {
+            const cachedPinSignal = getMonitorPinSignal(event.id);
+            const fallbackPinTime = cachedPinSignal?.time || event.liveTime || null;
+            const fallbackPinScore = cachedPinSignal?.score || formatScoreText(event.score);
+
             comparisonData.push({
                 id: event.id,
                 name: event.name,
                 time: event.liveTime,
-                score: (event.score || []).join("-"),
+                score: formatScoreText(event.score),
                 linked: !!pinMatch, 
-                pinnacle: null,
+                pinnacle: pinMatch ? {
+                    id: pinMatch.id,
+                    score: fallbackPinScore,
+                    time: fallbackPinTime,
+                    moneyline: null,
+                    totals: [],
+                    stale: true
+                } : null,
                 prematch: pinMatch ? pinMatch.odds : null, 
                 altenar: altenarData 
             });
@@ -1067,11 +1131,11 @@ export const getLiveOddsComparison = async () => {
             id: event.id,
             name: event.name,
             time: event.liveTime,
-            score: (event.score || []).join("-"),
+            score: formatScoreText(event.score),
             linked: true,
             pinnacle: {
                 id: monitorPinOdds.id,
-                score: monitorPinOdds.score, 
+                score: formatScoreText(monitorPinOdds.score), 
                 time: monitorPinOdds.time,   
                 moneyline: monitorPinOdds.moneyline,
                 totals: monitorPinOdds.totals

@@ -8,6 +8,13 @@
 - **Drift configurable en Booky:** `BOOKY_LIVE_MAX_ODD_DRIFT` y `BOOKY_PREMATCH_MAX_ODD_DRIFT` leídos desde entorno.
 - **Aliases operativos nuevos:** `gimpo citizen -> gimpo`, `university of macau -> universidade de macau`.
 
+## [2026-03-24] Diagnóstico LIVE + Requote UX + Monitor PIN/ALT
+- **Diagnóstico LIVE estructurado:** se agregó bitácora de decisiones y endpoint `GET /api/opportunities/live/diagnostics` con pipeline y motivos.
+- **Diagnóstico pre-oportunidad LIVE_SNIPE:** ahora se cuentan descartes por causa (`ev_non_positive`, `stake_below_1`, `real_prob_invalid`, etc.) para no depender solo de logs sueltos.
+- **Requote provider code=4:** backend preserva `BOOKY_PLACEWIDGET_REQUOTE_REQUIRED` y frontend deja de mostrar rechazo genérico.
+- **Reintento inmediato por re-quote:** UI ofrece reintentar al instante (máximo 1 auto-retry), respetando `confirm-fast` en `LIVE_SNIPE` y `confirm` en el resto.
+- **Monitor de marcador:** se eliminan `0-0`/`?-?` espurios por coerción nula, se agrega badge `DESYNC` y modo `STALE` para micro-cortes de Pinnacle.
+
 ## [Frontend] App.jsx
 - **Fix Visual (Odds):** Se modificó la tarjeta de oportunidad para priorizar `op.price` (la cuota de Altenar/DoradoBet) en lugar de `op.odd`. Esto corrige el bug donde salía `0.00`.
 - **Fix Tabs:** Se separó la lógica de filtrado. "Live" muestra solo `LIVE_VALUE` y `Pre-match` muestra solo `PREMATCH_VALUE`. "Todos" muestra ambos.

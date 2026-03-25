@@ -7,6 +7,77 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.18] -- 2026-03-24 -- Sprint: Live Diagnostics Deep Dive + Requote UX + Monitor Score Integrity
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Diagnostico LIVE consultable por API
+- **`src/services/scannerService.js`**:
+  - Se agrega bitacora estructurada de decisiones live (`triggered`, `not-triggered`, `no-opportunities`) con motivos y metadatos (`ev`, `kellyStake`, `placementMode`, `ticketId`).
+  - Se incluye persistencia opcional en `data/live_opportunity_decisions.jsonl`.
+  - Nuevos knobs de entorno:
+    - `LIVE_DIAG_MAX_ENTRIES`
+    - `LIVE_DIAG_PERSIST_FILE`
+
+- **`src/routes/opportunities.js`**:
+  - Nuevo endpoint `GET /api/opportunities/live/diagnostics` para consultar:
+    - estado del pipeline (`raw/dedup/stable/final`),
+    - breakdown de razones,
+    - eventos recientes.
+
+#### Diagnostico pre-oportunidad en LIVE_SNIPE
+- **`src/services/liveScannerService.js`**:
+  - Se incorpora contador por ciclo para candidatos LIVE_SNIPE y motivos de descarte antes de `opportunities.push()`.
+  - Nuevo getter `getLiveSnipeScanDiagnostics()` expuesto en el endpoint de diagnostics.
+  - Razones auditables añadidas: `real_prob_invalid`, `require_pinnacle_live_failed`, `altenar_odd_invalid`, `ev_invalid`, `ev_non_positive`, `stake_below_1`, `details_missing`, `details_error`, `pushed`.
+
+### 🔄 Changed
+
+#### Requote provider code=4: clasificación y UX correctas
+- **`src/services/bookySemiAutoService.js`**:
+  - Se preserva `BOOKY_PLACEWIDGET_REQUOTE_REQUIRED` en capa de retry (no se degrada a rechazo genérico).
+  - `providerCode=4` mantiene semántica de re-quote/selección cambiante.
+
+- **`client/src/App.jsx`**:
+  - Manejo explícito de `BOOKY_REAL_REQUOTE_REQUIRED` con mensaje accionable en UI.
+  - Se agrega flujo de reintento inmediato guiado (confirmación del usuario) con límite de 1 intento para evitar bucles.
+  - El reintento respeta modo de confirmación por estrategia:
+    - `confirm-fast` para `LIVE_SNIPE`
+    - `confirm` para el resto.
+
+#### Integridad de marcador PIN vs ALT en monitor
+- **`src/services/pinnacleService.js`** y **`src/services/liveValueScanner.js`**:
+  - Parseo de score estricto para evitar coerción `null -> 0` y prevenir `0-0` falsos.
+  - Normalización de score en payload de monitor para no serializar marcadores vacíos/ambiguos.
+
+- **`client/src/components/MonitorDashboard.jsx`**:
+  - Se elimina fallback visual engañoso a `0-0` cuando PIN no trae score real.
+  - Se agrega etiqueta `DESYNC` cuando ambos marcadores existen y difieren.
+  - Se agrega `sticky` temporal frontend y badge `STALE` para micro-cortes de feed.
+
+### 🐛 Fixed
+
+#### Caso de apuestas reales con HTTP 200 pero error funcional provider
+- `providerStatus=200 + providerCode=4` ahora se informa como re-quote (no rechazo definitivo), con trazabilidad de `requestId` y sugerencia de repreparar.
+
+#### Diagnostico ambiguo de "no oportunidades"
+- Se corrige ceguera operacional donde solo se veía `finalCount=0` sin razones; ahora el endpoint expone causas pre-filtro de LIVE_SNIPE y razones de no-trigger.
+
+#### Marcadores PIN en `?`/`0-0` espurios
+- Se evita mostrar score inválido cuando falta tick puntual de Pinnacle, manteniendo último dato útil por ventana corta y señalizando `STALE`.
+
+### 🧪 Validated
+
+- Verificación en runtime de endpoint:
+  - `GET /api/opportunities/live/diagnostics?limit=60` devolviendo `pipeline.at` activo + `liveSnipeDiagnostics.reasonCounts`.
+- Confirmación de causas reales observadas en sesión:
+  - `ev_non_positive` dominante,
+  - `stake_below_1` secundario,
+  - `pushed=0` en ciclos auditados.
+- Sin errores estáticos en archivos modificados (`App.jsx`, `bookySemiAutoService.js`, `liveScannerService.js`, `scannerService.js`).
+
 ## [v3.4.17] -- 2026-03-22 -- Sprint: Finalizados REAL Full-History + Auto-Snipe Requote + SIM/REAL Reconciliation Hardening
 
 > Rama: `master`
