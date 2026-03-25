@@ -705,6 +705,17 @@ const postPlaceWidgetWithRetry = async ({ draft, auth, ticketId, fastMode = fals
     );
   }
 
+  if (lastError?.code === 'BOOKY_PLACEWIDGET_REQUOTE_REQUIRED') {
+    throw createBookyError(
+      `placeWidget requiere re-quote (HTTP ${statusCode})${fastMode ? ' [fast]' : ''}.`,
+      {
+        statusCode,
+        code: 'BOOKY_PLACEWIDGET_REQUOTE_REQUIRED',
+        diagnostic
+      }
+    );
+  }
+
   throw createBookyError(
     `placeWidget rechazó la apuesta (HTTP ${statusCode})${fastMode ? ' [fast]' : ''}.`,
     {

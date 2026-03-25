@@ -1,5 +1,5 @@
 import express from 'express';
-import { getCachedLiveOpportunities, discardOpportunity, getDiscardedIds } from '../services/scannerService.js';
+import { getCachedLiveOpportunities, discardOpportunity, getDiscardedIds, getLiveDecisionDiagnostics } from '../services/scannerService.js';
 import { scanPrematchOpportunities } from '../services/prematchScannerService.js';
 import db from '../db/database.js';
 
@@ -121,6 +121,18 @@ router.get('/live', async (req, res) => {
       count: result.data.length,
       data: result.data
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/opportunities/live/diagnostics
+// Retorna razones de auto-snipe/no-auto y métricas de pipeline live.
+router.get('/live/diagnostics', async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+    const result = getLiveDecisionDiagnostics({ limit });
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

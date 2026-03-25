@@ -2,9 +2,11 @@ import altenarClient from '../config/axiosClient.js';
 import db, { initDB } from '../db/database.js';
 // [MOD] Importamos AMBAS estrategias
 import { scanLiveOpportunities as performValueScan, getLiveOverview } from './liveValueScanner.js';
-import { scanLiveOpportunities as performTurnaroundScan } from './liveScannerService.js'; 
+import { scanLiveOpportunities as performTurnaroundScan, getLiveSnipeScanDiagnostics } from './liveScannerService.js'; 
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 import { prepareSemiAutoTicket, confirmSemiAutoTicket, confirmRealPlacementFast } from './bookySemiAutoService.js';
+import fs from 'fs';
+import path from 'path';
 
 const parseBooleanFromEnv = (rawValue, fallback = false) => {
     if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
@@ -60,10 +62,48 @@ const AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(
     true
 );
 const BOOKY_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(process.env.BOOKY_REAL_PLACEMENT_ENABLED, false);
+const LIVE_DIAG_MAX_ENTRIES = parsePositiveIntOr(process.env.LIVE_DIAG_MAX_ENTRIES, 1000);
+const LIVE_DIAG_PERSIST_FILE = parseBooleanFromEnv(process.env.LIVE_DIAG_PERSIST_FILE, true);
+const LIVE_DIAG_FILE = path.resolve('data', 'live_opportunity_decisions.jsonl');
 
 const autoSnipeInFlight = new Set();
 const autoSnipeLastAttemptAt = new Map();
 const autoSnipePlacedAtHistory = [];
+const liveDecisionLog = [];
+let lastLivePipelineStats = {
+    at: null,
+    liveEventCount: 0,
+    rawCount: 0,
+    dedupCount: 0,
+    stableCount: 0,
+    finalCount: 0,
+    activeLiveBets: 0,
+    pollMode: 'idle'
+};
+
+const appendLiveDecisionLog = (entry = {}) => {
+    const payload = {
+        at: new Date().toISOString(),
+        ...entry
+    };
+
+    liveDecisionLog.push(payload);
+    if (liveDecisionLog.length > LIVE_DIAG_MAX_ENTRIES) {
+        liveDecisionLog.splice(0, liveDecisionLog.length - LIVE_DIAG_MAX_ENTRIES);
+    }
+
+    if (LIVE_DIAG_PERSIST_FILE) {
+        fs.appendFile(LIVE_DIAG_FILE, `${JSON.stringify(payload)}\n`, () => {});
+    }
+};
+
+const recordLivePipelineStats = (stats = {}) => {
+    lastLivePipelineStats = {
+        ...lastLivePipelineStats,
+        ...stats,
+        at: new Date().toISOString()
+    };
+};
 
 // Helper: Generar ID único por oportunidad (eventId + selection)
 // Debe coincidir con la función del frontend
@@ -533,6 +573,16 @@ export const startBackgroundScanner = () => {
                 }
             }
 
+            recordLivePipelineStats({
+                liveEventCount,
+                rawCount: rawOps.length,
+                dedupCount,
+                stableCount,
+                finalCount: ops.length,
+                activeLiveBets,
+                pollMode
+            });
+
             // C) AUTO-TRADING LIVE (Detectar entrada)
             if (ops && ops.length > 0) {
                  console.log(`   🎯 Oportunidades LIVE encontradas: ${ops.length}`);
@@ -541,6 +591,19 @@ export const startBackgroundScanner = () => {
                     // Si AUTO_SNIPE está activo, solo ejecuta LIVE_SNIPE/LA_VOLTEADA con guardas.
                     const autoResult = await maybeRunAutoSnipe(op);
                     if (autoResult?.triggered) {
+                        appendLiveDecisionLog({
+                            type: String(op?.type || op?.strategy || 'UNKNOWN').toUpperCase(),
+                            eventId: op?.eventId || op?.id || null,
+                            match: op?.match || null,
+                            selection: op?.selection || op?.action || null,
+                            ev: Number(op?.ev || 0),
+                            kellyStake: Number(op?.kellyStake || 0),
+                            decision: 'triggered',
+                            outcome: autoResult?.outcome || (autoResult?.dryRun ? 'dry-run' : 'triggered'),
+                            reason: autoResult?.reason || null,
+                            ticketId: autoResult?.ticketId || null,
+                            placementMode: autoResult?.placementMode || (BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim')
+                        });
                         if (autoResult.dryRun) {
                             console.log(`      🤖 AUTO_SNIPE (dry-run): ${op.match}`);
                         } else if (autoResult.outcome === 'confirmed') {
@@ -554,10 +617,34 @@ export const startBackgroundScanner = () => {
                         }
                     } else {
                         const reason = autoResult?.reason || 'manual-default';
+                        appendLiveDecisionLog({
+                            type: String(op?.type || op?.strategy || 'UNKNOWN').toUpperCase(),
+                            eventId: op?.eventId || op?.id || null,
+                            match: op?.match || null,
+                            selection: op?.selection || op?.action || null,
+                            ev: Number(op?.ev || 0),
+                            kellyStake: Number(op?.kellyStake || 0),
+                            decision: 'not-triggered',
+                            outcome: 'manual',
+                            reason,
+                            placementMode: BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim'
+                        });
                         console.log(`      👀 Oportunidad detectada (Esperando confirmación manual): ${op.match} | reason=${reason}`);
                     }
                 }
             } else {
+                 appendLiveDecisionLog({
+                    decision: 'no-opportunities',
+                    outcome: 'none',
+                    reason: 'empty-final-op-list',
+                    pipeline: {
+                        liveEventCount,
+                        rawCount: rawOps.length,
+                        dedupCount,
+                        stableCount,
+                        finalCount: ops.length
+                    }
+                 });
                  if(ticks % 2 === 0) console.log(`   ... Escaneo Live completado. Sin oportunidades (nuevas).`);
             }
 
@@ -643,6 +730,43 @@ export const getCachedLiveOpportunities = () => {
     return {
         timestamp: lastScanTime,
         data: filtered
+    };
+};
+
+export const getLiveDecisionDiagnostics = ({ limit = 200 } = {}) => {
+    const safeLimit = Math.max(1, Math.min(2000, Number(limit) || 200));
+    const recent = liveDecisionLog.slice(-safeLimit);
+
+    const reasonBreakdown = {};
+    for (const row of recent) {
+        const key = String(row?.reason || row?.outcome || 'unknown');
+        reasonBreakdown[key] = (reasonBreakdown[key] || 0) + 1;
+    }
+
+    return {
+        generatedAt: new Date().toISOString(),
+        scanner: {
+            autoSnipeEnabled: AUTO_SNIPE_ENABLED,
+            autoSnipeDryRun: AUTO_SNIPE_DRY_RUN,
+            bookyRealPlacementEnabled: BOOKY_REAL_PLACEMENT_ENABLED,
+            minEvPercent: AUTO_SNIPE_MIN_EV_PERCENT,
+            minStakeSol: AUTO_SNIPE_MIN_STAKE_SOL,
+            maxBetsPerHour: AUTO_SNIPE_MAX_BETS_PER_HOUR,
+            cooldownPerPickMs: AUTO_SNIPE_COOLDOWN_PER_PICK_MS,
+            reentryMinOddImprovementPct: AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT,
+            reentryMinOddPoints: AUTO_SNIPE_REENTRY_MIN_ODD_POINTS,
+            maxEntriesPerPick: AUTO_SNIPE_MAX_ENTRIES_PER_PICK,
+            liveGlobalStabilityEnabled: LIVE_GLOBAL_STABILITY_ENABLED,
+            liveGlobalStabilityMinHits: QUOTE_STABILITY_MIN_HITS
+        },
+        pipeline: lastLivePipelineStats,
+        liveSnipeDiagnostics: getLiveSnipeScanDiagnostics(),
+        summary: {
+            totalStored: liveDecisionLog.length,
+            returned: recent.length,
+            reasonBreakdown
+        },
+        recent
     };
 };
 

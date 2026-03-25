@@ -58,6 +58,20 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 - Drift de odds en confirmación Booky pasa a ser configurable por entorno (`BOOKY_LIVE_MAX_ODD_DRIFT`, `BOOKY_PREMATCH_MAX_ODD_DRIFT`).
 - Detalle completo en [CHANGELOG.md](CHANGELOG.md), entrada `v3.4.17`.
 
+### Actualización 2026-03-24 (v3.4.18)
+
+- Nuevo endpoint de diagnóstico live: `GET /api/opportunities/live/diagnostics` con pipeline (`raw/dedup/stable/final`), razones agregadas y eventos recientes.
+- LIVE_SNIPE ahora expone razones pre-oportunidad (por ejemplo `ev_non_positive`, `stake_below_1`, `real_prob_invalid`) para auditoría real de por qué no entra una señal.
+- Requote de provider (`providerCode=4`) corregido end-to-end:
+  - Backend preserva `BOOKY_PLACEWIDGET_REQUOTE_REQUIRED`.
+  - Frontend muestra mensaje específico de re-quote y permite reintento inmediato guiado.
+- Integridad de marcador en monitor reforzada:
+  - eliminación de `0-0` falsos,
+  - normalización de score,
+  - etiqueta `DESYNC`,
+  - fallback `STALE` en micro-cortes de feed.
+- Detalle completo en [CHANGELOG.md](CHANGELOG.md), entrada `v3.4.18`.
+
 ### 1) Arcadia Gateway: auto-refresh estable y sin bucles
 
 - `server.js` ahora puede levantar `services/pinnacleGateway.js` automáticamente (`PINNACLE_GATEWAY_AUTOSTART=true`).
