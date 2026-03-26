@@ -7,6 +7,56 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.19] -- 2026-03-26 -- Sprint: Finalizados REAL Clarity + Score Consistency + Alias Expansion
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Hidratación de score en Finalizados REAL
+- **`client/src/App.jsx`**:
+  - Se agrega resolución robusta de marcador final con fallback por `eventId` y por `match` para filas hermanas del mismo partido.
+  - Cuando una fila no trae score propio (`?-?`), reutiliza un score válido del mismo evento para evitar inconsistencias visuales.
+
+#### Expansión de aliases dinámicos para matcher
+- **`src/utils/dynamicAliases.json`**:
+  - Se amplía significativamente el catálogo de aliases para mejorar matching internacional (ligas menores, variantes ortográficas y selecciones U21).
+  - Se incluyen equivalencias nuevas para equipos/ligas con variantes frecuentes en feed ALT/PIN.
+
+### 🔄 Changed
+
+#### Etiqueta de fuente en Finalizados
+- **`client/src/App.jsx`**:
+  - La pastilla de fuente deja de marcar como `SIM` a filas reales locales.
+  - Nuevo criterio visual:
+    - `BOOKY` para historial remoto,
+    - `REAL` para historial real local,
+    - `SIM` solo para simulado real.
+
+#### Ticket ID visible en historial real local
+- **`client/src/App.jsx`**:
+  - En pestaña Finalizados, el `Ticket <providerBetId>` ahora también se muestra para filas `isRealHistory` (no solo `isBookyHistory`).
+
+### 🐛 Fixed
+
+#### Falso `SIM` en apuestas reales finalizadas
+- Se corrige confusión de estado donde apuestas reales locales aparecían como simuladas.
+
+#### Inconsistencia de marcador en el mismo partido (`1-1` vs `?-?`)
+- Se elimina discrepancia visual causada por fuentes heterogéneas entre historial local y remoto.
+
+#### Ticket oculto en segunda entrada real
+- Se corrige condición de render que ocultaba `providerBetId` en entradas reales locales dentro de Finalizados.
+
+### 🧪 Validated
+
+- Build de frontend exitoso tras cambios de UI:
+  - `npm --prefix client run build`.
+- Verificación manual sobre casos reportados:
+  - Etiqueta `REAL` en filas reales locales,
+  - score consistente en entradas del mismo evento,
+  - ticket visible en ambas entradas reales cuando existe `providerBetId`.
+
 ## [v3.4.18] -- 2026-03-24 -- Sprint: Live Diagnostics Deep Dive + Requote UX + Monitor Score Integrity
 
 > Rama: `master`

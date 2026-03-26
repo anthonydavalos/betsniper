@@ -49,6 +49,17 @@
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-03-26 (v3.4.19)
+
+- Finalizados ahora diferencia correctamente la fuente de ejecución:
+  - `BOOKY` para remoto,
+  - `REAL` para real local,
+  - `SIM` solo para simulado.
+- Se corrigió inconsistencia visual de marcador en filas del mismo partido (`1-1` vs `?-?`) mediante fallback de score por `eventId`/`match`.
+- En pestaña Finalizados, el `Ticket <providerBetId>` ya se muestra también para filas reales locales (`isRealHistory`).
+- Se expandió `src/utils/dynamicAliases.json` con aliases adicionales para mejorar matching (variantes ortográficas, ligas menores y U21).
+- Detalle completo en [CHANGELOG.md](CHANGELOG.md), entrada `v3.4.19`.
+
 ### Actualización 2026-03-22 (v3.4.17)
 
 - Finalizados REAL ahora soporta historial completo sin truncamiento por ventana corta (`historyLimit=0`) y con hidratación forzada inicial en pestaña FINISHED.
