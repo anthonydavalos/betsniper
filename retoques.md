@@ -1,5 +1,11 @@
 # Registro de Retoques y Correcciones
 
+## [2026-03-26] Finalizados REAL: fuente/ticket/score + aliases matcher
+- **Etiqueta correcta de ejecución:** en Finalizados, las filas reales locales ya no aparecen como `SIM`; ahora se distinguen `BOOKY`, `REAL` y `SIM`.
+- **Ticket visible en real local:** se corrige condición de UI para mostrar `Ticket <providerBetId>` también en filas `isRealHistory`.
+- **Score consistente entre entradas del mismo evento:** se añade fallback por `eventId`/`match` para evitar casos `1-1` vs `?-?` en el mismo partido.
+- **Aliases dinámicos ampliados:** `src/utils/dynamicAliases.json` incorpora nuevas equivalencias (incluye variantes internacionales y U21) para reducir no-match por nombre.
+
 ## [2026-03-22] Finalizados REAL + Auto-Snipe + Cache History
 - **Finalizados REAL sin truncamiento:** se habilitó `historyLimit=0` en `/api/booky/account`, con hidratación completa en pestaña Finalizados REAL y bypass de caché parcial cuando se pide `fetchAll`.
 - **Filtro por fecha robusto en snapshot:** `getBookyAccountSnapshot()` ahora filtra por `BOOKY_CASHFLOW_FROM_DATE` / `BOOKY_FINISHED_FROM_DATE` sobre historial completo antes de aplicar recorte.

@@ -102,6 +102,30 @@ const normalizeScoreText = (value) => {
     return clean;
 };
 
+const isMissingScoreText = (value) => {
+    const normalized = normalizeScoreText(value);
+    if (!normalized) return true;
+    const compact = normalized.replace(/\s+/g, '');
+    return compact === '?-?' || compact === '?' || compact === '-';
+};
+
+const resolveBestScoreText = (...rows) => {
+    for (const row of rows) {
+        if (!row || typeof row !== 'object') continue;
+        const candidates = [
+            row?.finalScore,
+            row?.lastKnownScore,
+            Array.isArray(row?.score) ? row.score.join(' - ') : row?.score,
+            resolveBookyFinalScore(row)
+        ];
+        for (const candidate of candidates) {
+            const normalized = normalizeScoreText(candidate);
+            if (!isMissingScoreText(normalized)) return normalized;
+        }
+    }
+    return null;
+};
+
 const resolveBookyFinalScore = (row = {}) => {
     const fromSelectionRaw = row?.selections?.[0]?.raw?.eventScore;
     const fromRawSelection = row?.raw?.selections?.[0]?.eventScore;
@@ -2227,7 +2251,34 @@ function App() {
         const allRealFinished = [...realHistoryFromPortfolio, ...realHistoryFromRemote]
             .sort((a,b) => new Date(b.date) - new Date(a.date));
 
-        return allRealFinished.filter(op => isSameDay(new Date(op.date), dateFilter));
+        const scoreFallbackByEventOrMatch = new Map();
+        allRealFinished.forEach((row) => {
+            const score = resolveBestScoreText(row);
+            if (!score) return;
+            const eventKey = row?.eventId ? `event:${String(row.eventId).trim()}` : null;
+            const matchKey = row?.match ? `match:${String(row.match).trim().toLowerCase()}` : null;
+            if (eventKey && !scoreFallbackByEventOrMatch.has(eventKey)) scoreFallbackByEventOrMatch.set(eventKey, score);
+            if (matchKey && !scoreFallbackByEventOrMatch.has(matchKey)) scoreFallbackByEventOrMatch.set(matchKey, score);
+        });
+
+        const allRealFinishedHydrated = allRealFinished.map((row) => {
+            const ownScore = resolveBestScoreText(row);
+            if (ownScore) return row;
+            const eventKey = row?.eventId ? `event:${String(row.eventId).trim()}` : null;
+            const matchKey = row?.match ? `match:${String(row.match).trim().toLowerCase()}` : null;
+            const fallbackScore =
+                (eventKey ? scoreFallbackByEventOrMatch.get(eventKey) : null) ||
+                (matchKey ? scoreFallbackByEventOrMatch.get(matchKey) : null) ||
+                null;
+            if (!fallbackScore) return row;
+            return {
+                ...row,
+                finalScore: row?.finalScore || fallbackScore,
+                lastKnownScore: row?.lastKnownScore || fallbackScore
+            };
+        });
+
+        return allRealFinishedHydrated.filter(op => isSameDay(new Date(op.date), dateFilter));
   };
 
   const getOpenBookyRemoteBets = () => {
@@ -2919,7 +2970,7 @@ function App() {
                                         (isReallyLiveType || hasTrustedVisualLiveClock || isInPlayNow);
                                     const ticketIdForRow = resolveOpTicketId(betData) || resolveOpTicketId(op);
                                     const showTicketId = Boolean(
-                                        ticketIdForRow && !(activeTab === 'FINISHED' && !op.isBookyHistory)
+                                        ticketIdForRow && !(activeTab === 'FINISHED' && !op.isBookyHistory && !op.isRealHistory)
                                     );
                                     const eventStartIsoFromHistory = ticketIdForRow
                                         ? (bookyEventStartIsoByProvider.get(String(ticketIdForRow)) || null)
@@ -3066,7 +3117,7 @@ function App() {
                                                     </div>
                                                     {/* SCORE BELOW FIN */}
                                                      <span className="font-mono font-bold text-slate-300 text-xs pl-0.5">
-                                                        {betData.finalScore || betData.lastKnownScore || betData.score || '?-?'}
+                                                                          {resolveBestScoreText(betData, op) || '?-?'}
                                                      </span>
                                                      {/* HORA DE APUESTA */}
                                                      <span className="text-[9px] text-slate-400 leading-tight" title="Hora de Apuesta">
@@ -3423,9 +3474,11 @@ function App() {
                                                     <span className={`text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border mb-1 ${
                                                         op.isBookyHistory
                                                             ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                                                            : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+                                                            : op.isRealHistory
+                                                                ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                                                                : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
                                                     }`}>
-                                                        {op.isBookyHistory ? 'BOOKY' : 'SIM'}
+                                                        {op.isBookyHistory ? 'BOOKY' : (op.isRealHistory ? 'REAL' : 'SIM')}
                                                     </span>
                                                     {op.isBookyHistory ? (
                                                         (() => {
