@@ -1,5 +1,12 @@
 import express from 'express';
-import { getCachedLiveOpportunities, discardOpportunity, getDiscardedIds, getLiveDecisionDiagnostics } from '../services/scannerService.js';
+import {
+  getCachedLiveOpportunities,
+  discardOpportunity,
+  getDiscardedIds,
+  getLiveDecisionDiagnostics,
+  getAutoPlacementProvider,
+  setAutoPlacementProvider
+} from '../services/scannerService.js';
 import { scanPrematchOpportunities } from '../services/prematchScannerService.js';
 import db from '../db/database.js';
 
@@ -135,6 +142,32 @@ router.get('/live/diagnostics', async (req, res) => {
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/opportunities/live/placement-provider
+// Muestra proveedor activo de auto-placement (booky|pinnacle).
+router.get('/live/placement-provider', async (_req, res) => {
+  try {
+    res.json({
+      success: true,
+      provider: getAutoPlacementProvider(),
+      allowed: ['booky', 'pinnacle']
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/opportunities/live/placement-provider
+// Cambia proveedor activo en caliente sin reiniciar backend.
+router.post('/live/placement-provider', async (req, res) => {
+  try {
+    const provider = String(req.body?.provider || '').trim().toLowerCase();
+    const result = setAutoPlacementProvider(provider);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
   }
 });
 

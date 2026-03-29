@@ -5,6 +5,11 @@ import { scanLiveOpportunities as performValueScan, getLiveOverview } from './li
 import { scanLiveOpportunities as performTurnaroundScan, getLiveSnipeScanDiagnostics } from './liveScannerService.js'; 
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 import { prepareSemiAutoTicket, confirmSemiAutoTicket, confirmRealPlacementFast } from './bookySemiAutoService.js';
+import {
+    preparePinnacleSemiAutoTicket,
+    confirmPinnacleSemiAutoTicket,
+    confirmPinnacleRealPlacementFast
+} from './pinnacleSemiAutoService.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -40,6 +45,12 @@ const parseAllowedOpportunityTypes = (rawValue, fallback = []) => {
         .map((v) => String(v).trim().toUpperCase())
         .filter(Boolean);
     return values.length > 0 ? values : [...fallback];
+};
+
+const parsePlacementProvider = (rawValue, fallback = 'booky') => {
+    const normalized = String(rawValue || '').trim().toLowerCase();
+    if (normalized === 'booky' || normalized === 'pinnacle') return normalized;
+    return fallback;
 };
 
 // =====================================================================
@@ -78,6 +89,9 @@ const AUTO_PLACEMENT_ALLOWED_TYPES = parseAllowedOpportunityTypes(
 );
 const AUTO_PLACEMENT_ALLOWED_TYPES_SET = new Set(AUTO_PLACEMENT_ALLOWED_TYPES);
 const BOOKY_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(process.env.BOOKY_REAL_PLACEMENT_ENABLED, false);
+const PINNACLE_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(process.env.PINNACLE_REAL_PLACEMENT_ENABLED, false);
+const AUTO_PLACEMENT_PROVIDER_OPTIONS = ['booky', 'pinnacle'];
+let runtimeAutoPlacementProvider = parsePlacementProvider(process.env.AUTO_PLACEMENT_PROVIDER, 'booky');
 const LIVE_DIAG_MAX_ENTRIES = parsePositiveIntOr(process.env.LIVE_DIAG_MAX_ENTRIES, 1000);
 const LIVE_DIAG_PERSIST_FILE = parseBooleanFromEnv(process.env.LIVE_DIAG_PERSIST_FILE, true);
 const LIVE_DIAG_FILE = path.resolve('data', 'live_opportunity_decisions.jsonl');
@@ -163,6 +177,32 @@ const isAutoSnipeOpportunity = (op = {}) => {
     return AUTO_PLACEMENT_ALLOWED_TYPES_SET.has(type);
 };
 
+const isRealPlacementEnabledForProvider = (provider = 'booky') => {
+    const normalized = parsePlacementProvider(provider, 'booky');
+    if (normalized === 'pinnacle') return PINNACLE_REAL_PLACEMENT_ENABLED;
+    return BOOKY_REAL_PLACEMENT_ENABLED;
+};
+
+const buildPlacementMode = ({ provider = 'booky', realEnabled = false } = {}) => {
+    const p = parsePlacementProvider(provider, 'booky');
+    return `${p}-${realEnabled ? 'real' : 'sim'}`;
+};
+
+export const getAutoPlacementProvider = () => runtimeAutoPlacementProvider;
+
+export const setAutoPlacementProvider = (providerRaw = '') => {
+    const normalized = String(providerRaw || '').trim().toLowerCase();
+    if (!AUTO_PLACEMENT_PROVIDER_OPTIONS.includes(normalized)) {
+        throw new Error(`Proveedor inválido: ${providerRaw}. Usa ${AUTO_PLACEMENT_PROVIDER_OPTIONS.join(', ')}.`);
+    }
+    runtimeAutoPlacementProvider = normalized;
+    return {
+        provider: runtimeAutoPlacementProvider,
+        updatedAt: new Date().toISOString(),
+        allowed: AUTO_PLACEMENT_PROVIDER_OPTIONS
+    };
+};
+
 const pruneAutoSnipeState = () => {
     const now = Date.now();
     const oneHourAgo = now - (60 * 60 * 1000);
@@ -182,8 +222,11 @@ const maybeRunAutoSnipe = async (opportunity) => {
     if (!AUTO_SNIPE_ENABLED) return { triggered: false, reason: 'disabled' };
     if (!isAutoSnipeOpportunity(opportunity)) return { triggered: false, reason: 'type-not-enabled' };
 
-    if (AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED && !BOOKY_REAL_PLACEMENT_ENABLED) {
-        return { triggered: false, reason: 'booky-real-disabled' };
+    const placementProvider = getAutoPlacementProvider();
+    const providerRealEnabled = isRealPlacementEnabledForProvider(placementProvider);
+
+    if (AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED && !providerRealEnabled) {
+        return { triggered: false, reason: `${placementProvider}-real-disabled`, placementProvider };
     }
 
     pruneAutoSnipeState();
@@ -258,18 +301,24 @@ const maybeRunAutoSnipe = async (opportunity) => {
             return { triggered: true, dryRun: true };
         }
 
-        const placementMode = BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim';
+        const placementMode = buildPlacementMode({ provider: placementProvider, realEnabled: providerRealEnabled });
         const runPlacementOnce = async () => {
-            const ticket = await prepareSemiAutoTicket(opportunity);
+            const ticket = placementProvider === 'pinnacle'
+                ? await preparePinnacleSemiAutoTicket(opportunity)
+                : await prepareSemiAutoTicket(opportunity);
             const ticketId = ticket?.id;
             ticketIdForLog = ticketId || 'n/a';
             if (!ticketId) {
                 return { ok: false, reason: 'ticket-missing-id' };
             }
 
-            const placementResult = BOOKY_REAL_PLACEMENT_ENABLED
-                ? await confirmRealPlacementFast(ticketId)
-                : await confirmSemiAutoTicket(ticketId);
+            const placementResult = placementProvider === 'pinnacle'
+                ? (providerRealEnabled
+                    ? await confirmPinnacleRealPlacementFast(ticketId)
+                    : await confirmPinnacleSemiAutoTicket(ticketId))
+                : (providerRealEnabled
+                    ? await confirmRealPlacementFast(ticketId)
+                    : await confirmSemiAutoTicket(ticketId));
             return { ok: true, ticketId, placementResult };
         };
 
@@ -295,9 +344,18 @@ const maybeRunAutoSnipe = async (opportunity) => {
             `✅ [AUTO_SNIPE] Resultado final=CONFIRMED mode=${placementMode.toUpperCase()} | ${opportunity.match} (${opportunity.selection}) ` +
             `ticket=${placementAttempt.ticketId} status=${status} portfolioBetId=${portfolioBetId}`
         );
-        return { triggered: true, dryRun: false, ticketId: placementAttempt.ticketId, outcome: 'confirmed', status, portfolioBetId, placementMode };
+        return {
+            triggered: true,
+            dryRun: false,
+            ticketId: placementAttempt.ticketId,
+            outcome: 'confirmed',
+            status,
+            portfolioBetId,
+            placementMode,
+            placementProvider
+        };
     } catch (error) {
-        const placementMode = BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim';
+        const placementMode = buildPlacementMode({ provider: placementProvider, realEnabled: providerRealEnabled });
         const msg = error?.message || 'Error desconocido';
         const code = String(error?.code || '');
 
@@ -306,16 +364,22 @@ const maybeRunAutoSnipe = async (opportunity) => {
         if (isRequote) {
             try {
                 console.warn(`↻ [AUTO_SNIPE] Re-quote detectado. Reintentando una vez con cuota refrescada: ${opportunity?.match || 'n/a'}`);
-                const retryTicket = await prepareSemiAutoTicket(opportunity);
+                const retryTicket = placementProvider === 'pinnacle'
+                    ? await preparePinnacleSemiAutoTicket(opportunity)
+                    : await prepareSemiAutoTicket(opportunity);
                 const retryTicketId = retryTicket?.id;
                 ticketIdForLog = retryTicketId || ticketIdForLog;
                 if (!retryTicketId) {
                     return { triggered: false, reason: 'ticket-missing-id' };
                 }
 
-                const retryResult = BOOKY_REAL_PLACEMENT_ENABLED
-                    ? await confirmRealPlacementFast(retryTicketId)
-                    : await confirmSemiAutoTicket(retryTicketId);
+                const retryResult = placementProvider === 'pinnacle'
+                    ? (providerRealEnabled
+                        ? await confirmPinnacleRealPlacementFast(retryTicketId)
+                        : await confirmPinnacleSemiAutoTicket(retryTicketId))
+                    : (providerRealEnabled
+                        ? await confirmRealPlacementFast(retryTicketId)
+                        : await confirmSemiAutoTicket(retryTicketId));
 
                 autoSnipePlacedAtHistory.push(Date.now());
                 const retryStatus = String(retryResult?.ticket?.status || (placementMode === 'real' ? 'REAL_CONFIRMED_FAST' : 'CONFIRMED'));
@@ -332,6 +396,7 @@ const maybeRunAutoSnipe = async (opportunity) => {
                     status: retryStatus,
                     portfolioBetId: retryPortfolioBetId,
                     placementMode,
+                    placementProvider,
                     retry: true
                 };
             } catch (retryErr) {
@@ -341,12 +406,21 @@ const maybeRunAutoSnipe = async (opportunity) => {
             }
         }
 
-        if (code === 'BOOKY_REAL_PLACEMENT_REJECTED') {
+        if (code === 'BOOKY_REAL_PLACEMENT_REJECTED' || code === 'PINNACLE_REAL_REJECTED') {
             console.warn(
                 `❌ [AUTO_SNIPE] Resultado final=REJECTED | ${opportunity?.match || 'n/a'} ` +
                 `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
             );
-            return { triggered: true, dryRun: false, outcome: 'rejected', reason: 'provider-rejected', error: msg, code };
+            return {
+                triggered: true,
+                dryRun: false,
+                outcome: 'rejected',
+                reason: 'provider-rejected',
+                error: msg,
+                code,
+                placementMode,
+                placementProvider
+            };
         }
 
         if (code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') {
@@ -354,11 +428,20 @@ const maybeRunAutoSnipe = async (opportunity) => {
                 `❓ [AUTO_SNIPE] Resultado final=UNCERTAIN | ${opportunity?.match || 'n/a'} ` +
                 `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
             );
-            return { triggered: true, dryRun: false, outcome: 'uncertain', reason: 'provider-uncertain', error: msg, code };
+            return {
+                triggered: true,
+                dryRun: false,
+                outcome: 'uncertain',
+                reason: 'provider-uncertain',
+                error: msg,
+                code,
+                placementMode,
+                placementProvider
+            };
         }
 
         console.warn(`⚠️ [AUTO_SNIPE] Falló ejecución para ${opportunity?.match || 'n/a'}: ${msg}`);
-        return { triggered: false, reason: 'execution-error', error: msg };
+        return { triggered: false, reason: 'execution-error', error: msg, placementProvider };
     } finally {
         autoSnipeInFlight.delete(key);
     }
@@ -618,7 +701,11 @@ export const startBackgroundScanner = () => {
                             outcome: autoResult?.outcome || (autoResult?.dryRun ? 'dry-run' : 'triggered'),
                             reason: autoResult?.reason || null,
                             ticketId: autoResult?.ticketId || null,
-                            placementMode: autoResult?.placementMode || (BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim')
+                            placementMode: autoResult?.placementMode || buildPlacementMode({
+                                provider: getAutoPlacementProvider(),
+                                realEnabled: isRealPlacementEnabledForProvider(getAutoPlacementProvider())
+                            }),
+                            placementProvider: autoResult?.placementProvider || getAutoPlacementProvider()
                         });
                         if (autoResult.dryRun) {
                             console.log(`      🤖 AUTO_SNIPE (dry-run): ${op.match}`);
@@ -643,7 +730,11 @@ export const startBackgroundScanner = () => {
                             decision: 'not-triggered',
                             outcome: 'manual',
                             reason,
-                            placementMode: BOOKY_REAL_PLACEMENT_ENABLED ? 'real' : 'sim'
+                            placementMode: buildPlacementMode({
+                                provider: getAutoPlacementProvider(),
+                                realEnabled: isRealPlacementEnabledForProvider(getAutoPlacementProvider())
+                            }),
+                            placementProvider: getAutoPlacementProvider()
                         });
                         console.log(`      👀 Oportunidad detectada (Esperando confirmación manual): ${op.match} | reason=${reason}`);
                     }
@@ -728,8 +819,10 @@ export const startBackgroundScanner = () => {
     console.log(
         `🔄 Background Scanner Iniciado (Modo Seguro Anti-Ban) | ` +
         `AUTO_SNIPE=${AUTO_SNIPE_ENABLED ? 1 : 0} dryRun=${AUTO_SNIPE_DRY_RUN ? 1 : 0} ` +
+        `provider=${getAutoPlacementProvider()} ` +
         `types=${AUTO_PLACEMENT_ALLOWED_TYPES.join(',')} ` +
         `bookyReal=${BOOKY_REAL_PLACEMENT_ENABLED ? 1 : 0} minEV=${AUTO_SNIPE_MIN_EV_PERCENT} ` +
+        `pinnacleReal=${PINNACLE_REAL_PLACEMENT_ENABLED ? 1 : 0} ` +
         `minStake=${AUTO_SNIPE_MIN_STAKE_SOL} hourlyCap=${AUTO_SNIPE_MAX_BETS_PER_HOUR} ` +
         `reentryPct=${AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT}% reentryPts=${AUTO_SNIPE_REENTRY_MIN_ODD_POINTS} ` +
         `maxEntriesPick=${AUTO_SNIPE_MAX_ENTRIES_PER_PICK}`
@@ -765,8 +858,11 @@ export const getLiveDecisionDiagnostics = ({ limit = 200 } = {}) => {
         scanner: {
             autoSnipeEnabled: AUTO_SNIPE_ENABLED,
             autoSnipeDryRun: AUTO_SNIPE_DRY_RUN,
+            autoPlacementProvider: getAutoPlacementProvider(),
+            autoPlacementProviderOptions: AUTO_PLACEMENT_PROVIDER_OPTIONS,
             autoPlacementAllowedTypes: AUTO_PLACEMENT_ALLOWED_TYPES,
             bookyRealPlacementEnabled: BOOKY_REAL_PLACEMENT_ENABLED,
+            pinnacleRealPlacementEnabled: PINNACLE_REAL_PLACEMENT_ENABLED,
             minEvPercent: AUTO_SNIPE_MIN_EV_PERCENT,
             minStakeSol: AUTO_SNIPE_MIN_STAKE_SOL,
             maxBetsPerHour: AUTO_SNIPE_MAX_BETS_PER_HOUR,

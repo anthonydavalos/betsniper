@@ -7,6 +7,43 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.21] -- 2026-03-29 -- Sprint: Auto-Placement Provider Selector (Booky/Pinnacle)
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Selector de proveedor de auto-placement en runtime
+- **`src/services/scannerService.js`**:
+  - Nuevo provider activo para auto-placement (`booky` o `pinnacle`) con parser seguro y fallback.
+  - Nuevos helpers exportados:
+    - `getAutoPlacementProvider()`
+    - `setAutoPlacementProvider(provider)`
+
+#### API para consulta/cambio en caliente
+- **`src/routes/opportunities.js`**:
+  - `GET /api/opportunities/live/placement-provider`
+  - `POST /api/opportunities/live/placement-provider`
+  - Validación estricta de proveedor permitido y respuesta con `allowed`.
+
+### 🔄 Changed
+
+#### Ejecución auto-snipe provider-aware
+- **`src/services/scannerService.js`**:
+  - `maybeRunAutoSnipe` ahora enruta confirmación por proveedor activo.
+  - Guardas de habilitación real se evalúan por proveedor (`BOOKY_REAL_PLACEMENT_ENABLED` vs `PINNACLE_REAL_PLACEMENT_ENABLED`).
+  - Diagnóstico live incluye proveedor activo y lista de proveedores soportados.
+
+### 🧪 Validated
+
+- Sin errores estáticos en archivos modificados:
+  - `src/services/scannerService.js`
+  - `src/routes/opportunities.js`
+- Smoke test en localhost:
+  - GET provider devuelve `booky`/`pinnacle`.
+  - POST provider permite switch en caliente.
+  - POST inválido retorna `400`.
+
 ## [v3.4.20] -- 2026-03-29 -- Sprint: Auto-Placement Multi-Strategy (LIVE_VALUE habilitado) + Alias Wave
 
 > Rama: `master`

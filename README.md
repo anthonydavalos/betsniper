@@ -49,6 +49,13 @@
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-03-29 (v3.4.21)
+
+- Selector de proveedor de auto-placement en runtime (`booky` o `pinnacle`) en `scannerService`.
+- Nuevo endpoint de consulta: `GET /api/opportunities/live/placement-provider`.
+- Nuevo endpoint de cambio en caliente: `POST /api/opportunities/live/placement-provider`.
+- Diagnóstico de arranque/decisión live ahora expone proveedor activo y opciones permitidas.
+
 ### Actualización 2026-03-29 (v3.4.20)
 
 - Auto-placement ahora soporta múltiples estrategias por configuración (`AUTO_SNIPE_ALLOWED_TYPES`), con default activo para `LIVE_SNIPE`, `LA_VOLTEADA` y `LIVE_VALUE`.
@@ -1356,6 +1363,14 @@ El servidor expone los siguientes endpoints REST:
 - **Descripción:** Retorna oportunidades en tiempo real.
 - **Cache:** 5 segundos.
 
+**`GET /api/opportunities/live/placement-provider`**
+- **Descripción:** Retorna el proveedor activo para auto-placement.
+- **Respuesta:** `{ "success": true, "provider": "booky", "allowed": ["booky", "pinnacle"] }`
+
+**`POST /api/opportunities/live/placement-provider`**
+- **Body:** `{ "provider": "booky" }` o `{ "provider": "pinnacle" }`
+- **Descripción:** Cambia el proveedor de auto-placement en caliente, sin reiniciar backend.
+
 **`POST /api/opportunities/discard`**
 - **Body:** `{ "eventId": 123456 }`
 - **Descripción:** Añade evento a blacklist (no volverá a mostrarse).
@@ -1495,6 +1510,7 @@ ALTENAR_SPORT_ID=0
 # BOOKY_MAX_ODD_DROP=0.20
 
 # AUTO_SNIPE (rollout controlado)
+# AUTO_PLACEMENT_PROVIDER=booky
 # AUTO_SNIPE_ENABLED=false
 # AUTO_SNIPE_DRY_RUN=true
 # AUTO_SNIPE_MIN_EV_PERCENT=3
