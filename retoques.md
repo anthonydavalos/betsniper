@@ -1,5 +1,11 @@
 # Registro de Retoques y Correcciones
 
+## [2026-03-29] Auto-ejecución LIVE_VALUE + diagnóstico por tipos + alias wave
+- **Auto-placement multi-strategy:** `scannerService` ahora permite auto-ejecución por lista de tipos (`AUTO_SNIPE_ALLOWED_TYPES`) y deja habilitado por defecto `LIVE_SNIPE, LA_VOLTEADA, LIVE_VALUE`.
+- **Descartes más claros:** cuando una oportunidad no está habilitada por tipo, el motivo pasa a `type-not-enabled` (reemplaza `not-snipe` en ese caso).
+- **Visibilidad operativa:** `GET /api/opportunities/live/diagnostics` incorpora `scanner.autoPlacementAllowedTypes` para validar en runtime qué tipos están activos.
+- **Alias matcher:** expansión adicional en `dynamicAliases.json` para reducir no-match internacional y ajustar casos ambiguos (`gimnasia`, `nacional`, etc.).
+
 ## [2026-03-26] Finalizados REAL: fuente/ticket/score + aliases matcher
 - **Etiqueta correcta de ejecución:** en Finalizados, las filas reales locales ya no aparecen como `SIM`; ahora se distinguen `BOOKY`, `REAL` y `SIM`.
 - **Ticket visible en real local:** se corrige condición de UI para mostrar `Ticket <providerBetId>` también en filas `isRealHistory`.

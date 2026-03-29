@@ -31,6 +31,17 @@ const parsePositiveNumberOr = (value, fallback) => {
     return n > 0 ? n : fallback;
 };
 
+const parseAllowedOpportunityTypes = (rawValue, fallback = []) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return [...fallback];
+    }
+    const values = String(rawValue)
+        .split(',')
+        .map((v) => String(v).trim().toUpperCase())
+        .filter(Boolean);
+    return values.length > 0 ? values : [...fallback];
+};
+
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER" (Background Worker)
 // Estrategia: "La Volteada" (Favorito Pre-match perdiendo por 1 gol)
@@ -61,6 +72,11 @@ const AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(
     process.env.AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED,
     true
 );
+const AUTO_PLACEMENT_ALLOWED_TYPES = parseAllowedOpportunityTypes(
+    process.env.AUTO_SNIPE_ALLOWED_TYPES,
+    ['LIVE_SNIPE', 'LA_VOLTEADA', 'LIVE_VALUE']
+);
+const AUTO_PLACEMENT_ALLOWED_TYPES_SET = new Set(AUTO_PLACEMENT_ALLOWED_TYPES);
 const BOOKY_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(process.env.BOOKY_REAL_PLACEMENT_ENABLED, false);
 const LIVE_DIAG_MAX_ENTRIES = parsePositiveIntOr(process.env.LIVE_DIAG_MAX_ENTRIES, 1000);
 const LIVE_DIAG_PERSIST_FILE = parseBooleanFromEnv(process.env.LIVE_DIAG_PERSIST_FILE, true);
@@ -144,7 +160,7 @@ function getOpportunityId(op) {
 
 const isAutoSnipeOpportunity = (op = {}) => {
     const type = String(op?.type || op?.strategy || '').toUpperCase();
-    return type === 'LIVE_SNIPE' || type === 'LA_VOLTEADA';
+    return AUTO_PLACEMENT_ALLOWED_TYPES_SET.has(type);
 };
 
 const pruneAutoSnipeState = () => {
@@ -164,7 +180,7 @@ const pruneAutoSnipeState = () => {
 
 const maybeRunAutoSnipe = async (opportunity) => {
     if (!AUTO_SNIPE_ENABLED) return { triggered: false, reason: 'disabled' };
-    if (!isAutoSnipeOpportunity(opportunity)) return { triggered: false, reason: 'not-snipe' };
+    if (!isAutoSnipeOpportunity(opportunity)) return { triggered: false, reason: 'type-not-enabled' };
 
     if (AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED && !BOOKY_REAL_PLACEMENT_ENABLED) {
         return { triggered: false, reason: 'booky-real-disabled' };
@@ -588,7 +604,7 @@ export const startBackgroundScanner = () => {
                  console.log(`   🎯 Oportunidades LIVE encontradas: ${ops.length}`);
                 for (const op of ops) {
                     // Modo por defecto: semi-automático.
-                    // Si AUTO_SNIPE está activo, solo ejecuta LIVE_SNIPE/LA_VOLTEADA con guardas.
+                    // Si AUTO_SNIPE está activo, ejecuta los tipos permitidos con guardas.
                     const autoResult = await maybeRunAutoSnipe(op);
                     if (autoResult?.triggered) {
                         appendLiveDecisionLog({
@@ -712,6 +728,7 @@ export const startBackgroundScanner = () => {
     console.log(
         `🔄 Background Scanner Iniciado (Modo Seguro Anti-Ban) | ` +
         `AUTO_SNIPE=${AUTO_SNIPE_ENABLED ? 1 : 0} dryRun=${AUTO_SNIPE_DRY_RUN ? 1 : 0} ` +
+        `types=${AUTO_PLACEMENT_ALLOWED_TYPES.join(',')} ` +
         `bookyReal=${BOOKY_REAL_PLACEMENT_ENABLED ? 1 : 0} minEV=${AUTO_SNIPE_MIN_EV_PERCENT} ` +
         `minStake=${AUTO_SNIPE_MIN_STAKE_SOL} hourlyCap=${AUTO_SNIPE_MAX_BETS_PER_HOUR} ` +
         `reentryPct=${AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT}% reentryPts=${AUTO_SNIPE_REENTRY_MIN_ODD_POINTS} ` +
@@ -748,6 +765,7 @@ export const getLiveDecisionDiagnostics = ({ limit = 200 } = {}) => {
         scanner: {
             autoSnipeEnabled: AUTO_SNIPE_ENABLED,
             autoSnipeDryRun: AUTO_SNIPE_DRY_RUN,
+            autoPlacementAllowedTypes: AUTO_PLACEMENT_ALLOWED_TYPES,
             bookyRealPlacementEnabled: BOOKY_REAL_PLACEMENT_ENABLED,
             minEvPercent: AUTO_SNIPE_MIN_EV_PERCENT,
             minStakeSol: AUTO_SNIPE_MIN_STAKE_SOL,
