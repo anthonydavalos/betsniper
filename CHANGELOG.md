@@ -7,6 +7,54 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.20] -- 2026-03-29 -- Sprint: Auto-Placement Multi-Strategy (LIVE_VALUE habilitado) + Alias Wave
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Auto-placement configurable por tipos de oportunidad
+- **`src/services/scannerService.js`**:
+  - Se agrega parser de entorno para tipos permitidos (`AUTO_SNIPE_ALLOWED_TYPES`) con fallback seguro.
+  - Default operativo ampliado para permitir auto-ejecución de:
+    - `LIVE_SNIPE`
+    - `LA_VOLTEADA`
+    - `LIVE_VALUE`
+
+#### Diagnóstico de tipos permitidos en runtime
+- **`src/services/scannerService.js`**:
+  - `getLiveDecisionDiagnostics()` ahora expone `scanner.autoPlacementAllowedTypes`.
+  - Log de arranque del scanner incluye el set activo de tipos (`types=...`) para auditoría rápida.
+
+### 🔄 Changed
+
+#### Regla de elegibilidad del motor auto
+- **`src/services/scannerService.js`**:
+  - La validación ya no está hardcodeada solo a SNIPE/Volteada.
+  - Ahora evalúa contra la lista configurable de tipos habilitados.
+
+#### Razón de descarte más precisa
+- **`src/services/scannerService.js`**:
+  - `reason=not-snipe` se reemplaza por `reason=type-not-enabled` cuando el tipo de oportunidad no está en la lista permitida.
+
+#### Catálogo de aliases dinámicos expandido
+- **`src/utils/dynamicAliases.json`**:
+  - Nueva ola de aliases para ligas/selecciones internacionales (incluyendo variantes idiomáticas y U21) para mejorar linking PIN vs ALT.
+  - Ajustes de precedencia en aliases ambiguos (`gimnasia`, `nacional`) para reducir cruces erróneos.
+
+### 🐛 Fixed
+
+#### LIVE_VALUE detectadas pero no elegibles por restricción de tipo
+- Se elimina bloqueo estructural del motor auto que impedía ejecutar `LIVE_VALUE` aun con EV/guardas válidas.
+
+### 🧪 Validated
+
+- Import y sintaxis del servicio actualizados correctamente:
+  - `scannerService import ok`.
+- Seguimiento en `data/live_opportunity_decisions.jsonl` confirmando registro multi-tipo (`LIVE_SNIPE` y `LIVE_VALUE`).
+- Auditoría operativa reciente:
+  - `LIVE_VALUE` deja de depender de exclusión por tipo; los bloqueos predominantes observados pasan a ser de guardas (`stake-guard`, `cooldown`, etc.).
+
 ## [v3.4.19] -- 2026-03-26 -- Sprint: Finalizados REAL Clarity + Score Consistency + Alias Expansion
 
 > Rama: `master`

@@ -49,6 +49,15 @@
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-03-29 (v3.4.20)
+
+- Auto-placement ahora soporta múltiples estrategias por configuración (`AUTO_SNIPE_ALLOWED_TYPES`), con default activo para `LIVE_SNIPE`, `LA_VOLTEADA` y `LIVE_VALUE`.
+- Se elimina la restricción hardcodeada que dejaba fuera `LIVE_VALUE` del motor automático.
+- Diagnóstico runtime mejorado: `GET /api/opportunities/live/diagnostics` ahora incluye `scanner.autoPlacementAllowedTypes`.
+- El reason de descarte evoluciona de `not-snipe` a `type-not-enabled` cuando el tipo no está habilitado.
+- Se expandió nuevamente `src/utils/dynamicAliases.json` para fortalecer matching internacional (variantes de nombre/equipo/selección).
+- Detalle completo en [CHANGELOG.md](CHANGELOG.md), entrada `v3.4.20`.
+
 ### Actualización 2026-03-26 (v3.4.19)
 
 - Finalizados ahora diferencia correctamente la fuente de ejecución:
