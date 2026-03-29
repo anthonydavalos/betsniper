@@ -1643,6 +1643,37 @@ El payload capturado se guarda en `data/booky/capture-*.json` y queda disponible
 
 ---
 
+#### Captura de Payload Pinnacle Placement (Fase 1)
+
+Necesario para descubrir el contrato real de Pinnacle (endpoint + request body + respuesta) antes de implementar `pinnacleSemiAutoService`.
+
+| Comando | Modo | Descripción |
+|---|---|---|
+| `npm run capture:pinnacle:placement` | Headed + espera manual | Abre Pinnacle con perfil dedicado, captura requests `POST/PUT/PATCH` candidatos a placement y espera cierre manual del navegador. |
+| `npm run capture:pinnacle:placement:headless` | Headless + timeout 180s | Ejecuta captura automática por ventana de tiempo sin UI. |
+
+**Output de captura:**
+- `data/pinnacle/capture-placement-<timestamp>.json`
+- `data/pinnacle/capture-placement.latest.json`
+
+**Flujo recomendado (seguro):**
+1. Ejecutar `npm run capture:pinnacle:placement`.
+2. En la ventana de Pinnacle, hacer una apuesta manual de prueba hasta el último click de confirmar.
+3. Cerrar navegador para finalizar y persistir captura.
+4. Revisar `capture-placement.latest.json` y extraer:
+  - endpoint exacto,
+  - headers requeridos,
+  - esquema del payload,
+  - semántica de respuesta (confirmado/rechazado/requote).
+
+Tip: si no aparece ningún candidato, repetir con:
+
+```bash
+node scripts/capture-pinnacle-placement.js --headed --wait-close --all-posts
+```
+
+---
+
 #### Spy de Historial y Perfil
 
 | Comando | Descripción |
