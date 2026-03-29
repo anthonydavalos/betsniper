@@ -152,6 +152,7 @@ import portfolioRouter from './src/routes/portfolio.js';
 import matcherRouter from './src/routes/matcher.js';
 import monitorRouter from './src/routes/monitor.js';
 import bookyRouter from './src/routes/booky.js';
+import pinnacleRouter from './src/routes/pinnacle.js';
 
 app.use('/api/opportunities', opportunitiesRouter);
 app.use('/api/portfolio', portfolioRouter);
@@ -169,6 +170,7 @@ if (monitorDashboardEnabled) {
   });
 }
 app.use('/api/booky', bookyRouter);
+app.use('/api/pinnacle', pinnacleRouter);
 
 // Rutas Básicas (API Health Check)
 app.get('/', (req, res) => {

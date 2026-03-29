@@ -31,6 +31,11 @@ const defaultData = {
   booky: {
     pendingTickets: [],
     history: []
+  },
+  // FLUJO SEMI-AUTO PINNACLE (Fase 2)
+  pinnacle: {
+    pendingTickets: [],
+    history: []
   }
 };
 
@@ -152,6 +157,9 @@ export const initDB = async () => {
   if (!db.data.booky) { db.data.booky = { pendingTickets: [], history: [] }; modified = true; }
   if (!db.data.booky.pendingTickets) { db.data.booky.pendingTickets = []; modified = true; }
   if (!db.data.booky.history) { db.data.booky.history = []; modified = true; }
+  if (!db.data.pinnacle) { db.data.pinnacle = { pendingTickets: [], history: [] }; modified = true; }
+  if (!db.data.pinnacle.pendingTickets) { db.data.pinnacle.pendingTickets = []; modified = true; }
+  if (!db.data.pinnacle.history) { db.data.pinnacle.history = []; modified = true; }
   
   // Solo escribir si hubo cambios estructurales (evita trigger nodemon loop)
   if (modified) {
