@@ -71,6 +71,33 @@ Esta sección resume lo implementado desde el último commit para dejar trazabil
 
 Detalle técnico completo en [CHANGELOG.md](CHANGELOG.md), entrada `v3.4.22`.
 
+### SOP Operativo Rápido (v3.4.22)
+
+Checklist recomendado para operación diaria post-release:
+
+1. Verificar cuenta Pinnacle:
+  - `GET /api/pinnacle/account?refresh=1`
+  - Confirmar `balance`, `pnl.total`, `pnl.baseCapital` y `pnl.baseCapitalSource`.
+2. Verificar sync histórico:
+  - `GET /api/pinnacle/history?refresh=1&status=settled&days=180&limit=500`
+  - Confirmar `success=true` y revisar `reconcileStats.touchedCount`.
+3. Verificar UI:
+  - En Auto Placement, seleccionar `PINNACLE`.
+  - Confirmar badge azul (`PINNACLE`) y acción de sync (`SYNC PINNACLE` al hover).
+  - Ejecutar sync manual y validar estado `SYNC...` + mensaje de éxito.
+4. Validar consistencia financiera:
+  - El PnL mostrado para Pinnacle debe seguir: `PnL = balance actual - base de capital externa`.
+5. Monitoreo mínimo:
+  - 1 sync manual diario de control.
+  - Revisar si hay `error` en `transactions` o `history`.
+
+Variables recomendadas para ajustar en producción:
+
+- `PINNACLE_PNL_WINDOW_DAYS`
+- `PINNACLE_PNL_BASE_CAPITAL` (solo fallback)
+- `PINNACLE_HISTORY_DEFAULT_DAYS`
+- `PINNACLE_HISTORY_DEFAULT_STATUS`
+
 ### Actualización 2026-03-29 (v3.4.21)
 
 - Selector de proveedor de auto-placement en runtime (`booky` o `pinnacle`) en `scannerService`.
