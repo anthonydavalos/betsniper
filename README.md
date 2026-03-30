@@ -2158,8 +2158,8 @@ Pull requests son bienvenidos. Para cambios mayores, abre un issue primero para 
 ## 📧 Contacto
 
 - **Autor:** BetSniper Architect
-- **Repositorio:** [GitHub](https://github.com/tu-usuario/betsniper-v3)
-- **Issues:** [Reportar Bug](https://github.com/tu-usuario/betsniper-v3/issues)
+- **Repositorio:** [GitHub](https://github.com/anthonydavalos/betsniper-v3)
+- **Issues:** [Reportar Bug](https://github.com/anthonydavalos/betsniper-v3/issues)
 
 ---
 
