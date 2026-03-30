@@ -49,6 +49,28 @@
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-03-29 (v3.4.22)
+
+- Pinnacle ahora tiene recuperación histórica completa y reconciliación local:
+  - `GET /api/pinnacle/history` sincroniza apuestas remotas de Arcadia y las cruza por `providerBetId` con `portfolio`.
+  - `GET /api/pinnacle/account` soporta refresh/historial opcional para snapshot operativo.
+- Se agregó cálculo de PnL real de Pinnacle anclado a cashflow externo (`/transactions`):
+  - base de capital por depósitos/retiros,
+  - PnL mostrado = balance actual - base externa,
+  - evita mezclar saldo Pinnacle con PnL de Booky.
+- UI de Auto Placement reforzada:
+  - proveedor manual runtime (`BOOKY`/`PINNACLE`),
+  - badge/botón de PINNACLE con sync manual de historial (`SYNC PINNACLE` al hover, `SYNC...` en progreso),
+  - layout responsive para evitar desbordes en la tarjeta.
+- Finalizados mejorado con trazabilidad por origen:
+  - badge de origen (`BOOKY`/`PINNACLE`/`SIM`) y filtro por proveedor (`ALL/BOOKY/PINNACLE/SIM`).
+- Nuevos scripts de operación/diagnóstico Pinnacle:
+  - `npm run capture:pinnacle:account`
+  - `npm run capture:pinnacle:account:headless`
+  - `scripts/debug-pinnacle-history-endpoints.js`
+
+Detalle técnico completo en [CHANGELOG.md](CHANGELOG.md), entrada `v3.4.22`.
+
 ### Actualización 2026-03-29 (v3.4.21)
 
 - Selector de proveedor de auto-placement en runtime (`booky` o `pinnacle`) en `scannerService`.

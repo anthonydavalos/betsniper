@@ -1063,7 +1063,7 @@ export const confirmSemiAutoTicket = async (ticketId) => {
   }
 
   // Confirmación manual + espejo en portfolio (fase 1)
-  const placedBet = await placeAutoBet(refreshed);
+  const placedBet = await placeAutoBet(withBookyMirrorMetadata(refreshed));
   if (!placedBet) {
     throw new Error('No se pudo registrar la apuesta (duplicada o sin liquidez).');
   }
@@ -1240,8 +1240,25 @@ const extractAcceptedPlacementMeta = (providerResponse = {}) => {
   };
 };
 
+const withBookyMirrorMetadata = (opportunity = {}) => {
+  const integration = String(
+    getRuntimeEnvValue('ALTENAR_INTEGRATION', altenarClient?.defaults?.params?.integration || '')
+  ).trim().toLowerCase() || null;
+
+  return {
+    ...(opportunity || {}),
+    provider: 'booky',
+    placementProvider: 'booky',
+    integration
+  };
+};
+
 const reconcileMirroredBetWithAccepted = (mirroredBet, acceptedMeta = {}) => {
   if (!mirroredBet?.id) return mirroredBet;
+
+  const integration = String(
+    getRuntimeEnvValue('ALTENAR_INTEGRATION', altenarClient?.defaults?.params?.integration || '')
+  ).trim().toLowerCase() || null;
 
   const acceptedOdd = Number.isFinite(Number(acceptedMeta?.acceptedOdd)) ? Number(acceptedMeta.acceptedOdd) : null;
   const acceptedStake = Number.isFinite(Number(acceptedMeta?.acceptedStake)) ? Number(acceptedMeta.acceptedStake) : null;
@@ -1264,6 +1281,9 @@ const reconcileMirroredBetWithAccepted = (mirroredBet, acceptedMeta = {}) => {
     providerSelectionName: acceptedMeta.selectionName || bet.providerSelectionName || null,
     providerEventName: acceptedMeta.eventName || bet.providerEventName || null,
     providerEventDate: acceptedMeta.eventDate || bet.providerEventDate || null,
+    provider: 'booky',
+    placementProvider: 'booky',
+    integration: integration || bet.integration || null,
     providerAcceptedAt: nowIso(),
     providerPotentialReturn: Number.isFinite(Number(acceptedMeta.potentialReturn))
       ? Number(acceptedMeta.potentialReturn)
@@ -1433,7 +1453,7 @@ export const confirmRealPlacement = async (ticketId) => {
   }
 
   // Espejo en portfolio local solo si placeWidget responde sin throw.
-  let mirroredBet = await placeAutoBet(draft.refreshed);
+  let mirroredBet = await placeAutoBet(withBookyMirrorMetadata(draft.refreshed));
   if (!mirroredBet) {
     mirroredBet = findPortfolioMirrorBet(draft.refreshed);
   }
@@ -1599,7 +1619,7 @@ export const confirmRealPlacementFast = async (ticketId) => {
     throw error;
   }
 
-  let mirroredBet = await placeAutoBet(draft.refreshed);
+  let mirroredBet = await placeAutoBet(withBookyMirrorMetadata(draft.refreshed));
   if (!mirroredBet) {
     mirroredBet = findPortfolioMirrorBet(draft.refreshed);
   }

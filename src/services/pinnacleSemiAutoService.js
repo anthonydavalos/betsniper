@@ -9,6 +9,13 @@ import { placeAutoBet } from './paperTradingService.js';
 const ARCADIA_BASE_URL = 'https://api.arcadia.pinnacle.com/0.1';
 const PINNACLE_TOKEN_FILE = path.resolve('data', 'pinnacle_token.json');
 const PINNACLE_CAPTURE_LATEST = path.resolve('data', 'pinnacle', 'capture-placement.latest.json');
+const PINNACLE_REMOTE_HISTORY_TTL_MS = 45 * 1000;
+const PINNACLE_REMOTE_TRANSACTIONS_TTL_MS = 45 * 1000;
+const PINNACLE_REMOTE_HISTORY_DEFAULT_DAYS = Number(process.env.PINNACLE_HISTORY_DEFAULT_DAYS || 120);
+const PINNACLE_REMOTE_HISTORY_DEFAULT_STATUS = String(process.env.PINNACLE_HISTORY_DEFAULT_STATUS || 'settled').trim().toLowerCase();
+const PINNACLE_PNL_WINDOW_DAYS = Number(process.env.PINNACLE_PNL_WINDOW_DAYS || 365);
+const PINNACLE_PNL_BASE_CAPITAL_FALLBACK = Number(process.env.PINNACLE_PNL_BASE_CAPITAL);
+const PINNACLE_BET_STATUS_ALLOWED = new Set(['all', 'unsettled', 'settled']);
 
 const nowIso = () => new Date().toISOString();
 
@@ -24,6 +31,27 @@ const createPinnacleError = (message, extras = {}) => {
   if (extras.diagnostic) err.diagnostic = extras.diagnostic;
   return err;
 };
+
+const parsePositiveInt = (value, fallback) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+};
+
+const parsePinnacleHistoryStatus = (value = '', fallback = 'settled') => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (PINNACLE_BET_STATUS_ALLOWED.has(normalized)) return normalized;
+  return PINNACLE_BET_STATUS_ALLOWED.has(String(fallback || '').trim().toLowerCase())
+    ? String(fallback || '').trim().toLowerCase()
+    : 'settled';
+};
+
+const withPinnacleMirrorMetadata = (opportunity = {}) => ({
+  ...(opportunity || {}),
+  provider: 'pinnacle',
+  placementProvider: 'pinnacle',
+  integration: 'pinnacle'
+});
 
 const reconcileMirroredBetWithRequested = ({ mirroredBet, requestedPayload, providerBody } = {}) => {
   if (!mirroredBet?.id) return mirroredBet;
@@ -50,6 +78,9 @@ const reconcileMirroredBetWithRequested = ({ mirroredBet, requestedPayload, prov
       kellyStake: requestedStake || bet.kellyStake || bet.stake,
       providerRequestId,
       providerStatus,
+      provider: 'pinnacle',
+      placementProvider: 'pinnacle',
+      integration: 'pinnacle',
       providerRequestedStake: requestedStake || bet.providerRequestedStake || null,
       providerRequestedOdd: requestedOdd || bet.providerRequestedOdd || null,
       providerAcceptedAt: nowIso()
@@ -93,9 +124,29 @@ const reconcileMirroredBetWithRequested = ({ mirroredBet, requestedPayload, prov
 };
 
 const ensurePinnacleStore = () => {
-  if (!db.data.pinnacle) db.data.pinnacle = { pendingTickets: [], history: [] };
+  if (!db.data.pinnacle) db.data.pinnacle = { pendingTickets: [], history: [], remoteHistory: null };
   if (!Array.isArray(db.data.pinnacle.pendingTickets)) db.data.pinnacle.pendingTickets = [];
   if (!Array.isArray(db.data.pinnacle.history)) db.data.pinnacle.history = [];
+  if (!db.data.pinnacle.remoteHistory || typeof db.data.pinnacle.remoteHistory !== 'object') {
+    db.data.pinnacle.remoteHistory = {
+      items: [],
+      fetchedAt: null,
+      source: 'cache-empty',
+      params: null
+    };
+  }
+  if (!Array.isArray(db.data.pinnacle.remoteHistory.items)) db.data.pinnacle.remoteHistory.items = [];
+
+  if (!db.data.pinnacle.remoteTransactions || typeof db.data.pinnacle.remoteTransactions !== 'object') {
+    db.data.pinnacle.remoteTransactions = {
+      items: [],
+      fetchedAt: null,
+      source: 'cache-empty',
+      windowDays: null,
+      summary: null
+    };
+  }
+  if (!Array.isArray(db.data.pinnacle.remoteTransactions.items)) db.data.pinnacle.remoteTransactions.items = [];
 };
 
 const cloneForStorage = (value) => JSON.parse(JSON.stringify(value || null));
@@ -339,6 +390,9 @@ const createManualMirrorBetFromPlacement = ({ ticket, draft, providerBody } = {}
     stake: Number(requestedStake.toFixed(2)),
     kellyStake: Number(requestedStake.toFixed(2)),
     status: 'PENDING',
+    provider: 'pinnacle',
+    placementProvider: 'pinnacle',
+    integration: 'pinnacle',
     initialScore: opportunity.score || '0-0',
     lastKnownScore: opportunity.score || '0-0',
     lastUpdate: nowIso(),
@@ -541,7 +595,7 @@ export const confirmPinnacleSemiAutoTicket = async (ticketId) => {
     });
   }
 
-  const mirroredBet = await placeAutoBet(ticket.opportunity);
+  const mirroredBet = await placeAutoBet(withPinnacleMirrorMetadata(ticket.opportunity));
   if (!mirroredBet) {
     throw createPinnacleError('No se pudo registrar apuesta simulada en portfolio.', {
       code: 'PINNACLE_SIM_MIRROR_FAILED',
@@ -584,6 +638,639 @@ export const getPinnacleSemiAutoTickets = async () => {
   return {
     pending: db.data.pinnacle.pendingTickets,
     history: db.data.pinnacle.history.slice(-100).reverse()
+  };
+};
+
+const toFiniteOrNull = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const parseArcadiaDateOrNull = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+};
+
+const isExternalPinnacleCashflowTx = (tx = {}) => {
+  const typeNorm = String(tx?.type || '').trim().toLowerCase();
+  const descNorm = String(tx?.description || '').trim().toLowerCase();
+
+  if (typeNorm === 'e') return true;
+  if (descNorm.includes('customer deposit')) return true;
+  if (descNorm.includes('customer withdrawal')) return true;
+  if (descNorm.includes('deposit')) return true;
+  if (descNorm.includes('withdraw')) return true;
+  return false;
+};
+
+const normalizeArcadiaTransaction = (raw = {}) => {
+  const amountRaw = Number(raw?.amount);
+  const creditRaw = Number(raw?.creditAmount);
+  const debitRaw = Number(raw?.debitAmount);
+  const amount = Number.isFinite(amountRaw)
+    ? amountRaw
+    : (Number.isFinite(creditRaw) && Number.isFinite(debitRaw)
+      ? Number((creditRaw - debitRaw).toFixed(2))
+      : null);
+
+  const normalized = {
+    id: raw?.id ?? null,
+    createdAt: parseArcadiaDateOrNull(raw?.createdAt),
+    type: String(raw?.type || '').trim() || null,
+    code: String(raw?.code || '').trim() || null,
+    description: String(raw?.description || '').trim() || null,
+    productName: String(raw?.productName || '').trim() || null,
+    amount: Number.isFinite(Number(amount)) ? Number(amount) : null,
+    creditAmount: Number.isFinite(creditRaw) ? Number(creditRaw) : null,
+    debitAmount: Number.isFinite(debitRaw) ? Number(debitRaw) : null,
+    balance: toFiniteOrNull(raw?.balance),
+    raw
+  };
+
+  return {
+    ...normalized,
+    isExternalCashflow: isExternalPinnacleCashflowTx(normalized)
+  };
+};
+
+const normalizeArcadiaTransactions = (payload = null) => {
+  const rows = Array.isArray(payload)
+    ? payload
+    : (Array.isArray(payload?.items)
+      ? payload.items
+      : (Array.isArray(payload?.data) ? payload.data : []));
+
+  return rows
+    .filter((row) => row && typeof row === 'object')
+    .map(normalizeArcadiaTransaction)
+    .sort((a, b) => new Date(b?.createdAt || 0).getTime() - new Date(a?.createdAt || 0).getTime());
+};
+
+const summarizePinnacleTransactions = (rows = []) => {
+  const list = Array.isArray(rows) ? rows : [];
+  const externalRows = list.filter((row) => row?.isExternalCashflow === true && Number.isFinite(Number(row?.amount)));
+
+  const externalCredits = Number(externalRows
+    .filter((row) => Number(row.amount) > 0)
+    .reduce((sum, row) => sum + Number(row.amount), 0)
+    .toFixed(2));
+
+  const externalDebits = Number(externalRows
+    .filter((row) => Number(row.amount) < 0)
+    .reduce((sum, row) => sum + Math.abs(Number(row.amount)), 0)
+    .toFixed(2));
+
+  const externalNet = Number((externalCredits - externalDebits).toFixed(2));
+  const baseCapitalFromEnv = Number.isFinite(PINNACLE_PNL_BASE_CAPITAL_FALLBACK)
+    ? Number(PINNACLE_PNL_BASE_CAPITAL_FALLBACK.toFixed(2))
+    : null;
+
+  const hasExternalBase = externalRows.length > 0;
+  const baseCapital = hasExternalBase ? externalNet : baseCapitalFromEnv;
+  const baseCapitalSource = hasExternalBase
+    ? 'arcadia-transactions-external'
+    : (Number.isFinite(baseCapitalFromEnv) ? 'env-pinnacle-pnl-base-capital' : 'unavailable');
+
+  return {
+    rowsCount: list.length,
+    externalRowsCount: externalRows.length,
+    externalCredits,
+    externalDebits,
+    externalNet,
+    baseCapital: Number.isFinite(Number(baseCapital)) ? Number(baseCapital) : null,
+    baseCapitalSource,
+    firstTxAt: list.length > 0 ? list[list.length - 1]?.createdAt || null : null,
+    lastTxAt: list.length > 0 ? list[0]?.createdAt || null : null
+  };
+};
+
+const fetchPinnacleTransactionsSummary = async ({ forceRefresh = false, days = PINNACLE_PNL_WINDOW_DAYS } = {}) => {
+  const normalizedDays = parsePositiveInt(days, parsePositiveInt(PINNACLE_PNL_WINDOW_DAYS, 365));
+  const cache = db.data?.pinnacle?.remoteTransactions || null;
+  const cacheFresh = !forceRefresh
+    && cache?.fetchedAt
+    && Number.isFinite(new Date(cache.fetchedAt).getTime())
+    && (Date.now() - new Date(cache.fetchedAt).getTime()) <= PINNACLE_REMOTE_TRANSACTIONS_TTL_MS
+    && Number(cache?.windowDays) === Number(normalizedDays)
+    && Array.isArray(cache?.items);
+
+  if (cacheFresh) {
+    return {
+      source: 'cache',
+      fetchedAt: cache.fetchedAt,
+      windowDays: normalizedDays,
+      items: cache.items,
+      summary: cache.summary || summarizePinnacleTransactions(cache.items)
+    };
+  }
+
+  const endDate = new Date();
+  const startDate = new Date(endDate.getTime() - (normalizedDays * 24 * 60 * 60 * 1000));
+  const params = {
+    startDate: startDate.toISOString(),
+    endDate: endDate.toISOString()
+  };
+
+  try {
+    const response = await arcadiaRequest('GET', '/transactions', { params });
+    const items = normalizeArcadiaTransactions(response?.data);
+    const summary = summarizePinnacleTransactions(items);
+
+    db.data.pinnacle.remoteTransactions = {
+      items,
+      fetchedAt: nowIso(),
+      source: 'arcadia',
+      windowDays: normalizedDays,
+      summary,
+      params
+    };
+    await db.write();
+
+    return {
+      source: 'arcadia',
+      fetchedAt: db.data.pinnacle.remoteTransactions.fetchedAt,
+      windowDays: normalizedDays,
+      items,
+      summary
+    };
+  } catch (error) {
+    const fallbackItems = Array.isArray(cache?.items) ? cache.items : [];
+    return {
+      source: fallbackItems.length > 0 ? 'cache-fallback' : 'unavailable',
+      fetchedAt: cache?.fetchedAt || null,
+      windowDays: normalizedDays,
+      items: fallbackItems,
+      summary: cache?.summary || summarizePinnacleTransactions(fallbackItems),
+      error: {
+        message: error?.message || 'Error al obtener transacciones Pinnacle.',
+        code: error?.code || null,
+        statusCode: Number(error?.statusCode) || null,
+        diagnostic: error?.diagnostic || null
+      }
+    };
+  }
+};
+
+export const getPinnacleAccountBalance = async ({ forceRefreshTransactions = false } = {}) => {
+  await initDB();
+  await db.read();
+  ensurePinnacleStore();
+
+  const response = await arcadiaRequest('GET', '/wallet/balance');
+  const raw = response?.data || {};
+
+  const rawAmount = raw?.amount;
+  const amount = (rawAmount === null || rawAmount === undefined || String(rawAmount).trim() === '')
+    ? null
+    : Number(rawAmount);
+  const currency = String(raw?.currency || 'USD').toUpperCase();
+  const txSummaryData = await fetchPinnacleTransactionsSummary({ forceRefresh: forceRefreshTransactions });
+  const baseCapital = Number(txSummaryData?.summary?.baseCapital);
+  const pnlByBalance = Number.isFinite(amount) && Number.isFinite(baseCapital)
+    ? Number((amount - baseCapital).toFixed(2))
+    : null;
+
+  const pnlSource = Number.isFinite(pnlByBalance)
+    ? 'balance-minus-external-cashflow'
+    : 'unavailable';
+
+  return {
+    fetchedAt: nowIso(),
+    endpoint: '/wallet/balance',
+    source: 'arcadia',
+    balance: {
+      amount: Number.isFinite(amount) ? amount : null,
+      currency
+    },
+    pnl: {
+      total: Number.isFinite(pnlByBalance) ? pnlByBalance : null,
+      netAfterOpenStake: Number.isFinite(pnlByBalance) ? pnlByBalance : null,
+      byBalance: Number.isFinite(pnlByBalance) ? pnlByBalance : null,
+      baseCapital: Number.isFinite(baseCapital) ? Number(baseCapital) : null,
+      baseCapitalSource: txSummaryData?.summary?.baseCapitalSource || null,
+      externalNet: Number(txSummaryData?.summary?.externalNet || 0),
+      externalCredits: Number(txSummaryData?.summary?.externalCredits || 0),
+      externalDebits: Number(txSummaryData?.summary?.externalDebits || 0),
+      source: pnlSource,
+      rowsCount: Number(txSummaryData?.summary?.rowsCount || 0)
+    },
+    transactions: {
+      source: txSummaryData?.source || null,
+      fetchedAt: txSummaryData?.fetchedAt || null,
+      windowDays: Number(txSummaryData?.windowDays || 0),
+      summary: txSummaryData?.summary || null,
+      error: txSummaryData?.error || null
+    },
+    raw
+  };
+};
+
+const formatArcadiaFinalScore = (items = []) => {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length === 0) return null;
+
+  const home = list.find((s) => String(s?.alignment || '').toLowerCase() === 'home');
+  const away = list.find((s) => String(s?.alignment || '').toLowerCase() === 'away');
+  const homeScore = Number(home?.score);
+  const awayScore = Number(away?.score);
+
+  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return null;
+  return `${homeScore}-${awayScore}`;
+};
+
+const buildArcadiaMatchName = (matchup = {}) => {
+  const participants = Array.isArray(matchup?.participants) ? matchup.participants : [];
+  const home = participants.find((p) => String(p?.alignment || '').toLowerCase() === 'home') || participants[0] || null;
+  const away = participants.find((p) => String(p?.alignment || '').toLowerCase() === 'away') || participants[1] || null;
+  const homeName = String(home?.name || '').trim();
+  const awayName = String(away?.name || '').trim();
+  if (homeName && awayName) return `${homeName} vs ${awayName}`;
+  return homeName || awayName || null;
+};
+
+const resolveArcadiaSelectionMeta = (selection = {}) => {
+  const designation = String(selection?.designation || '').trim().toLowerCase();
+  const marketType = String(selection?.market?.type || '').trim().toLowerCase();
+  const marketKey = String(selection?.market?.key || '').trim().toLowerCase();
+  const points = toFiniteOrNull(selection?.points);
+
+  if (marketType === 'moneyline' || marketKey === 's;0;m') {
+    if (designation === 'home') return { pick: 'home', selection: 'LOCAL', market: '1x2' };
+    if (designation === 'away') return { pick: 'away', selection: 'VISITA', market: '1x2' };
+    if (designation === 'draw') return { pick: 'draw', selection: 'EMPATE', market: '1x2' };
+    return { pick: designation || 'unknown', selection: designation || 'SELECCION', market: '1x2' };
+  }
+
+  if (marketType === 'total' || marketKey === 's;0;t') {
+    if (designation === 'over') {
+      return {
+        pick: Number.isFinite(points) ? `over_${points}` : 'over',
+        selection: Number.isFinite(points) ? `OVER ${points}` : 'OVER',
+        market: Number.isFinite(points) ? `Total ${points}` : 'Total'
+      };
+    }
+    if (designation === 'under') {
+      return {
+        pick: Number.isFinite(points) ? `under_${points}` : 'under',
+        selection: Number.isFinite(points) ? `UNDER ${points}` : 'UNDER',
+        market: Number.isFinite(points) ? `Total ${points}` : 'Total'
+      };
+    }
+  }
+
+  return {
+    pick: designation || 'unknown',
+    selection: designation ? designation.toUpperCase() : 'SELECCION',
+    market: marketType || marketKey || 'market'
+  };
+};
+
+const resolveArcadiaLocalStatus = ({ status = '', outcome = '', stake = null } = {}) => {
+  const statusNorm = String(status || '').trim().toLowerCase();
+  const outcomeNorm = String(outcome || '').trim().toLowerCase();
+  const stakeNum = toFiniteOrNull(stake);
+
+  if (statusNorm !== 'settled') return { localStatus: 'PENDING', profit: 0 };
+
+  if (['win', 'won'].includes(outcomeNorm)) return { localStatus: 'WON', profit: null };
+  if (['loss', 'lose', 'lost'].includes(outcomeNorm)) {
+    return { localStatus: 'LOST', profit: Number.isFinite(stakeNum) ? -Math.abs(stakeNum) : null };
+  }
+  if (['push', 'void', 'refund', 'cancelled', 'canceled'].includes(outcomeNorm)) return { localStatus: 'VOID', profit: 0 };
+
+  return { localStatus: 'PENDING', profit: 0 };
+};
+
+const normalizeArcadiaRemoteBet = (raw = {}) => {
+  const selection = Array.isArray(raw?.selections) ? (raw.selections[0] || null) : null;
+  const matchup = selection?.matchup || null;
+  const matchupId = Number(selection?.matchup?.id || selection?.matchupId || raw?.matchupId || 0);
+
+  const stake = toFiniteOrNull(raw?.stake);
+  const odd = toFiniteOrNull(raw?.price ?? selection?.price);
+  const winLoss = toFiniteOrNull(raw?.winLoss);
+  const payout = toFiniteOrNull(raw?.payout);
+  const toWin = toFiniteOrNull(raw?.toWin);
+  const placedAt = parseArcadiaDateOrNull(raw?.createdAt);
+  const settledAt = parseArcadiaDateOrNull(raw?.settledAt);
+  const status = String(raw?.status || '').trim().toLowerCase();
+  const outcome = String(raw?.outcome || selection?.outcome || '').trim().toLowerCase();
+
+  const selectionMeta = resolveArcadiaSelectionMeta(selection || {});
+  const statusMeta = resolveArcadiaLocalStatus({ status, outcome, stake });
+
+  let profit = Number.isFinite(winLoss)
+    ? winLoss
+    : (Number.isFinite(payout) ? payout : null);
+  if (!Number.isFinite(profit)) {
+    if (statusMeta.localStatus === 'WON' && Number.isFinite(toWin)) profit = toWin;
+    else if (statusMeta.localStatus === 'LOST' && Number.isFinite(stake)) profit = -Math.abs(stake);
+    else if (statusMeta.localStatus === 'VOID') profit = 0;
+  }
+
+  const potentialReturn = (() => {
+    if (Number.isFinite(stake) && Number.isFinite(toWin)) return Number((stake + toWin).toFixed(2));
+    if (Number.isFinite(stake) && Number.isFinite(odd) && odd > 1) return Number((stake * odd).toFixed(2));
+    return null;
+  })();
+
+  return {
+    providerBetId: raw?.id ?? null,
+    providerRequestId: raw?.requestId || null,
+    providerStatus: status || null,
+    providerOutcome: outcome || null,
+    placedAt,
+    settledAt,
+    statusNormalized: status || null,
+    localStatus: statusMeta.localStatus,
+    stake,
+    odd,
+    toWin,
+    payout,
+    winLoss,
+    profit: Number.isFinite(profit) ? Number(profit) : null,
+    potentialReturn,
+    eventId: Number.isFinite(matchupId) && matchupId > 0 ? matchupId : null,
+    pinnacleId: Number.isFinite(matchupId) && matchupId > 0 ? matchupId : null,
+    matchDate: parseArcadiaDateOrNull(matchup?.startTime),
+    match: buildArcadiaMatchName(matchup || {}),
+    league: matchup?.league?.name || null,
+    market: selectionMeta.market,
+    selection: selectionMeta.selection,
+    pick: selectionMeta.pick,
+    finalScore: formatArcadiaFinalScore(selection?.finalScore),
+    type: 'PINNACLE_REAL',
+    strategy: 'PINNACLE_REAL',
+    provider: 'pinnacle',
+    placementProvider: 'pinnacle',
+    integration: 'pinnacle',
+    source: 'remote',
+    raw
+  };
+};
+
+const normalizeArcadiaRemoteBets = (payload = null) => {
+  const rows = Array.isArray(payload)
+    ? payload
+    : (Array.isArray(payload?.bets)
+      ? payload.bets
+      : (Array.isArray(payload?.items)
+        ? payload.items
+        : (Array.isArray(payload?.data) ? payload.data : [])));
+
+  return rows
+    .filter((row) => row && typeof row === 'object')
+    .map(normalizeArcadiaRemoteBet)
+    .filter((row) => row?.providerBetId !== null && row?.providerBetId !== undefined && row?.providerBetId !== '');
+};
+
+const upsertPortfolioBetFromRemote = (existing = {}, remote = {}) => {
+  const fallbackId = `pn_remote_${remote.providerBetId || remote.providerRequestId || Date.now()}_${Math.floor(Math.random() * 10000)}`;
+  return {
+    ...existing,
+    id: existing?.id || fallbackId,
+    createdAt: existing?.createdAt || remote.placedAt || nowIso(),
+    confirmedAt: existing?.confirmedAt || remote.placedAt || null,
+    closedAt: remote.settledAt || existing?.closedAt || null,
+    lastUpdate: nowIso(),
+    eventId: remote.eventId ?? existing?.eventId ?? null,
+    pinnacleId: remote.pinnacleId ?? existing?.pinnacleId ?? remote.eventId ?? null,
+    matchDate: remote.matchDate || existing?.matchDate || null,
+    match: remote.match || existing?.match || 'Pinnacle Remote Bet',
+    league: remote.league || existing?.league || null,
+    market: remote.market || existing?.market || '1x2',
+    selection: remote.selection || existing?.selection || null,
+    pick: remote.pick || existing?.pick || 'unknown',
+    type: existing?.type || remote.type || 'PINNACLE_REAL',
+    strategy: existing?.strategy || remote.strategy || 'PINNACLE_REAL',
+    odd: Number.isFinite(Number(remote.odd)) ? Number(remote.odd) : (existing?.odd ?? null),
+    price: Number.isFinite(Number(remote.odd)) ? Number(remote.odd) : (existing?.price ?? null),
+    stake: Number.isFinite(Number(remote.stake)) ? Number(remote.stake) : (existing?.stake ?? null),
+    kellyStake: Number.isFinite(Number(remote.stake)) ? Number(remote.stake) : (existing?.kellyStake ?? existing?.stake ?? null),
+    potentialReturn: Number.isFinite(Number(remote.potentialReturn))
+      ? Number(remote.potentialReturn)
+      : (existing?.potentialReturn ?? null),
+    status: remote.localStatus || existing?.status || 'PENDING',
+    profit: remote.localStatus === 'PENDING'
+      ? (existing?.profit ?? 0)
+      : (Number.isFinite(Number(remote.profit)) ? Number(remote.profit) : (existing?.profit ?? 0)),
+    provider: 'pinnacle',
+    placementProvider: 'pinnacle',
+    integration: 'pinnacle',
+    source: 'remote',
+    providerBetId: remote.providerBetId ?? existing?.providerBetId ?? null,
+    providerRequestId: remote.providerRequestId || existing?.providerRequestId || null,
+    providerStatus: remote.providerStatus || existing?.providerStatus || null,
+    providerOutcome: remote.providerOutcome || existing?.providerOutcome || null,
+    providerAcceptedAt: remote.placedAt || existing?.providerAcceptedAt || null,
+    providerSettledAt: remote.settledAt || existing?.providerSettledAt || null,
+    providerToWin: Number.isFinite(Number(remote.toWin)) ? Number(remote.toWin) : (existing?.providerToWin ?? null),
+    providerPayout: Number.isFinite(Number(remote.payout)) ? Number(remote.payout) : (existing?.providerPayout ?? null),
+    providerWinLoss: Number.isFinite(Number(remote.winLoss)) ? Number(remote.winLoss) : (existing?.providerWinLoss ?? null),
+    finalScore: remote.finalScore || existing?.finalScore || null,
+    lastKnownScore: remote.finalScore || existing?.lastKnownScore || existing?.initialScore || '0-0',
+    initialScore: existing?.initialScore || remote.finalScore || '0-0',
+    realPlacement: {
+      ...(existing?.realPlacement || {}),
+      source: 'arcadia-remote-sync',
+      endpoint: '/bets',
+      requestId: remote.providerRequestId || existing?.realPlacement?.requestId || null,
+      response: remote.raw || existing?.realPlacement?.response || null
+    }
+  };
+};
+
+const reconcilePortfolioFromPinnacleRemote = (remoteRows = [], { importUnsettled = false } = {}) => {
+  if (!db.data?.portfolio) return { touchedCount: 0, insertedHistory: 0, insertedActive: 0, patched: 0, movedToHistory: 0 };
+  if (!Array.isArray(db.data.portfolio.activeBets)) db.data.portfolio.activeBets = [];
+  if (!Array.isArray(db.data.portfolio.history)) db.data.portfolio.history = [];
+
+  const stats = {
+    touchedCount: 0,
+    insertedHistory: 0,
+    insertedActive: 0,
+    patched: 0,
+    movedToHistory: 0
+  };
+
+  for (const remote of remoteRows) {
+    const providerKey = String(remote?.providerBetId || '').trim();
+    if (!providerKey) continue;
+
+    const historyIdx = db.data.portfolio.history.findIndex((row) => String(row?.providerBetId || '').trim() === providerKey);
+    const activeIdx = db.data.portfolio.activeBets.findIndex((row) => String(row?.providerBetId || '').trim() === providerKey);
+    const isSettled = String(remote?.statusNormalized || '').toLowerCase() === 'settled';
+
+    if (historyIdx >= 0) {
+      db.data.portfolio.history[historyIdx] = upsertPortfolioBetFromRemote(db.data.portfolio.history[historyIdx], remote);
+      stats.patched += 1;
+      continue;
+    }
+
+    if (isSettled) {
+      if (activeIdx >= 0) {
+        const moved = upsertPortfolioBetFromRemote(db.data.portfolio.activeBets[activeIdx], remote);
+        db.data.portfolio.activeBets.splice(activeIdx, 1);
+        db.data.portfolio.history.unshift(moved);
+        stats.movedToHistory += 1;
+      } else {
+        db.data.portfolio.history.unshift(upsertPortfolioBetFromRemote(null, remote));
+        stats.insertedHistory += 1;
+      }
+      continue;
+    }
+
+    if (!importUnsettled) continue;
+
+    if (activeIdx >= 0) {
+      db.data.portfolio.activeBets[activeIdx] = upsertPortfolioBetFromRemote(db.data.portfolio.activeBets[activeIdx], remote);
+      stats.patched += 1;
+    } else {
+      db.data.portfolio.activeBets.push(upsertPortfolioBetFromRemote(null, remote));
+      stats.insertedActive += 1;
+    }
+  }
+
+  stats.touchedCount = stats.insertedHistory + stats.insertedActive + stats.patched + stats.movedToHistory;
+  return stats;
+};
+
+export const syncRemotePinnacleHistory = async ({
+  forceRefresh = false,
+  limit = 200,
+  status = PINNACLE_REMOTE_HISTORY_DEFAULT_STATUS,
+  days = PINNACLE_REMOTE_HISTORY_DEFAULT_DAYS
+} = {}) => {
+  await initDB();
+  await db.read();
+  ensurePinnacleStore();
+
+  const normalizedStatus = parsePinnacleHistoryStatus(status, PINNACLE_REMOTE_HISTORY_DEFAULT_STATUS);
+  const normalizedDays = parsePositiveInt(days, parsePositiveInt(PINNACLE_REMOTE_HISTORY_DEFAULT_DAYS, 120));
+  const parsedLimit = Number(limit);
+  const normalizedLimit = Number.isFinite(parsedLimit)
+    ? (parsedLimit <= 0 ? null : Math.max(1, Math.min(5000, Math.floor(parsedLimit))))
+    : 200;
+
+  const endDate = new Date();
+  const startDate = new Date(endDate.getTime() - (normalizedDays * 24 * 60 * 60 * 1000));
+  const params = {
+    startDate: startDate.toISOString(),
+    endDate: endDate.toISOString(),
+    status: normalizedStatus
+  };
+
+  const cache = db.data.pinnacle.remoteHistory || null;
+  const cacheFresh = !forceRefresh
+    && cache?.fetchedAt
+    && Number.isFinite(new Date(cache.fetchedAt).getTime())
+    && (Date.now() - new Date(cache.fetchedAt).getTime()) <= PINNACLE_REMOTE_HISTORY_TTL_MS
+    && cache?.params
+    && cache.params.status === params.status
+    && cache.params.startDate === params.startDate
+    && cache.params.endDate === params.endDate;
+
+  if (cacheFresh) {
+    const items = Array.isArray(cache.items) ? cache.items : [];
+    return {
+      source: 'cache',
+      fetchedAt: cache.fetchedAt,
+      params,
+      items: normalizedLimit === null ? items : items.slice(0, normalizedLimit),
+      totalCount: items.length,
+      summary: cache.summary || null,
+      reconcileStats: { touchedCount: 0, insertedHistory: 0, insertedActive: 0, patched: 0, movedToHistory: 0 }
+    };
+  }
+
+  try {
+    const response = await arcadiaRequest('GET', '/bets', { params });
+    const rows = normalizeArcadiaRemoteBets(response?.data)
+      .sort((a, b) => new Date(b?.placedAt || 0).getTime() - new Date(a?.placedAt || 0).getTime());
+
+    const reconcileStats = reconcilePortfolioFromPinnacleRemote(rows, {
+      importUnsettled: normalizedStatus !== 'settled'
+    });
+
+    db.data.pinnacle.remoteHistory = {
+      items: rows,
+      fetchedAt: nowIso(),
+      source: 'arcadia',
+      params,
+      summary: response?.data?.summary || null
+    };
+
+    await db.write();
+
+    return {
+      source: 'arcadia',
+      fetchedAt: db.data.pinnacle.remoteHistory.fetchedAt,
+      params,
+      items: normalizedLimit === null ? rows : rows.slice(0, normalizedLimit),
+      totalCount: rows.length,
+      summary: response?.data?.summary || null,
+      reconcileStats
+    };
+  } catch (error) {
+    const fallbackItems = Array.isArray(cache?.items) ? cache.items : [];
+    return {
+      source: fallbackItems.length > 0 ? 'cache-fallback' : 'unavailable',
+      fetchedAt: cache?.fetchedAt || null,
+      params,
+      items: normalizedLimit === null ? fallbackItems : fallbackItems.slice(0, normalizedLimit),
+      totalCount: fallbackItems.length,
+      summary: cache?.summary || null,
+      error: {
+        message: error?.message || 'Error al sincronizar historial Pinnacle.',
+        code: error?.code || null,
+        statusCode: Number(error?.statusCode) || null,
+        diagnostic: error?.diagnostic || null
+      },
+      reconcileStats: { touchedCount: 0, insertedHistory: 0, insertedActive: 0, patched: 0, movedToHistory: 0 }
+    };
+  }
+};
+
+export const getPinnacleAccountSnapshot = async ({
+  forceRefresh = false,
+  historyLimit = 0,
+  historyStatus = PINNACLE_REMOTE_HISTORY_DEFAULT_STATUS,
+  historyDays = PINNACLE_REMOTE_HISTORY_DEFAULT_DAYS
+} = {}) => {
+  const balance = await getPinnacleAccountBalance({ forceRefreshTransactions: forceRefresh });
+
+  const parsedLimit = Number(historyLimit);
+  const shouldSyncHistory = Number.isFinite(parsedLimit) ? parsedLimit !== 0 : false;
+  if (!shouldSyncHistory) {
+    return {
+      ...balance,
+      history: [],
+      historyCount: 0,
+      historyTotalCount: 0,
+      historyStatus: parsePinnacleHistoryStatus(historyStatus, PINNACLE_REMOTE_HISTORY_DEFAULT_STATUS),
+      reconcile: { touchedCount: 0, insertedHistory: 0, insertedActive: 0, patched: 0, movedToHistory: 0 }
+    };
+  }
+
+  const remote = await syncRemotePinnacleHistory({
+    forceRefresh,
+    limit: parsedLimit,
+    status: historyStatus,
+    days: historyDays
+  });
+
+  return {
+    ...balance,
+    history: Array.isArray(remote?.items) ? remote.items : [],
+    historyCount: Array.isArray(remote?.items) ? remote.items.length : 0,
+    historyTotalCount: Number(remote?.totalCount || 0),
+    historyStatus: parsePinnacleHistoryStatus(historyStatus, PINNACLE_REMOTE_HISTORY_DEFAULT_STATUS),
+    historySource: remote?.source || null,
+    historyFetchedAt: remote?.fetchedAt || null,
+    historySummary: remote?.summary || null,
+    historyError: remote?.error || null,
+    reconcile: remote?.reconcileStats || { touchedCount: 0, insertedHistory: 0, insertedActive: 0, patched: 0, movedToHistory: 0 }
   };
 };
 
@@ -689,7 +1376,7 @@ export const confirmPinnacleRealPlacement = async (ticketId) => {
     });
   }
 
-  let mirroredBet = await placeAutoBet(ticket.opportunity);
+  let mirroredBet = await placeAutoBet(withPinnacleMirrorMetadata(ticket.opportunity));
   if (!mirroredBet) {
     mirroredBet = findPortfolioMirrorBet({ ticket, draft });
   }

@@ -23,6 +23,8 @@
     "capture:booky:dorado:headless": "node scripts/capture-altenar-betslip.js --require-profile=doradobet",
     "capture:pinnacle:placement": "node scripts/capture-pinnacle-placement.js --headed --wait-close",
     "capture:pinnacle:placement:headless": "node scripts/capture-pinnacle-placement.js --capture-ms=180000",
+    "capture:pinnacle:account": "node scripts/capture-pinnacle-account.js --headed --wait-close --all-arcadia --all-xhr",
+    "capture:pinnacle:account:headless": "node scripts/capture-pinnacle-account.js --capture-ms=180000 --all-arcadia --all-xhr",
     "token:booky": "node scripts/extract-booky-auth-token.js --headed",
     "token:booky:wait-close": "node scripts/extract-booky-auth-token.js --headed --wait-close",
     "token:booky:acity": "node scripts/extract-booky-auth-token.js --headed --require-profile=acity",
