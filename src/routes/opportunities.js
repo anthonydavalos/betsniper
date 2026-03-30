@@ -8,6 +8,7 @@ import {
   setAutoPlacementProvider
 } from '../services/scannerService.js';
 import { scanPrematchOpportunities } from '../services/prematchScannerService.js';
+import { getArbitragePreview1x2 } from '../services/arbitrageService.js';
 import db from '../db/database.js';
 
 const router = express.Router();
@@ -227,6 +228,28 @@ router.get('/prematch', async (req, res) => {
       });
     }
     res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/opportunities/arbitrage/preview
+// Preview de arbitraje matemático (sin ejecución real).
+router.get('/arbitrage/preview', async (req, res) => {
+  try {
+    const bankrollRaw = Number(req.query?.bankroll);
+    const limitRaw = Number(req.query?.limit);
+
+    const payload = await getArbitragePreview1x2({
+      bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined
+    });
+
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      mode: 'preview-only',
+      error: error?.message || 'No se pudo generar preview de arbitraje.'
+    });
   }
 });
 

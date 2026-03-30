@@ -1,5 +1,68 @@
 # Registro de Retoques y Correcciones
 
+## [2026-03-30] Sprint A MVP: Surebet 1x2 + Stake Splitter + API Preview
+- **Servicio nuevo:** `src/services/arbitrageService.js`.
+  - Detector de surebet **1x2 prematch** usando `upcomingMatches` (Pinnacle) + `altenarUpcoming` (Altenar).
+  - Resolución de orientación de equipos (`normal`/`swapped`) para mapear correctamente home/away.
+  - Cálculo de arbitraje matemático con criterio `sum(1/odds) < 1`.
+  - **Stake Splitter** por bankroll con payout garantizado, profit esperado y ROI.
+- **Endpoint nuevo:** `GET /api/opportunities/arbitrage/preview` en `src/routes/opportunities.js`.
+  - Parámetros soportados:
+    - `bankroll` (opcional)
+    - `limit` (opcional)
+  - Modo explícito: `preview-only` (sin ejecución real).
+- **Diagnóstico incluido en respuesta:** filas escaneadas y descartes (`unlinked`, `orientation`, `missingOdds`).
+- **Smoke de servicio:** validado con muestra real devolviendo edge positivo y stakes por pata.
+
+## Guía de Ruta - Objetivo Arbitraje
+
+### Estado actual (2026-03-30)
+- **Fase actual:** Pre-arbitraje operable.
+- **Ya resuelto:**
+  - ingestión Pinnacle/Altenar estable,
+  - matching y normalización operativa,
+  - ejecución semi/real por proveedor,
+  - reconciliación de historial Pinnacle,
+  - PnL de Pinnacle anclado a cashflow externo,
+  - observabilidad mínima de decisiones y sync.
+- **Conclusión:** el sistema ya opera con valor esperado, pero aún no cierra arbitraje matemático completo de 2 patas con cobertura automática de fallo parcial.
+
+### Lo que falta para arbitraje real completo
+1. **Motor Surebet Multi-mercado:** detectar arbitrajes 2-way/3-way en tiempo real y calcular stakes por pata con beneficio neto garantizado.
+2. **Orquestador de Ejecución Dual:** ejecutar ambas patas con control de latencia y política de hedge si una pata falla.
+3. **Modelo de Operación de Arbitraje:** entidad única por operación (OPEN, PARTIAL, HEDGED, CLOSED) y PnL por operación, no solo por ticket.
+4. **Guardas de Ejecutabilidad:** límites por mercado/casa, stake mínimo/máximo, lock por evento y protección anti-duplicado.
+5. **Observabilidad de Producción:** métricas de slippage, partial fills, tiempo de ejecución y alertas de degradación.
+
+### Plan de ejecución propuesto
+
+#### Sprint A - Core matemático de arbitraje
+- Implementar detector de surebet para 1x2, Totales y líneas compatibles.
+- Implementar calculadora de stake por pata con redondeo y verificación de rentabilidad neta.
+- Exponer endpoint de oportunidades de arbitraje con score de ejecutabilidad.
+
+**Criterio de salida Sprint A:** oportunidades de arbitraje detectadas con stake plan válido y margen neto positivo validado por tests.
+
+#### Sprint B - Ejecución dual segura
+- Implementar orquestador de 2 patas con timeout y orden de prioridad configurable.
+- Manejar fallo parcial con cobertura automática (hedge) y estado PARTIAL/HEDGED.
+- Persistir evidencia completa de provider por cada pata (request/response/status).
+
+**Criterio de salida Sprint B:** flujo E2E de operación dual con cierre controlado en escenarios de éxito total y fallo parcial.
+
+#### Sprint C - Libro de arbitraje y operación diaria
+- Crear libro de operaciones de arbitraje con estados y PnL consolidado.
+- Agregar dashboard de arbitraje (abiertas, parciales, cerradas, ROI neto).
+- Agregar health operativo específico de arbitraje (latencia, ratio de partial, fallos por provider).
+
+**Criterio de salida Sprint C:** tablero operativo listo para uso diario y auditoría completa por operación.
+
+### Próximo paso inmediato recomendado
+- Iniciar Sprint A con un primer entregable mínimo:
+  - detector surebet 1x2,
+  - stake splitter,
+  - endpoint de preview de operación (sin ejecución real).
+
 ## [2026-03-29] Auto-ejecución LIVE_VALUE + diagnóstico por tipos + alias wave
 - **Auto-placement multi-strategy:** `scannerService` ahora permite auto-ejecución por lista de tipos (`AUTO_SNIPE_ALLOWED_TYPES`) y deja habilitado por defecto `LIVE_SNIPE, LA_VOLTEADA, LIVE_VALUE`.
 - **Descartes más claros:** cuando una oportunidad no está habilitada por tipo, el motivo pasa a `type-not-enabled` (reemplaza `not-snipe` en ese caso).
