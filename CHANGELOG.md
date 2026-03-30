@@ -7,6 +7,74 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.22] -- 2026-03-29 -- Sprint: Pinnacle History Recovery + PnL Real + Sync UX
+
+> Rama: `master`
+
+### ✅ Added
+
+#### API Pinnacle para cuenta e historial remoto
+- **`src/routes/pinnacle.js`**:
+  - Nuevo endpoint `GET /api/pinnacle/account` con soporte de refresh e hidratacion opcional de historial.
+  - Nuevo endpoint `GET /api/pinnacle/history` para sincronizacion manual/auditable de apuestas remotas.
+
+#### Sincronizacion de historial Arcadia y reconciliacion local
+- **`src/services/pinnacleSemiAutoService.js`**:
+  - Nuevo flujo `syncRemotePinnacleHistory(...)` consumiendo `GET /0.1/bets` con contrato confirmado (`startDate`, `endDate`, `status`).
+  - Reconciliacion por `providerBetId` hacia `portfolio.history/activeBets` con upsert/move consistente.
+  - Soporte de cache TTL para historial remoto y respuesta con `reconcileStats`.
+
+#### Captura y diagnostico operativo de endpoints Pinnacle
+- **`scripts/capture-pinnacle-account.js`** (nuevo):
+  - Captura XHR/fetch de Arcadia y account flows via Puppeteer para discovery/forensics.
+- **`scripts/debug-pinnacle-history-endpoints.js`** (nuevo):
+  - Probe automatizado de endpoints de historial/transacciones y shape de payload.
+- **`package.json`**:
+  - Nuevos comandos `capture:pinnacle:account` y `capture:pinnacle:account:headless`.
+
+### 🔄 Changed
+
+#### Provider metadata explicita en mirrors locales
+- **`src/services/paperTradingService.js`**:
+  - `placeAutoBet(...)` persiste `provider`, `placementProvider`, `integration`.
+- **`src/services/bookySemiAutoService.js`**:
+  - Se aplica metadata Booky en confirmaciones semi/real y parches post-aceptacion.
+- **`src/services/pinnacleSemiAutoService.js`**:
+  - Se aplica metadata Pinnacle en confirmaciones semi/real, mirror manual y reconciliacion remota.
+
+#### UI: provider manual, sync explicito y Finalizados por origen
+- **`client/src/App.jsx`**:
+  - Selector runtime de proveedor manual (`BOOKY`/`PINNACLE`) en Auto Placement.
+  - Boton/badge de provider para sync manual de historial Pinnacle (estado `SYNC...`, hover `SYNC PINNACLE`).
+  - Filtro de Finalizados por proveedor (`ALL/BOOKY/PINNACLE/SIM`) y badge de origen por fila.
+
+#### Cuenta Pinnacle con PnL real anclado a cashflow externo
+- **`src/services/pinnacleSemiAutoService.js`**:
+  - `getPinnacleAccountBalance(...)` ahora incluye `pnl` + `transactions`.
+  - Base de capital inferida desde `GET /0.1/transactions` (depositos/retiros externos) con fallback por entorno.
+  - Nuevos knobs:
+    - `PINNACLE_PNL_WINDOW_DAYS`
+    - `PINNACLE_PNL_BASE_CAPITAL`
+
+### 🐛 Fixed
+
+#### PnL incorrecto en header al usar proveedor manual Pinnacle
+- **`client/src/App.jsx`**:
+  - Se corrige mezcla de saldo Pinnacle con PnL de Booky.
+  - El header ahora muestra PnL de Pinnacle cuando el provider activo es Pinnacle.
+
+#### Desborde de control sync en tarjeta Auto Placement
+- **`client/src/App.jsx`**:
+  - Layout responsive (`flex-wrap` + stack en ancho estrecho) para evitar overflow del control de sync.
+
+### 🧪 Validated
+
+- Build frontend exitoso:
+  - `npm --prefix client run build`.
+- Smoke test servicio Pinnacle:
+  - balance `0.82`, base capital `25`, PnL `-24.18` (caso real validado).
+- Sin errores estaticos en archivos tocados (`App.jsx`, `pinnacleSemiAutoService.js`, `pinnacle.js`, `bookySemiAutoService.js`, `paperTradingService.js`).
+
 ## [v3.4.21] -- 2026-03-29 -- Sprint: Auto-Placement Provider Selector (Booky/Pinnacle)
 
 > Rama: `master`

@@ -58,6 +58,113 @@ const REENTRY_MIN_ODD_IMPROVEMENT_PCT = 8;
 const REENTRY_MIN_EV_PERCENT = 3;
 const REENTRY_MIN_STAKE_SOL = 1;
 const MIN_BOOKY_STAKE_SOL = 1;
+const AUTO_PLACEMENT_PROVIDER_ALLOWED = ['booky', 'pinnacle'];
+
+const normalizeAutoPlacementProvider = (value = '', fallback = 'booky') => {
+    const normalized = String(value || '').trim().toLowerCase();
+    return AUTO_PLACEMENT_PROVIDER_ALLOWED.includes(normalized) ? normalized : fallback;
+};
+
+const normalizeAutoPlacementProviderOptions = (values = []) => {
+    const list = Array.isArray(values) ? values : [];
+    const normalized = list
+        .map((v) => normalizeAutoPlacementProvider(v, ''))
+        .filter(Boolean);
+    return normalized.length > 0 ? Array.from(new Set(normalized)) : [...AUTO_PLACEMENT_PROVIDER_ALLOWED];
+};
+
+const FINISHED_PROVIDER_FILTER_ALLOWED = ['ALL', 'BOOKY', 'PINNACLE', 'SIM'];
+const FINISHED_PROVIDER_FILTER_LABELS = {
+    ALL: 'Todos',
+    BOOKY: 'Booky',
+    PINNACLE: 'Pinnacle',
+    SIM: 'Sim'
+};
+
+const normalizeFinishedProviderFilter = (value = 'ALL') => {
+    const normalized = String(value || '').trim().toUpperCase();
+    return FINISHED_PROVIDER_FILTER_ALLOWED.includes(normalized) ? normalized : 'ALL';
+};
+
+const resolveFinishedProviderOrigin = (row = {}) => {
+    if (!row || typeof row !== 'object') return 'SIM';
+
+    if (typeof row?.finishedProviderOrigin === 'string' && row.finishedProviderOrigin.trim()) {
+        return normalizeFinishedProviderFilter(row.finishedProviderOrigin);
+    }
+
+    const source = String(row?.source || '').trim().toLowerCase();
+    const integration = String(
+        row?.integration ||
+        row?.realPlacement?.integration ||
+        row?.realPlacement?.requested?.integration ||
+        ''
+    ).trim().toLowerCase();
+    const providerHint = String(
+        row?.provider ||
+        row?.realPlacement?.provider ||
+        row?.placementProvider ||
+        ''
+    ).trim().toLowerCase();
+    const endpoint = String(row?.realPlacement?.endpoint || '').trim().toLowerCase();
+    const providerRequestId = String(row?.providerRequestId || row?.realPlacement?.response?.requestId || '').trim();
+
+    const looksPinnacle = Boolean(
+        providerHint.includes('pinnacle') ||
+        providerHint.includes('arcadia') ||
+        endpoint.includes('arcadia.pinnacle.com') ||
+        endpoint.includes('/0.1/bets') ||
+        providerRequestId
+    );
+    if (looksPinnacle) return 'PINNACLE';
+
+    const looksBooky = Boolean(
+        row?.isBookyHistory ||
+        source === 'remote' ||
+        integration === 'acity' ||
+        integration === 'doradobet' ||
+        endpoint.includes('placewidget') ||
+        endpoint.includes('altenar') ||
+        endpoint.includes('biahosted')
+    );
+    if (looksBooky) return 'BOOKY';
+
+    const hasRealMarkers = Boolean(
+        row?.isRealHistory ||
+        row?.providerBetId ||
+        row?.providerStatus ||
+        row?.realPlacement
+    );
+    if (hasRealMarkers) return 'BOOKY';
+
+    return 'SIM';
+};
+
+const getFinishedProviderBadgeMeta = (row = {}) => {
+    const origin = resolveFinishedProviderOrigin(row);
+
+    if (origin === 'PINNACLE') {
+        return {
+            origin,
+            label: 'PINNACLE',
+            className: 'bg-orange-500/15 text-orange-300 border-orange-500/30'
+        };
+    }
+
+    if (origin === 'BOOKY') {
+        return {
+            origin,
+            label: 'BOOKY',
+            className: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+        };
+    }
+
+    return {
+        origin: 'SIM',
+        label: 'SIM',
+        className: 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+    };
+};
 
 const resolveBookyOutcome = (row = {}) => {
     const status = Number(row?.status);
@@ -631,9 +738,30 @@ function App() {
         pnl: { realized: 0, source: null, rowsCount: 0 },
         fetchedAt: null
     });
+    const [pinnacleAccount, setPinnacleAccount] = useState({
+        balance: { amount: null, currency: 'USD', stale: true },
+        pnl: { total: null, baseCapital: null, baseCapitalSource: null, source: null, rowsCount: 0 },
+        transactions: { source: null, fetchedAt: null, windowDays: 0, summary: null, error: null },
+        fetchedAt: null,
+        endpoint: '/wallet/balance',
+        source: 'arcadia'
+    });
     const [tokenHealth, setTokenHealth] = useState(null);
     const [kellyDiagnostics, setKellyDiagnostics] = useState(null);
     const [tokenClockMs, setTokenClockMs] = useState(() => Date.now());
+    const [autoPlacementProvider, setAutoPlacementProvider] = useState('booky');
+    const [autoPlacementProviderOptions, setAutoPlacementProviderOptions] = useState([...AUTO_PLACEMENT_PROVIDER_ALLOWED]);
+    const [autoPlacementProviderLoading, setAutoPlacementProviderLoading] = useState(false);
+    const [autoPlacementProviderSaving, setAutoPlacementProviderSaving] = useState(false);
+    const [pinnacleHistorySyncing, setPinnacleHistorySyncing] = useState(false);
+    const [pinnacleSyncButtonHover, setPinnacleSyncButtonHover] = useState(false);
+    const [pinnacleHistorySyncMeta, setPinnacleHistorySyncMeta] = useState({
+        fetchedAt: null,
+        totalCount: 0,
+        touchedCount: 0,
+        source: null,
+        error: null
+    });
   
   const [loading, setLoading] = useState(false);
   
@@ -647,6 +775,13 @@ function App() {
       } catch (_) {}
       return 'HYBRID';
   }); // HYBRID | BOOKY | CANONICAL
+  const [finishedProviderFilter, setFinishedProviderFilter] = useState(() => {
+      try {
+          return normalizeFinishedProviderFilter(localStorage.getItem('finishedProviderFilter') || 'ALL');
+      } catch (_) {
+          return 'ALL';
+      }
+  });
 
   // Refs para control de notificaciones
   const isFirstLoad = useRef(true);
@@ -660,6 +795,9 @@ function App() {
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
     const lastPrematchFetchAtRef = useRef(0);
+    const lastPlacementProviderFetchAtRef = useRef(0);
+    const lastPinnacleAccountFetchAtRef = useRef(0);
+    const pinnacleBalanceFetchInFlightRef = useRef(false);
     const latestPortfolioActiveBetsRef = useRef([]);
     const latestBookyHistoryRef = useRef([]);
     const activeTabRef = useRef(activeTab);
@@ -670,9 +808,14 @@ function App() {
     const remoteOpenEventIdsRef = useRef(new Set());
     const autoTokenRenewInFlightRef = useRef(false);
     const lastSilentTokenRenewAttemptAtRef = useRef(0);
+    const placementProviderFetchInFlightRef = useRef(false);
 
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
+    const PLACEMENT_PROVIDER_POLL_MS = 20000;
+    const PINNACLE_BALANCE_POLL_MS = 15000;
+    const PINNACLE_HISTORY_SYNC_DAYS = 180;
+    const PINNACLE_HISTORY_SYNC_LIMIT = 500;
     const BOOKY_HISTORY_LIMIT = 120;
     const BOOKY_HISTORY_LIMIT_FINISHED_REAL = 0;
     const TOKEN_CLOCK_TICK_MS = 1000;
@@ -875,6 +1018,91 @@ function App() {
         };
     };
 
+    const fetchAutoPlacementProvider = async ({ force = false } = {}) => {
+        if (placementProviderFetchInFlightRef.current) return;
+
+        const nowMs = Date.now();
+        if (!force && (nowMs - lastPlacementProviderFetchAtRef.current) < PLACEMENT_PROVIDER_POLL_MS) return;
+
+        placementProviderFetchInFlightRef.current = true;
+        setAutoPlacementProviderLoading(true);
+
+        try {
+            const res = await axios.get('/api/opportunities/live/placement-provider', { timeout: 6000 });
+            if (!res?.data?.success) return;
+
+            const provider = normalizeAutoPlacementProvider(res.data.provider, 'booky');
+            const options = normalizeAutoPlacementProviderOptions(res.data.allowed);
+            setAutoPlacementProvider(provider);
+            setAutoPlacementProviderOptions(options);
+        } catch (error) {
+            console.warn('⚠️ Provider auto-placement fetch falló. Se mantiene snapshot previo.', error?.message || error);
+        } finally {
+            lastPlacementProviderFetchAtRef.current = Date.now();
+            placementProviderFetchInFlightRef.current = false;
+            setAutoPlacementProviderLoading(false);
+        }
+    };
+
+    const fetchPinnacleBalanceSnapshot = async ({ force = false } = {}) => {
+        if (pinnacleBalanceFetchInFlightRef.current) return;
+
+        const nowMs = Date.now();
+        if (!force && (nowMs - lastPinnacleAccountFetchAtRef.current) < PINNACLE_BALANCE_POLL_MS) return;
+
+        pinnacleBalanceFetchInFlightRef.current = true;
+
+        try {
+            const res = await axios.get(force ? '/api/pinnacle/account?refresh=1' : '/api/pinnacle/account', { timeout: force ? 15000 : 8000 });
+            if (!res?.data?.success) return;
+
+            const rawAmount = res.data?.balance?.amount;
+            const parsedAmount = (rawAmount === null || rawAmount === undefined || String(rawAmount).trim() === '')
+                ? null
+                : Number(rawAmount);
+            const rawPnlTotal = res.data?.pnl?.total;
+            const parsedPnlTotal = (rawPnlTotal === null || rawPnlTotal === undefined || String(rawPnlTotal).trim() === '')
+                ? null
+                : Number(rawPnlTotal);
+            const rawBaseCapital = res.data?.pnl?.baseCapital;
+            const parsedBaseCapital = (rawBaseCapital === null || rawBaseCapital === undefined || String(rawBaseCapital).trim() === '')
+                ? null
+                : Number(rawBaseCapital);
+
+            setPinnacleAccount({
+                balance: {
+                    amount: Number.isFinite(parsedAmount) ? parsedAmount : null,
+                    currency: String(res.data?.balance?.currency || 'USD').toUpperCase(),
+                    stale: false
+                },
+                pnl: {
+                    total: Number.isFinite(parsedPnlTotal) ? parsedPnlTotal : null,
+                    netAfterOpenStake: Number.isFinite(parsedPnlTotal) ? parsedPnlTotal : null,
+                    byBalance: Number.isFinite(Number(res.data?.pnl?.byBalance)) ? Number(res.data?.pnl?.byBalance) : null,
+                    baseCapital: Number.isFinite(parsedBaseCapital) ? parsedBaseCapital : null,
+                    baseCapitalSource: String(res.data?.pnl?.baseCapitalSource || '').trim() || null,
+                    source: String(res.data?.pnl?.source || '').trim() || null,
+                    rowsCount: Number(res.data?.pnl?.rowsCount || 0)
+                },
+                transactions: {
+                    source: String(res.data?.transactions?.source || '').trim() || null,
+                    fetchedAt: res.data?.transactions?.fetchedAt || null,
+                    windowDays: Number(res.data?.transactions?.windowDays || 0),
+                    summary: res.data?.transactions?.summary || null,
+                    error: res.data?.transactions?.error || null
+                },
+                fetchedAt: res.data?.fetchedAt || new Date().toISOString(),
+                endpoint: res.data?.endpoint || '/wallet/balance',
+                source: res.data?.source || 'arcadia'
+            });
+            lastPinnacleAccountFetchAtRef.current = Date.now();
+        } catch (error) {
+            console.warn('⚠️ Pinnacle balance fetch falló. Se mantiene snapshot previo.', error?.message || error);
+        } finally {
+            pinnacleBalanceFetchInFlightRef.current = false;
+        }
+    };
+
   // --- API CALLS ---
 
         const fetchData = async ({ forceBookyRefresh = false } = {}) => {
@@ -896,6 +1124,18 @@ function App() {
             const bookyAccountUrl = mustRefreshBookyNow
                 ? `/api/booky/account?refresh=1&historyLimit=${selectedHistoryLimit}`
                 : `/api/booky/account?historyLimit=${selectedHistoryLimit}`;
+            const shouldFetchPlacementProvider = forceBookyRefresh || (nowMs - lastPlacementProviderFetchAtRef.current) >= PLACEMENT_PROVIDER_POLL_MS;
+            const shouldFetchPinnacleBalance =
+                normalizeAutoPlacementProvider(autoPlacementProvider, 'booky') === 'pinnacle'
+                && (forceBookyRefresh || (nowMs - lastPinnacleAccountFetchAtRef.current) >= PINNACLE_BALANCE_POLL_MS);
+
+            if (shouldFetchPlacementProvider) {
+                void fetchAutoPlacementProvider({ force: true });
+            }
+
+            if (shouldFetchPinnacleBalance) {
+                void fetchPinnacleBalanceSnapshot({ force: forceBookyRefresh });
+            }
 
             const settled = await Promise.allSettled([
                 axios.get('/api/opportunities/live'),
@@ -1020,7 +1260,7 @@ function App() {
                     const optimisticTtlMs = resolveOptimisticTtlMs(optimisticMeta);
                     const isInFlight = Boolean(optimisticMeta?.optimisticInFlight);
                     const optimisticPlacementMode = String(optimisticMeta?.optimisticPlacementMode || 'UNKNOWN').toUpperCase();
-                    const requiresBookyConfirmation = optimisticPlacementMode === 'REAL';
+                    const requiresBookyConfirmation = optimisticPlacementMode === 'REAL' || optimisticPlacementMode === 'BOOKY_REAL';
                     const hasFreshRemoteCheck = !requiresBookyConfirmation || ((Date.now() - Number(lastBookyAccountFetchAtRef.current || 0)) <= 25000);
 
                     const confirmedAtMs = new Date(optimisticMeta?.optimisticConfirmedAt || 0).getTime();
@@ -1227,6 +1467,88 @@ function App() {
         }
     };
 
+    const handleAutoPlacementProviderChange = async (providerRaw = '') => {
+        const nextProvider = normalizeAutoPlacementProvider(providerRaw, autoPlacementProvider);
+        if (!nextProvider || nextProvider === autoPlacementProvider) return;
+
+        setAutoPlacementProviderSaving(true);
+        try {
+            const { data } = await axios.post(
+                '/api/opportunities/live/placement-provider',
+                { provider: nextProvider },
+                { timeout: 8000 }
+            );
+
+            if (!data?.success) {
+                throw new Error(data?.error || 'No se pudo actualizar el proveedor.');
+            }
+
+            setAutoPlacementProvider(normalizeAutoPlacementProvider(data.provider, nextProvider));
+            setAutoPlacementProviderOptions(normalizeAutoPlacementProviderOptions(data.allowed));
+            lastPlacementProviderFetchAtRef.current = Date.now();
+
+            if (nextProvider === 'pinnacle') {
+                await fetchPinnacleBalanceSnapshot({ force: true });
+            }
+
+            void fetchData({ forceBookyRefresh: true });
+        } catch (error) {
+            alert(`⚠️ No se pudo cambiar proveedor de auto-placement: ${error?.message || error}`);
+            void fetchAutoPlacementProvider({ force: true });
+        } finally {
+            setAutoPlacementProviderSaving(false);
+        }
+    };
+
+    const handleManualPinnacleHistorySync = async () => {
+        if (pinnacleHistorySyncing) return;
+
+        setPinnacleHistorySyncing(true);
+        setPinnacleHistorySyncMeta((prev) => ({ ...prev, error: null }));
+
+        try {
+            const { data } = await axios.get('/api/pinnacle/history', {
+                params: {
+                    refresh: 1,
+                    limit: PINNACLE_HISTORY_SYNC_LIMIT,
+                    status: 'settled',
+                    days: PINNACLE_HISTORY_SYNC_DAYS
+                },
+                timeout: 30000
+            });
+
+            if (!data?.success) {
+                throw new Error(data?.error || 'No se pudo sincronizar historial Pinnacle.');
+            }
+
+            const totalCount = Number(data?.totalCount || 0);
+            const touchedCount = Number(data?.reconcileStats?.touchedCount || 0);
+            const fetchedAt = data?.fetchedAt || new Date().toISOString();
+
+            setPinnacleHistorySyncMeta({
+                fetchedAt,
+                totalCount,
+                touchedCount,
+                source: data?.source || null,
+                error: null
+            });
+
+            await fetchPinnacleBalanceSnapshot({ force: true });
+            await fetchData({ forceBookyRefresh: true });
+
+            alert(`✅ Sync Pinnacle OK. Remotas: ${totalCount} | Tocadas local: ${touchedCount}`);
+        } catch (error) {
+            const message = error?.message || 'Error desconocido al sincronizar Pinnacle.';
+            setPinnacleHistorySyncMeta((prev) => ({
+                ...prev,
+                error: message
+            }));
+            alert(`⚠️ Sync Pinnacle falló: ${message}`);
+        } finally {
+            setPinnacleHistorySyncing(false);
+        }
+    };
+
   const resetPortfolio = async () => {
     if (!window.confirm("¿Seguro de reiniciar la simulación?")) return;
     try {
@@ -1330,6 +1652,12 @@ function App() {
             } catch (_) {}
     }, [finishedSelectionView]);
 
+        useEffect(() => {
+            try {
+                localStorage.setItem('finishedProviderFilter', normalizeFinishedProviderFilter(finishedProviderFilter));
+            } catch (_) {}
+        }, [finishedProviderFilter]);
+
   // Effect para Notificaciones Sonoras (Nuevas Oportunidades Live)
   useEffect(() => {
     if (isFirstLoad.current) {
@@ -1391,6 +1719,14 @@ function App() {
     const realBalanceAmount = Number(bookyAccount?.balance?.amount);
     const realBalanceCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
     const activeBookyLabel = String(bookyAccount?.profile || bookyAccount?.integration || 'booky').toUpperCase();
+    const pinnacleBalanceAmount = Number(pinnacleAccount?.balance?.amount);
+    const pinnacleBalanceCurrency = String(pinnacleAccount?.balance?.currency || 'USD').toUpperCase();
+    const pinnaclePnlSnapshotRaw = Number(pinnacleAccount?.pnl?.netAfterOpenStake ?? pinnacleAccount?.pnl?.total);
+    const pinnaclePnlByBalanceRaw = Number(pinnacleAccount?.pnl?.byBalance);
+    const pinnacleBaseCapitalRaw = Number(pinnacleAccount?.pnl?.baseCapital);
+    const pinnacleRealPnL = Number.isFinite(pinnaclePnlSnapshotRaw)
+        ? pinnaclePnlSnapshotRaw
+        : (Number.isFinite(pinnaclePnlByBalanceRaw) ? pinnaclePnlByBalanceRaw : NaN);
     const pnlFromSnapshot = Number(bookyAccount?.pnl?.netAfterOpenStake);
     const pnlFromSnapshotTotal = Number(bookyAccount?.pnl?.total);
     const pnlFromSnapshotRealized = Number(bookyAccount?.pnl?.realized);
@@ -1471,16 +1807,49 @@ function App() {
         ? Number(simulatedRealizedPnL.toFixed(2))
         : 0;
 
+    const manualProviderNormalized = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+    const showPinnacleBalanceInHeader = manualProviderNormalized === 'pinnacle' && Number.isFinite(pinnacleBalanceAmount);
+    const wantsPinnacleBalance = manualProviderNormalized === 'pinnacle';
+
     const showSimInHeader = isSimulatedDisplayMode || isManualKellyMode;
-    const headerCapitalAmount = showSimInHeader
+    const defaultHeaderCapitalAmount = showSimInHeader
         ? (Number.isFinite(simulatedCapitalAmount)
             ? simulatedCapitalAmount
             : (Number.isFinite(kellyBaseAmount) ? kellyBaseAmount : NaN))
         : realBalanceAmount;
-    const headerCapitalCurrency = showSimInHeader ? kellyBaseCurrency : realBalanceCurrency;
-    const headerPnlAmount = showSimInHeader ? simulatedPnlAmount : realBookyPnL;
+    const defaultHeaderCapitalCurrency = showSimInHeader ? kellyBaseCurrency : realBalanceCurrency;
+    const fallbackAmountWhenPinnacleMissing = Number.isFinite(realBalanceAmount) ? realBalanceAmount : defaultHeaderCapitalAmount;
+    const fallbackCurrencyWhenPinnacleMissing = Number.isFinite(realBalanceAmount) ? realBalanceCurrency : defaultHeaderCapitalCurrency;
+    const headerCapitalAmount = showPinnacleBalanceInHeader
+        ? pinnacleBalanceAmount
+        : (wantsPinnacleBalance ? fallbackAmountWhenPinnacleMissing : defaultHeaderCapitalAmount);
+    const headerCapitalCurrency = showPinnacleBalanceInHeader
+        ? pinnacleBalanceCurrency
+        : (wantsPinnacleBalance ? fallbackCurrencyWhenPinnacleMissing : defaultHeaderCapitalCurrency);
+    const headerPnlAmount = showSimInHeader
+        ? simulatedPnlAmount
+        : (wantsPinnacleBalance
+            ? (Number.isFinite(pinnacleRealPnL) ? pinnacleRealPnL : realBookyPnL)
+            : realBookyPnL);
     const headerPnlClass = headerPnlAmount >= 0 ? 'text-emerald-400' : 'text-red-400';
-    const headerPnlLabel = showSimInHeader ? 'PnL (SIM NAV)' : `PnL (${activeBookyLabel})`;
+    const headerPnlLabel = wantsPinnacleBalance
+        ? 'PnL (PINNACLE)'
+        : (showSimInHeader ? 'PnL (SIM NAV)' : `PnL (${activeBookyLabel})`);
+    const pinnacleBaseCapitalLabel = Number.isFinite(pinnacleBaseCapitalRaw)
+        ? ` | Base: ${pinnacleBalanceCurrency} ${pinnacleBaseCapitalRaw.toFixed(2)}`
+        : '';
+    const headerBalanceSourceLabel = showPinnacleBalanceInHeader
+        ? `Saldo mostrado: PINNACLE (${pinnacleAccount?.endpoint || '/wallet/balance'})${pinnacleBaseCapitalLabel}`
+        : (wantsPinnacleBalance
+            ? `Saldo Pinnacle no disponible; fallback ${activeBookyLabel}`
+            : `Saldo mostrado: ${activeBookyLabel} (Booky/ACity)`);
+    const autoPlacementProviderLabel = String(autoPlacementProvider || 'booky').toUpperCase();
+    const autoPlacementProviderPretty = autoPlacementProvider === 'pinnacle' ? 'Pinnacle' : 'Booky';
+    const autoPlacementProviderBadgeClass = autoPlacementProvider === 'pinnacle'
+        ? (pinnacleHistorySyncing
+            ? 'bg-blue-500/35 text-blue-100 border-blue-300/70 ring-1 ring-blue-300/35'
+            : 'bg-blue-500/20 text-blue-300 border-blue-500/35 hover:bg-blue-500/30')
+        : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/35';
     const [tokenRenewing, setTokenRenewing] = useState(false);
     const tokenRenewingRef = useRef(false);
 
@@ -1568,10 +1937,15 @@ function App() {
                         ? 'confirm-fast'
                         : (options?.confirmModeHint === 'confirm' ? 'confirm' : null);
         const optimisticIsSnipe = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE';
-                let useRealPlacement = true;
+            const manualPlacementProvider = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+            const isBookyManualPlacement = manualPlacementProvider === 'booky';
+            const providerApiBase = isBookyManualPlacement ? '/api/booky' : '/api/pinnacle';
+            const providerLabel = isBookyManualPlacement ? 'Booky' : 'Pinnacle';
+            const providerPrefix = isBookyManualPlacement ? 'BOOKY' : 'PINNACLE';
+            let useRealPlacement = !isBookyManualPlacement;
 
         const recoverPreparedTicket = async () => {
-            const ticketsRes = await axios.get('/api/booky/tickets', { timeout: 7000 });
+            const ticketsRes = await axios.get(`${providerApiBase}/tickets`, { timeout: 7000 });
             const pending = Array.isArray(ticketsRes?.data?.pending) ? ticketsRes.data.pending : [];
             const nowMs = Date.now();
 
@@ -1641,7 +2015,7 @@ function App() {
         optimisticCreatedAt: Date.now(),
         optimisticTtlMs: optimisticIsSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS,
         optimisticIsSnipe,
-        optimisticPlacementMode: 'UNKNOWN',
+        optimisticPlacementMode: `${providerPrefix}_UNKNOWN`,
         optimisticInFlight: true,
         optimisticFlow: 'preparing',
         optimisticConfirmedAt: null,
@@ -1652,12 +2026,12 @@ function App() {
     try {
         // Optimización UX: no bloquear el flujo por token-health lento.
         // El backend vuelve a validar token en confirmación real.
-        const tokenHealthPromise = axios
-            .get('/api/booky/token-health', { timeout: 3500 })
-            .catch(() => null);
+        const tokenHealthPromise = isBookyManualPlacement
+            ? axios.get('/api/booky/token-health', { timeout: 3500 }).catch(() => null)
+            : Promise.resolve(null);
 
         const prepareTimeoutMs = 45000;
-        const doPrepare = () => axios.post('/api/booky/prepare', opportunity, { timeout: prepareTimeoutMs });
+        const doPrepare = () => axios.post(`${providerApiBase}/prepare`, opportunity, { timeout: prepareTimeoutMs });
 
         let prepRes;
         try {
@@ -1689,7 +2063,7 @@ function App() {
         const token = tokenRes?.data?.token;
         const tokenCheckAvailable = Boolean(tokenRes?.data?.success);
 
-        if (tokenCheckAvailable && !hasEnoughTokenLife(token)) {
+        if (isBookyManualPlacement && tokenCheckAvailable && !hasEnoughTokenLife(token)) {
             const liveTokenMins = getTokenRemainingMinutes(token);
             const minRequiredMins = Number(token?.minRequiredMinutes || 2);
             const reason = !token?.authenticated
@@ -1697,12 +2071,16 @@ function App() {
                 : (token?.expired
                     ? 'token vencido'
                     : `token por vencer (${liveTokenMins.toFixed(1)} min < ${minRequiredMins.toFixed(1)} min requeridos)`);
-            await axios.post(`/api/booky/cancel/${ticket.id}`).catch(() => {});
-            alert(`⚠️ No se puede apostar en Booky: ${reason}. Renueva token y reintenta.`);
+            await axios.post(`${providerApiBase}/cancel/${ticket.id}`).catch(() => {});
+            alert(`⚠️ No se puede apostar en ${providerLabel}: ${reason}. Renueva token y reintenta.`);
             localPlacedBetIdsRef.current.delete(id);
             delete pendingBetDetailsRef.current[id];
             forceUpdate();
             return;
+        }
+
+        if (isBookyManualPlacement) {
+            useRealPlacement = Boolean(token?.realPlacementEnabled);
         }
 
         pendingBetDetailsRef.current[id] = {
@@ -1711,7 +2089,7 @@ function App() {
             optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
             optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (optimisticIsSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
             optimisticIsSnipe,
-            optimisticPlacementMode: useRealPlacement ? 'REAL' : 'SIM',
+            optimisticPlacementMode: `${providerPrefix}_${useRealPlacement ? 'REAL' : 'SIM'}`,
             optimisticInFlight: true,
             optimisticFlow: 'prepared',
             optimisticConfirmedAt: null,
@@ -1742,18 +2120,21 @@ function App() {
         const evDeltaLine = showDelta(oldEv, ev, 2);
         const probDeltaLine = showDelta(oldRealProb, realProb, 2);
         const tokenMins = getTokenRemainingMinutes(token);
-        useRealPlacement = Boolean(token?.realPlacementEnabled);
-        const placementTitle = useRealPlacement ? 'Apuesta REAL Booky' : 'Apuesta SIMULADA (Paper)';
+        const placementTitle = useRealPlacement ? `Apuesta REAL ${providerLabel}` : `Apuesta SIMULADA (${providerLabel})`;
         const placementQuestion = useRealPlacement
-            ? '¿Confirmar envío REAL a Booky?'
+            ? `¿Confirmar envío REAL a ${providerLabel}?`
             : '¿Confirmar apuesta SIMULADA al historial local?';
-        const tokenLine = tokenCheckAvailable
+        const tokenLine = isBookyManualPlacement
+            ? (tokenCheckAvailable
             ? (useRealPlacement
                 ? `Token restante: ${tokenMins.toFixed(1)} min\n\n`
                 : 'Modo simulado: no se enviará placeWidget al provider.\n\n')
             : (useRealPlacement
                 ? 'Token: verificación rápida no disponible (se validará al confirmar)\n\n'
-                : 'Modo simulado: verificación de token no requerida para placement real.\n\n');
+                : 'Modo simulado: verificación de token no requerida para placement real.\n\n'))
+            : (useRealPlacement
+                ? 'Placement real vía Pinnacle API.\n\n'
+                : 'Modo simulado: confirmación local en portfolio.\n\n');
 
         const refreshLines = [
             'Recalculo previo a confirmación:',
@@ -1781,7 +2162,7 @@ function App() {
         );
 
         if (!ok) {
-            await axios.post(`/api/booky/cancel/${ticket.id}`);
+            await axios.post(`${providerApiBase}/cancel/${ticket.id}`);
             localPlacedBetIdsRef.current.delete(id);
             delete pendingBetDetailsRef.current[id];
             forceUpdate();
@@ -1791,8 +2172,8 @@ function App() {
         const isLiveSnipe = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase() === 'LIVE_SNIPE';
         const confirmMode = forcedConfirmMode || (isLiveSnipe ? 'confirm-fast' : 'confirm');
         const confirmEndpoint = useRealPlacement
-            ? `/api/booky/real/${confirmMode}/${ticket.id}`
-            : `/api/booky/confirm/${ticket.id}`;
+            ? `${providerApiBase}/real/${confirmMode}/${ticket.id}`
+            : `${providerApiBase}/confirm/${ticket.id}`;
 
         if (pendingBetDetailsRef.current[id]) {
             pendingBetDetailsRef.current[id] = {
@@ -1817,14 +2198,56 @@ function App() {
                     optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
                     optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (isLiveSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
                     optimisticIsSnipe: pendingBetDetailsRef.current[id]?.optimisticIsSnipe ?? isLiveSnipe,
-                    optimisticPlacementMode: 'SIM',
+                    optimisticPlacementMode: `${providerPrefix}_SIM`,
                     optimisticInFlight: false,
                     optimisticFlow: 'confirmed',
                     optimisticConfirmedAt: new Date().toISOString(),
                     optimisticMissingRemoteChecks: 0
                 };
                 forceUpdate();
-                alert('✅ Apuesta simulada confirmada y registrada en portfolio local.');
+                alert(`✅ Apuesta simulada (${providerLabel}) confirmada y registrada en portfolio local.`);
+                await fetchData();
+                return;
+            }
+
+            if (!isBookyManualPlacement) {
+                const providerBetId =
+                    confirmRes?.data?.ticket?.portfolioBetId ||
+                    confirmRes?.data?.providerResponse?.betId ||
+                    confirmRes?.data?.providerResponse?.requestId ||
+                    null;
+                const requestedStakeRaw =
+                    Number(confirmRes?.data?.ticket?.realPlacement?.requested?.stake) ||
+                    stake;
+                const requestedOddRaw =
+                    Number(confirmRes?.data?.ticket?.realPlacement?.requested?.selections?.[0]?.price) ||
+                    Number(confirmRes?.data?.ticket?.realPlacement?.requested?.odd) ||
+                    odd;
+
+                const syncedStake = Number.isFinite(requestedStakeRaw) && requestedStakeRaw > 0 ? requestedStakeRaw : stake;
+                const syncedOdd = Number.isFinite(requestedOddRaw) && requestedOddRaw > 1 ? requestedOddRaw : odd;
+
+                pendingBetDetailsRef.current[id] = {
+                    ...(pendingBetDetailsRef.current[id] || opportunity),
+                    odd: syncedOdd,
+                    price: syncedOdd,
+                    stake: syncedStake,
+                    kellyStake: syncedStake,
+                    potentialReturn: syncedStake * syncedOdd,
+                    confirmedAt: new Date().toISOString(),
+                    providerBetId: providerBetId || (pendingBetDetailsRef.current[id]?.providerBetId || null),
+                    optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
+                    optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (isLiveSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
+                    optimisticIsSnipe: pendingBetDetailsRef.current[id]?.optimisticIsSnipe ?? isLiveSnipe,
+                    optimisticPlacementMode: 'PINNACLE_REAL',
+                    optimisticInFlight: false,
+                    optimisticFlow: 'confirmed',
+                    optimisticConfirmedAt: new Date().toISOString(),
+                    optimisticMissingRemoteChecks: 0
+                };
+                forceUpdate();
+
+                alert('✅ Apuesta REAL enviada y confirmada en Pinnacle.');
                 await fetchData();
                 return;
             }
@@ -1893,7 +2316,7 @@ function App() {
                 optimisticCreatedAt: pendingBetDetailsRef.current[id]?.optimisticCreatedAt || Date.now(),
                 optimisticTtlMs: pendingBetDetailsRef.current[id]?.optimisticTtlMs || (isLiveSnipe ? OPTIMISTIC_BET_TTL_SNIPE_MS : OPTIMISTIC_BET_TTL_MS),
                 optimisticIsSnipe: pendingBetDetailsRef.current[id]?.optimisticIsSnipe ?? isLiveSnipe,
-                optimisticPlacementMode: 'REAL',
+                optimisticPlacementMode: 'BOOKY_REAL',
                 optimisticInFlight: false,
                 optimisticFlow: 'confirmed',
                 optimisticConfirmedAt: new Date().toISOString(),
@@ -1954,6 +2377,15 @@ function App() {
                 offerImmediateRequoteRetry();
                 return;
             }
+            if (confirmRes.data?.code === 'PINNACLE_REAL_REJECTED') {
+                const msg = confirmRes.data?.message || 'Provider rechazó la apuesta.';
+                alert(`❌ Rechazo Pinnacle: ${msg}`);
+                localPlacedBetIdsRef.current.delete(id);
+                delete pendingBetDetailsRef.current[id];
+                forceUpdate();
+                await fetchData();
+                return;
+            }
             const msg = confirmRes.data?.message || 'Error desconocido';
             alert(`⚠️ ${useRealPlacement ? 'Confirmación real' : 'Confirmación simulada'} falló: ${msg}`);
             localPlacedBetIdsRef.current.delete(id);
@@ -1987,6 +2419,12 @@ function App() {
                     delete pendingBetDetailsRef.current[id];
                     forceUpdate();
                     offerImmediateRequoteRetry();
+                } else if (code === 'PINNACLE_REAL_REJECTED') {
+                    alert(`❌ Rechazo Pinnacle: ${msg}${diagText}`);
+                    localPlacedBetIdsRef.current.delete(id);
+                    delete pendingBetDetailsRef.current[id];
+                    forceUpdate();
+                    await fetchData();
                 } else {
                     const normalizedMsg = String(msg || '').toLowerCase();
                     if (normalizedMsg.includes('ticket no encontrado')) {
@@ -1997,8 +2435,8 @@ function App() {
                                 const recoveredType = String(recovered?.opportunity?.type || opportunity?.type || '').toUpperCase();
                                 const recoveredMode = recoveredType === 'LIVE_SNIPE' ? 'confirm-fast' : 'confirm';
                                 const retryEndpoint = useRealPlacement
-                                    ? `/api/booky/real/${recoveredMode}/${recovered.id}`
-                                    : `/api/booky/confirm/${recovered.id}`;
+                                    ? `${providerApiBase}/real/${recoveredMode}/${recovered.id}`
+                                    : `${providerApiBase}/confirm/${recovered.id}`;
                                 const retryRes = await axios.post(retryEndpoint, undefined, { timeout: 30000 });
                                 if (retryRes?.data?.success) {
                                     recoveredAndConfirmed = true;
@@ -2154,7 +2592,8 @@ function App() {
                     ...h,
                     date: h.matchDate || h.createdAt || h.date || h.closedAt,
                     isFinished: true,
-                    isSimulatedHistory: true
+                    isSimulatedHistory: true,
+                    finishedProviderOrigin: 'SIM'
                 }));
 
             const pendingFinishData = (portfolio.activeBets || []).filter(b => {
@@ -2185,7 +2624,8 @@ function App() {
             }).map(b => ({
                 ...b,
                 date: b.createdAt,
-                manualStatus: 'WAIT_RES'
+                manualStatus: 'WAIT_RES',
+                finishedProviderOrigin: 'SIM'
             }));
 
             const allFinished = [...pendingFinishData, ...simHistoryData].sort((a,b) => new Date(b.date) - new Date(a.date));
@@ -2217,7 +2657,8 @@ function App() {
                 ...h,
                 date: h.closedAt || h.providerAcceptedAt || h.createdAt || h.date || h.matchDate,
                 isFinished: true,
-                isRealHistory: true
+                isRealHistory: true,
+                finishedProviderOrigin: resolveFinishedProviderOrigin(h)
             }));
 
         const existingProviderIds = new Set(
@@ -2245,7 +2686,8 @@ function App() {
                 isBookyHistory: true,
                 isFinished: true,
                 isRealHistory: true,
-                date: row?.settledAt || row?.closedAt || row?.placedAt || resolveBookyEventStartIso(row) || row?.date || row?.createdAt
+                date: row?.settledAt || row?.closedAt || row?.placedAt || resolveBookyEventStartIso(row) || row?.date || row?.createdAt,
+                finishedProviderOrigin: 'BOOKY'
             }));
 
         const allRealFinished = [...realHistoryFromPortfolio, ...realHistoryFromRemote]
@@ -2274,11 +2716,17 @@ function App() {
             return {
                 ...row,
                 finalScore: row?.finalScore || fallbackScore,
-                lastKnownScore: row?.lastKnownScore || fallbackScore
+                lastKnownScore: row?.lastKnownScore || fallbackScore,
+                finishedProviderOrigin: normalizeFinishedProviderFilter(row?.finishedProviderOrigin || resolveFinishedProviderOrigin(row))
             };
         });
 
-        return allRealFinishedHydrated.filter(op => isSameDay(new Date(op.date), dateFilter));
+        const allRealFinishedNormalized = allRealFinishedHydrated.map((row) => ({
+            ...row,
+            finishedProviderOrigin: normalizeFinishedProviderFilter(row?.finishedProviderOrigin || resolveFinishedProviderOrigin(row))
+        }));
+
+        return allRealFinishedNormalized.filter(op => isSameDay(new Date(op.date), dateFilter));
   };
 
   const getOpenBookyRemoteBets = () => {
@@ -2442,7 +2890,10 @@ function App() {
         });
 
     } else if (activeTab === 'FINISHED') {
-        return getFinishedDataForSelectedDate();
+        const rows = getFinishedDataForSelectedDate();
+        const activeProviderFilter = normalizeFinishedProviderFilter(finishedProviderFilter);
+        if (activeProviderFilter === 'ALL') return rows;
+        return rows.filter((row) => normalizeFinishedProviderFilter(resolveFinishedProviderOrigin(row)) === activeProviderFilter);
     } else if (activeTab === 'MATCHER' || activeTab === 'MONITOR') {
         // Tab especial Manual Matcher / Monitor: No usamos filteredData, renderizaremos componente dedicado
         return [];
@@ -2535,6 +2986,15 @@ function App() {
   };
 
     const filteredOps = getFilteredData();
+    const finishedRowsForDate = getFinishedDataForSelectedDate();
+    const finishedTabCount = finishedRowsForDate.length;
+    const finishedProviderCounts = finishedRowsForDate.reduce((acc, row) => {
+        const key = normalizeFinishedProviderFilter(resolveFinishedProviderOrigin(row));
+        acc.ALL += 1;
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+    }, { ALL: 0, BOOKY: 0, PINNACLE: 0, SIM: 0 });
+    const finishedFilteredCount = activeTab === 'FINISHED' ? filteredOps.length : finishedTabCount;
     const bookyHistoryRows = Array.isArray(bookyAccount?.history) ? bookyAccount.history : [];
     const bookyEventStartIsoByProvider = new Map();
     for (const row of bookyHistoryRows) {
@@ -2610,8 +3070,6 @@ function App() {
         }
     }
 
-    const finishedTabCount = getFinishedDataForSelectedDate().length;
-
     const finishedSubtotal = activeTab === 'FINISHED'
         ? filteredOps.reduce((acc, op) => acc + resolveFinishedOpPnl(op), 0)
         : 0;
@@ -2653,6 +3111,9 @@ function App() {
                                 {headerPnlAmount >= 0 ? '+' : ''}{headerPnlAmount.toFixed(2)}
                             </p>
                         </div>
+                    </div>
+                    <div className="mb-2 text-[9px] text-slate-500 uppercase tracking-wide font-semibold">
+                        {headerBalanceSourceLabel}
                     </div>
                     {/* Botones Acciones Rápidas */}
                     <div className="flex gap-1.5 pt-2 border-t border-slate-700/50 justify-end mt-auto">
@@ -2735,6 +3196,64 @@ function App() {
                             </button>
                         )}
                     </div>
+
+                    <div className="mt-2 pt-2 border-t border-slate-700/50 flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="flex flex-col">
+                            <span className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Auto Placement</span>
+                            <span className="text-[9px] text-slate-500">Cambio en caliente (scanner live)</span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5 sm:justify-end">
+                            <select
+                                value={autoPlacementProvider}
+                                onChange={(e) => handleAutoPlacementProviderChange(e.target.value)}
+                                disabled={autoPlacementProviderLoading || autoPlacementProviderSaving}
+                                className="min-w-24 bg-slate-900/70 border border-slate-600 text-slate-100 text-[10px] font-bold uppercase rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-emerald-400 disabled:opacity-60"
+                            >
+                                {autoPlacementProviderOptions.map((provider) => (
+                                    <option key={provider} value={provider}>
+                                        {String(provider).toUpperCase()}
+                                    </option>
+                                ))}
+                            </select>
+                            <button
+                                onClick={autoPlacementProvider === 'pinnacle' ? handleManualPinnacleHistorySync : undefined}
+                                onMouseEnter={() => {
+                                    if (autoPlacementProvider === 'pinnacle' && !pinnacleHistorySyncing) {
+                                        setPinnacleSyncButtonHover(true);
+                                    }
+                                }}
+                                onMouseLeave={() => setPinnacleSyncButtonHover(false)}
+                                onFocus={() => {
+                                    if (autoPlacementProvider === 'pinnacle' && !pinnacleHistorySyncing) {
+                                        setPinnacleSyncButtonHover(true);
+                                    }
+                                }}
+                                onBlur={() => setPinnacleSyncButtonHover(false)}
+                                disabled={autoPlacementProviderSaving || (autoPlacementProvider === 'pinnacle' ? pinnacleHistorySyncing : true)}
+                                className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border whitespace-nowrap transition-colors ${autoPlacementProvider === 'pinnacle' ? 'cursor-pointer disabled:opacity-70' : 'cursor-not-allowed opacity-90'} ${autoPlacementProviderBadgeClass}`}
+                                title={autoPlacementProvider === 'pinnacle'
+                                    ? 'Sincronizar historial remoto de Pinnacle y reconciliarlo al portfolio local'
+                                    : 'Selecciona PINNACLE para habilitar sync manual'}
+                            >
+                                {autoPlacementProviderSaving
+                                    ? 'Aplicando'
+                                    : (autoPlacementProvider === 'pinnacle' && pinnacleHistorySyncing
+                                        ? 'SYNC...'
+                                        : (autoPlacementProvider === 'pinnacle'
+                                            ? (pinnacleSyncButtonHover ? 'SYNC PINNACLE' : 'PINNACLE')
+                                            : autoPlacementProviderLabel))}
+                            </button>
+                        </div>
+                    </div>
+                    {autoPlacementProvider === 'pinnacle' && (
+                        <div className="mt-1 text-[9px] text-blue-300/90 font-mono">
+                            {pinnacleHistorySyncMeta?.error
+                                ? `Sync error: ${pinnacleHistorySyncMeta.error}`
+                                : (pinnacleHistorySyncMeta?.fetchedAt
+                                    ? `Ult sync ${formatTimeSafe(pinnacleHistorySyncMeta.fetchedAt)} | remotas ${Number(pinnacleHistorySyncMeta.totalCount || 0)} | tocadas ${Number(pinnacleHistorySyncMeta.touchedCount || 0)}`
+                                    : `Sync manual disponible (${PINNACLE_HISTORY_SYNC_DAYS}d)`)}
+                        </div>
+                    )}
                 </div>
 
             </div>
@@ -2808,31 +3327,60 @@ function App() {
                 </div>
             )}
 
-            {activeTab === 'FINISHED' && !isSimulatedDisplayMode && (
-                <div className="bg-slate-800 border-b border-slate-700 px-3 py-2 flex items-center justify-end gap-2">
-                    <span className="text-[10px] uppercase tracking-wide text-slate-500 font-bold">Vista selección</span>
-                    <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
-                        <button
-                            onClick={() => setFinishedSelectionView('HYBRID')}
-                            className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors ${finishedSelectionView === 'HYBRID' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
-                            title="Texto Booky + hint canónico"
-                        >
-                            Híbrida
-                        </button>
-                        <button
-                            onClick={() => setFinishedSelectionView('BOOKY')}
-                            className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors border-l border-slate-700 ${finishedSelectionView === 'BOOKY' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
-                            title="Mostrar texto original de Booky"
-                        >
-                            Booky
-                        </button>
-                        <button
-                            onClick={() => setFinishedSelectionView('CANONICAL')}
-                            className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors border-l border-slate-700 ${finishedSelectionView === 'CANONICAL' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
-                            title="Mostrar selección normalizada"
-                        >
-                            Canónica
-                        </button>
+            {activeTab === 'FINISHED' && (
+                <div className="bg-slate-800 border-b border-slate-700 px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+                    {!isSimulatedDisplayMode ? (
+                        <div className="flex items-center gap-2">
+                            <span className="text-[10px] uppercase tracking-wide text-slate-500 font-bold">Vista selección</span>
+                            <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
+                                <button
+                                    onClick={() => setFinishedSelectionView('HYBRID')}
+                                    className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors ${finishedSelectionView === 'HYBRID' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                                    title="Texto Booky + hint canónico"
+                                >
+                                    Híbrida
+                                </button>
+                                <button
+                                    onClick={() => setFinishedSelectionView('BOOKY')}
+                                    className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors border-l border-slate-700 ${finishedSelectionView === 'BOOKY' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                                    title="Mostrar texto original de Booky"
+                                >
+                                    Booky
+                                </button>
+                                <button
+                                    onClick={() => setFinishedSelectionView('CANONICAL')}
+                                    className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors border-l border-slate-700 ${finishedSelectionView === 'CANONICAL' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                                    title="Mostrar selección normalizada"
+                                >
+                                    Canónica
+                                </button>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="text-[10px] uppercase tracking-wide text-slate-500 font-bold">Finalizados simulados</div>
+                    )}
+
+                    <div className="flex items-center gap-2 ml-auto">
+                        <span className="text-[10px] uppercase tracking-wide text-slate-500 font-bold">Proveedor</span>
+                        <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
+                            {FINISHED_PROVIDER_FILTER_ALLOWED.map((providerKey, idx) => {
+                                const normalizedKey = normalizeFinishedProviderFilter(providerKey);
+                                const isActive = finishedProviderFilter === normalizedKey;
+                                const count = Number(finishedProviderCounts?.[normalizedKey] || 0);
+                                return (
+                                    <button
+                                        key={providerKey}
+                                        onClick={() => setFinishedProviderFilter(normalizedKey)}
+                                        className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors ${idx > 0 ? 'border-l border-slate-700' : ''} ${isActive ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                                        title={`Filtrar finalizados por ${FINISHED_PROVIDER_FILTER_LABELS[normalizedKey] || normalizedKey}`}
+                                    >
+                                        <span>{FINISHED_PROVIDER_FILTER_LABELS[normalizedKey] || normalizedKey}</span>
+                                        <span className={`ml-1 font-mono ${isActive ? 'text-slate-200' : 'text-slate-500'}`}>{count}</span>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                        <span className="text-[10px] text-slate-500 font-mono">{finishedFilteredCount}/{finishedTabCount}</span>
                     </div>
                 </div>
             )}
@@ -2913,6 +3461,7 @@ function App() {
                                     const activeInRemoteBooky = Boolean(remoteOpenRow);
                                     const executionStatus = op.isBookyHistory ? 'FINISHED' : (historyMatch ? 'FINISHED' : ((activeMatch || activeInRemoteBooky || op.isBookyRemoteOpen) ? 'ACTIVE' : 'PENDING'));
                                     const betData = op.isBookyHistory ? op : (historyMatch || activeMatch || remoteOpenRow || op);
+                                    const finishedOriginMeta = getFinishedProviderBadgeMeta(betData || op);
                                     const stickyPinnacleFromBet = getStickyPinnacleReference(betData || {});
                                     const stickyPinnacleFromOp = getStickyPinnacleReference(op || {});
                                     const liveCandidate = opBetKey ? (latestLiveCandidatesByKeyRef.current.get(opBetKey) || null) : null;
@@ -3073,7 +3622,7 @@ function App() {
                                     const previewStake = Number(op?.kellyStake || 0);
                                     const isFastModePreview = String(op?.type || '').toUpperCase() === 'LIVE_SNIPE';
                                     const betButtonTitle = [
-                                        'Enviar apuesta real a Booky',
+                                        `Enviar apuesta usando proveedor manual: ${autoPlacementProviderPretty}`,
                                         `Modo: ${isFastModePreview ? 'confirm-fast (LIVE_SNIPE)' : 'confirm (seguro)'}`,
                                         `Cuota actual: ${displayOdd > 0 ? displayOdd.toFixed(2) : '--'}`,
                                         `Stake sugerido: S/. ${previewStake.toFixed(2)}`,
@@ -3407,7 +3956,7 @@ function App() {
                                                                 </button>
                                                             ) : (
                                                                 <div className="text-[9px] text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded px-1.5 py-1">
-                                                                    Bloqueado: Booky no acepta apuestas &lt; S/. {REENTRY_MIN_STAKE_SOL.toFixed(2)}
+                                                                    Bloqueado: {autoPlacementProviderPretty} no acepta apuestas &lt; S/. {REENTRY_MIN_STAKE_SOL.toFixed(2)}
                                                                 </div>
                                                             )}
                                                         </div>
@@ -3419,6 +3968,9 @@ function App() {
                                                 </div>
                                             ) : (
                                                 <div className="flex flex-col items-center gap-1.5">
+                                                    <span className="text-[9px] uppercase tracking-wide text-slate-500 font-bold">
+                                                        Manual {autoPlacementProviderLabel}
+                                                    </span>
                                                     {/* BOTÓN APOSTAR */}
                                                     <button 
                                                         onClick={(e) => { e.stopPropagation(); handlePlaceBet(op); }}
@@ -3471,14 +4023,8 @@ function App() {
                                                 </div>
                                             ) : (executionStatus === 'FINISHED' || op.isFinished) ? (
                                                 <div className="flex flex-col items-center justify-center p-1 rounded bg-slate-800/50 group relative">
-                                                    <span className={`text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border mb-1 ${
-                                                        op.isBookyHistory
-                                                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                                                            : op.isRealHistory
-                                                                ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
-                                                                : 'bg-blue-500/15 text-blue-300 border-blue-500/30'
-                                                    }`}>
-                                                        {op.isBookyHistory ? 'BOOKY' : (op.isRealHistory ? 'REAL' : 'SIM')}
+                                                    <span className={`text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border mb-1 ${finishedOriginMeta.className}`}>
+                                                        {finishedOriginMeta.label}
                                                     </span>
                                                     {op.isBookyHistory ? (
                                                         (() => {

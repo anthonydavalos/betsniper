@@ -4,6 +4,9 @@ import {
   confirmPinnacleSemiAutoTicket,
   cancelPinnacleSemiAutoTicket,
   getPinnacleSemiAutoTickets,
+  getPinnacleAccountBalance,
+  getPinnacleAccountSnapshot,
+  syncRemotePinnacleHistory,
   getLatestPinnacleCapture,
   getPinnacleRealPlacementDryRun,
   confirmPinnacleRealPlacement,
@@ -29,6 +32,68 @@ const sendPinnacleError = (res, error, fallbackStatus = 400) => {
 router.get('/tickets', async (_req, res) => {
   try {
     const data = await getPinnacleSemiAutoTickets();
+    res.json({ success: true, ...data });
+  } catch (error) {
+    sendPinnacleError(res, error, 500);
+  }
+});
+
+// GET /api/pinnacle/account
+router.get('/account', async (req, res) => {
+  try {
+    const refresh = String(req.query?.refresh || '').toLowerCase();
+    const forceRefresh = refresh === '1' || refresh === 'true' || refresh === 'yes';
+
+    const historyLimitRaw = Number(req.query?.historyLimit);
+    const historyLimit = Number.isFinite(historyLimitRaw)
+      ? (historyLimitRaw <= 0 ? 0 : Math.max(1, Math.min(5000, Math.floor(historyLimitRaw))))
+      : 0;
+
+    const historyStatus = String(req.query?.historyStatus || '').trim() || null;
+    const historyDaysRaw = Number(req.query?.historyDays);
+    const historyDays = Number.isFinite(historyDaysRaw) && historyDaysRaw > 0
+      ? Math.floor(historyDaysRaw)
+      : null;
+
+    const data = historyLimit > 0 || forceRefresh
+      ? await getPinnacleAccountSnapshot({
+        forceRefresh,
+        historyLimit,
+        historyStatus: historyStatus || undefined,
+        historyDays: historyDays || undefined
+      })
+      : await getPinnacleAccountBalance();
+
+    res.json({ success: true, ...data });
+  } catch (error) {
+    sendPinnacleError(res, error, 500);
+  }
+});
+
+// GET /api/pinnacle/history?refresh=1&limit=200&status=settled&days=120
+router.get('/history', async (req, res) => {
+  try {
+    const refresh = String(req.query?.refresh || '').toLowerCase();
+    const forceRefresh = refresh === '1' || refresh === 'true' || refresh === 'yes';
+
+    const limitRaw = Number(req.query?.limit || 200);
+    const limit = Number.isFinite(limitRaw)
+      ? (limitRaw <= 0 ? 0 : Math.max(1, Math.min(5000, Math.floor(limitRaw))))
+      : 200;
+
+    const status = String(req.query?.status || '').trim() || undefined;
+    const daysRaw = Number(req.query?.days);
+    const days = Number.isFinite(daysRaw) && daysRaw > 0
+      ? Math.floor(daysRaw)
+      : undefined;
+
+    const data = await syncRemotePinnacleHistory({
+      forceRefresh,
+      limit,
+      status,
+      days
+    });
+
     res.json({ success: true, ...data });
   } catch (error) {
     sendPinnacleError(res, error, 500);

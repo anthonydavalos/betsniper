@@ -207,6 +207,9 @@ export const placeAutoBet = async (opportunity) => {
             ev: Number.isFinite(Number(opportunity.ev)) ? Number(opportunity.ev) : null,
             stake: stake,         
             status: 'PENDING',
+            provider: opportunity.provider || opportunity.placementProvider || null,
+            placementProvider: opportunity.placementProvider || opportunity.provider || null,
+            integration: opportunity.integration || null,
             initialScore: opportunity.score || "0-0", // Guardamos score inicial
             lastKnownScore: opportunity.score || "0-0",
             lastUpdate: new Date().toISOString(),
