@@ -7,6 +7,48 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.25] -- 2026-04-01 -- Sprint: Prematch Eligibility Hardening + NAV/Liquidity Guards
+
+> Rama: `master` | Commit: `1bf0a95`
+
+### 🔄 Changed
+
+#### Arbitraje UI con base NAV y control de liquidez por provider
+- **`client/src/App.jsx`**:
+  - Perfiles de riesgo (`conservative`, `moderate`, `aggressive`) migrados a `stakeMode: percent_nav` por defecto.
+  - Resolución de NAV base con preferencia operativa: `booky+pinnacle` (si moneda coincide), fallback a `booky`, luego `pinnacle`, luego `portfolio`.
+  - Exposición explícita en UI de `navSource` y `navCurrency` para trazabilidad de stake.
+  - Guardia de liquidez por split dual (`Altenar` vs `Arcadia`) para bloquear ejecuciones cuando el requerido excede saldo disponible por provider.
+  - Mensajería de bloqueo dual más clara (`liquidez insuficiente` / `match-started`).
+  - Timestamp de refresh de arbitraje alineado al polling automático exitoso (evita confusión entre refresh manual y ciclos de 30s).
+
+#### Preview de arbitraje prematch más estricto temporalmente
+- **`src/services/arbitrageService.js`**:
+  - Nuevo filtro por hora de inicio para excluir partidos ya iniciados o fuera de ventana válida antes de generar oportunidades.
+  - Parámetro configurable `ARBITRAGE_PREMATCH_START_GRACE_MINUTES` para tolerancia controlada.
+  - Diagnóstico enriquecido con `eligiblePinnacleRows`, `skippedByStartedAt`, `skippedByInvalidDate`, `startCutoffIso` y `startGraceMinutes`.
+
+#### Canal prematch de PinnacleLight con filtrado canónico y telemetría
+- **`services/pinnacleLight.js`**:
+  - Se excluyen matchups no canónicos en prematch (sin par `home/away`) para reducir ruido de fixtures no tradeables.
+  - Nuevo contador de descarte `no canónicos` en log de `Prematch Fixtures`.
+  - Nuevo log periódico `Prematch Odds sync` con métricas de `payload`, `fixtureValidIds` y `store` para observabilidad operativa.
+
+#### Ajustes operativos de aliases dinámicos
+- **`src/utils/dynamicAliases.json`**:
+  - Actualización incremental de aliases para reforzar cobertura de matching en casos recientes de operación.
+
+### 🐛 Fixed
+
+#### Inflado de fixtures prematch sin cuotas útiles
+- Se corrige escenario donde el endpoint de fixtures prematch incluía entidades no canónicas (por ejemplo, mercados auxiliares) que aumentaban el contador pero no aportaban cuotas `straight` utilizables para arbitraje.
+
+### 🧪 Validated
+
+- Build frontend exitoso (`npm --prefix client run build`).
+- Sintaxis backend validada en archivos modificados (`node --check services/pinnacleLight.js`, `node --check src/services/arbitrageService.js`).
+- Verificación operativa del canal prematch con actualización continua de `data/pinnacle_prematch.json` y logs de sincronización activos.
+
 ## [v3.4.24] -- 2026-04-01 -- Sprint: ARBITRAGE Semi-Auto (Fase 1) + Dual Sequential (Fase 2)
 
 > Rama: `master`
