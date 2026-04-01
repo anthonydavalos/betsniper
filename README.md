@@ -10,6 +10,14 @@
 
 </div>
 
+## 🔐 Cybersecurity Perspective
+
+This project demonstrates real-world techniques used in:
+
+- WebSocket traffic analysis
+- Real-time system behavior monitoring
+- Reverse engineering of event-driven platforms
+
 ---
 
 ## 📖 Tabla de Contenidos
