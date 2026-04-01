@@ -81,6 +81,45 @@ const FINISHED_PROVIDER_FILTER_LABELS = {
     SIM: 'Sim'
 };
 
+const ARBITRAGE_RISK_PROFILE_PRESETS = {
+    conservative: {
+        label: 'Conservador',
+        config: {
+            stakeMode: 'fixed',
+            stakePercentNav: 12,
+            stakeFixedAmount: 12,
+            maxStakePercentNav: 20,
+            maxStakeAbs: 20,
+            minRoiPercent: 0.8,
+            minProfitAbs: 1
+        }
+    },
+    moderate: {
+        label: 'Moderado',
+        config: {
+            stakeMode: 'fixed',
+            stakePercentNav: 20,
+            stakeFixedAmount: 20,
+            maxStakePercentNav: 30,
+            maxStakeAbs: 30,
+            minRoiPercent: 0.6,
+            minProfitAbs: 1.5
+        }
+    },
+    aggressive: {
+        label: 'Agresivo',
+        config: {
+            stakeMode: 'fixed',
+            stakePercentNav: 28,
+            stakeFixedAmount: 28,
+            maxStakePercentNav: 40,
+            maxStakeAbs: 40,
+            minRoiPercent: 0.4,
+            minProfitAbs: 1
+        }
+    }
+};
+
 const normalizeFinishedProviderFilter = (value = 'ALL') => {
     const normalized = String(value || '').trim().toUpperCase();
     return FINISHED_PROVIDER_FILTER_ALLOWED.includes(normalized) ? normalized : 'ALL';
@@ -727,6 +766,25 @@ function playAlert(kind = 'DEFAULT') {
 function App() {
   const [liveOps, setLiveOps] = useState([]);
   const [prematchOps, setPrematchOps] = useState([]);
+    const [arbitrageOps, setArbitrageOps] = useState([]);
+    const [arbitrageMeta, setArbitrageMeta] = useState({
+            generatedAt: null,
+            source: null,
+            diagnostics: null,
+            risk: null,
+            count: 0
+    });
+    const [arbitrageView, setArbitrageView] = useState('PREMATCH');
+    const [arbitrageRefreshState, setArbitrageRefreshState] = useState({
+        running: false,
+        phase: null,
+        lastOkAt: null,
+        lastError: null
+    });
+    const [arbitrageRiskProfileKey, setArbitrageRiskProfileKey] = useState('conservative');
+    const [arbitrageRiskConfig, setArbitrageRiskConfig] = useState(() => ({
+        ...ARBITRAGE_RISK_PROFILE_PRESETS.conservative.config
+    }));
   const [portfolio, setPortfolio] = useState({ balance: 100, activeBets: [], history: [] });
     const [bookyAccount, setBookyAccount] = useState({
         profile: null,
@@ -766,7 +824,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   
   // NAVEGACIÓN TIPO FLASHSCORE
-  const [activeTab, setActiveTab] = useState('ALL'); // 'ALL', 'LIVE', 'FINISHED', 'MATCHER'
+    const [activeTab, setActiveTab] = useState('ALL'); // 'ALL', 'ARBITRAGE', 'LIVE', 'FINISHED', 'MATCHER', 'MONITOR'
   const [dateFilter, setDateFilter] = useState(new Date());
   const [finishedSelectionView, setFinishedSelectionView] = useState(() => {
       try {
@@ -792,9 +850,11 @@ function App() {
         const lastAlertedLiveOpAtRef = useRef(new Map());
     const fetchInFlightRef = useRef(false);
     const prematchFetchInFlightRef = useRef(false);
+    const arbitrageFetchInFlightRef = useRef(false);
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
     const lastPrematchFetchAtRef = useRef(0);
+    const lastArbitrageFetchAtRef = useRef(0);
     const lastPlacementProviderFetchAtRef = useRef(0);
     const lastPinnacleAccountFetchAtRef = useRef(0);
     const pinnacleBalanceFetchInFlightRef = useRef(false);
@@ -812,6 +872,8 @@ function App() {
 
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
+    const ARBITRAGE_POLL_MS = 30000;
+    const ARBITRAGE_PREVIEW_LIMIT = 80;
     const PLACEMENT_PROVIDER_POLL_MS = 20000;
     const PINNACLE_BALANCE_POLL_MS = 15000;
     const PINNACLE_HISTORY_SYNC_DAYS = 180;
@@ -1418,6 +1480,7 @@ function App() {
 
             if (forceBookyRefresh) {
                 fetchPrematchData();
+                fetchArbitrageData({ force: true });
             }
         } catch (err) {
             console.error('Error fetching core data', err);
@@ -1464,6 +1527,205 @@ function App() {
             console.warn('⚠️ Prematch fetch falló. Se mantiene snapshot previo.', err?.message || err);
         } finally {
             prematchFetchInFlightRef.current = false;
+        }
+    };
+
+    const toPositiveNumber = (value, fallback) => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+        return parsed;
+    };
+
+    const toNonNegativeNumber = (value, fallback) => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+        return parsed;
+    };
+
+    const updateArbitrageRiskField = (field, value) => {
+        setArbitrageRiskProfileKey('custom');
+        setArbitrageRiskConfig((prev) => ({
+            ...prev,
+            [field]: value
+        }));
+    };
+
+    const resolveArbitrageStakeContext = (configOverride = null) => {
+        const sourceConfig = (configOverride && typeof configOverride === 'object')
+            ? configOverride
+            : arbitrageRiskConfig;
+        const navRaw = Number(portfolio?.balance);
+        const nav = Number.isFinite(navRaw) && navRaw > 0 ? navRaw : 0;
+        const stakeMode = String(sourceConfig?.stakeMode || 'percent_nav') === 'fixed'
+            ? 'fixed'
+            : 'percent_nav';
+
+        const stakePercentNav = toPositiveNumber(sourceConfig?.stakePercentNav, 2);
+        const stakeFixedAmount = toPositiveNumber(sourceConfig?.stakeFixedAmount, 20);
+        const maxStakePercentNav = toPositiveNumber(sourceConfig?.maxStakePercentNav, 3);
+        const maxStakeAbs = toPositiveNumber(sourceConfig?.maxStakeAbs, 30);
+        const minRoiPercent = toNonNegativeNumber(sourceConfig?.minRoiPercent, 0.8);
+        const minProfitAbs = toNonNegativeNumber(sourceConfig?.minProfitAbs, 2);
+
+        const requestedStake = stakeMode === 'percent_nav'
+            ? (nav * (stakePercentNav / 100))
+            : stakeFixedAmount;
+
+        const capByNavPct = nav > 0
+            ? (nav * (maxStakePercentNav / 100))
+            : maxStakeAbs;
+
+        const stakeBankroll = Number(Math.max(0, Math.min(requestedStake, capByNavPct, maxStakeAbs)).toFixed(2));
+
+        return {
+            nav,
+            stakeMode,
+            stakePercentNav,
+            stakeFixedAmount,
+            maxStakePercentNav,
+            maxStakeAbs,
+            minRoiPercent,
+            minProfitAbs,
+            requestedStake: Number(requestedStake.toFixed(2)),
+            capByNavPct: Number(capByNavPct.toFixed(2)),
+            stakeBankroll
+        };
+    };
+
+    const normalizeArbitrageProviderBucket = (providerRaw = '') => {
+        const provider = String(providerRaw || '').trim().toLowerCase();
+        if (!provider) return 'other';
+        if (provider.includes('pinnacle') || provider.includes('arcadia')) return 'arcadia';
+        if (provider.includes('altenar') || provider.includes('booky') || provider.includes('acity') || provider.includes('dorado')) return 'altenar';
+        return 'other';
+    };
+
+    const buildArbitrageProviderSplit = (op = {}, legs = []) => {
+        const split = {
+            altenar: 0,
+            arcadia: 0,
+            other: 0,
+            total: 0
+        };
+
+        const addStake = (providerRaw, stakeRaw) => {
+            const stake = Number(stakeRaw);
+            if (!(Number.isFinite(stake) && stake > 0)) return;
+            const bucket = normalizeArbitrageProviderBucket(providerRaw);
+            split[bucket] += stake;
+            split.total += stake;
+        };
+
+        const isDcOpposite = String(op?.type || '').toUpperCase() === 'SUREBET_DC_OPPOSITE_PREMATCH';
+        if (isDcOpposite) {
+            addStake(legs?.[0]?.provider, op?.plan?.stakes?.cover);
+            addStake(legs?.[1]?.provider, op?.plan?.stakes?.opposite);
+            return split;
+        }
+
+        addStake(op?.odds?.best?.home?.provider, op?.plan?.stakes?.home);
+        addStake(op?.odds?.best?.draw?.provider, op?.plan?.stakes?.draw);
+        addStake(op?.odds?.best?.away?.provider, op?.plan?.stakes?.away);
+
+        return split;
+    };
+
+    const applyArbitrageRiskProfile = (profileKey = 'conservative') => {
+        const normalized = String(profileKey || '').toLowerCase();
+        const preset = ARBITRAGE_RISK_PROFILE_PRESETS[normalized];
+        if (!preset) return;
+
+        const nextConfig = { ...preset.config };
+        setArbitrageRiskProfileKey(normalized);
+        setArbitrageRiskConfig(nextConfig);
+        void refreshArbitrageWithPrematch({ riskConfigOverride: nextConfig });
+    };
+
+    const fetchArbitrageData = async ({ force = false, riskConfigOverride = null } = {}) => {
+        if (arbitrageFetchInFlightRef.current) return;
+
+        const nowMs = Date.now();
+        if (!force && (nowMs - lastArbitrageFetchAtRef.current) < ARBITRAGE_POLL_MS - 300) return;
+
+        arbitrageFetchInFlightRef.current = true;
+        try {
+            const riskContext = resolveArbitrageStakeContext(riskConfigOverride);
+            const arbitrageRes = await axios.get('/api/opportunities/arbitrage/preview', {
+                params: {
+                    limit: ARBITRAGE_PREVIEW_LIMIT,
+                    bankroll: riskContext.stakeBankroll > 0 ? riskContext.stakeBankroll : undefined,
+                    minRoiPercent: riskContext.minRoiPercent,
+                    minProfitAbs: riskContext.minProfitAbs
+                },
+                timeout: 20000
+            });
+
+            if (arbitrageRes?.data?.success) {
+                const rows = Array.isArray(arbitrageRes.data?.data) ? arbitrageRes.data.data : [];
+                setArbitrageOps(rows);
+                setArbitrageMeta({
+                    generatedAt: arbitrageRes.data?.generatedAt || null,
+                    source: arbitrageRes.data?.source || null,
+                    diagnostics: arbitrageRes.data?.diagnostics || null,
+                    risk: arbitrageRes.data?.risk || {
+                        minRoiPercent: riskContext.minRoiPercent,
+                        minProfitAbs: riskContext.minProfitAbs,
+                        stakeBankroll: riskContext.stakeBankroll
+                    },
+                    count: Number(arbitrageRes.data?.count || rows.length || 0)
+                });
+            }
+
+            lastArbitrageFetchAtRef.current = Date.now();
+        } catch (err) {
+            console.warn('⚠️ Arbitrage preview fetch falló. Se mantiene snapshot previo.', err?.message || err);
+        } finally {
+            arbitrageFetchInFlightRef.current = false;
+        }
+    };
+
+    const waitUntilInFlightClears = async (ref, timeoutMs = 25000) => {
+        const startedAt = Date.now();
+        while (ref.current && (Date.now() - startedAt) < timeoutMs) {
+            await new Promise((resolve) => setTimeout(resolve, 120));
+        }
+    };
+
+    const refreshArbitrageWithPrematch = async ({ riskConfigOverride = null } = {}) => {
+        if (arbitrageRefreshState.running) return;
+
+        setArbitrageRefreshState({
+            running: true,
+            phase: 'prematch',
+            lastOkAt: arbitrageRefreshState.lastOkAt,
+            lastError: null
+        });
+
+        try {
+            await waitUntilInFlightClears(prematchFetchInFlightRef);
+            await fetchPrematchData({ force: true });
+
+            setArbitrageRefreshState((prev) => ({
+                ...prev,
+                phase: 'arbitrage'
+            }));
+
+            await waitUntilInFlightClears(arbitrageFetchInFlightRef);
+            await fetchArbitrageData({ force: true, riskConfigOverride });
+
+            setArbitrageRefreshState({
+                running: false,
+                phase: null,
+                lastOkAt: new Date().toISOString(),
+                lastError: null
+            });
+        } catch (error) {
+            setArbitrageRefreshState((prev) => ({
+                running: false,
+                phase: null,
+                lastOkAt: prev.lastOkAt,
+                lastError: error?.message || 'No se pudo refrescar prematch + arbitraje.'
+            }));
         }
     };
 
@@ -1566,6 +1828,7 @@ function App() {
         await fetchData();
         if (isUnmounted) return;
         fetchPrematchData();
+        fetchArbitrageData({ force: true });
     };
 
     bootstrap();
@@ -1576,6 +1839,7 @@ function App() {
 
     const prematchInterval = setInterval(() => {
         fetchPrematchData();
+        fetchArbitrageData();
     }, PREMATCH_POLL_MS);
 
     return () => {
@@ -2889,6 +3153,8 @@ function App() {
              return timeB - timeA;
         });
 
+    } else if (activeTab === 'ARBITRAGE') {
+        return [];
     } else if (activeTab === 'FINISHED') {
         const rows = getFinishedDataForSelectedDate();
         const activeProviderFilter = normalizeFinishedProviderFilter(finishedProviderFilter);
@@ -2986,6 +3252,7 @@ function App() {
   };
 
     const filteredOps = getFilteredData();
+    const arbitrageStakeContext = resolveArbitrageStakeContext();
     const finishedRowsForDate = getFinishedDataForSelectedDate();
     const finishedTabCount = finishedRowsForDate.length;
     const finishedProviderCounts = finishedRowsForDate.reduce((acc, row) => {
@@ -3275,6 +3542,13 @@ function App() {
                     Prematch <span className="text-[10px] bg-slate-900 px-1.5 rounded-full text-slate-400" title="Oportunidades Pre-Match">{prematchOps.length}</span>
                 </button>
                 <button 
+                    onClick={() => setActiveTab('ARBITRAGE')}
+                    className={`flex-1 py-4 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors ${activeTab === 'ARBITRAGE' ? 'bg-slate-700 text-amber-400 border-b-2 border-amber-500' : 'text-slate-500 hover:text-amber-300 hover:bg-slate-750'}`}
+                >
+                    <TrendingUp className="w-4 h-4" />
+                    Arbitraje <span className="text-[10px] bg-slate-900 px-1.5 rounded-full text-slate-400">{arbitrageOps.length}</span>
+                </button>
+                <button 
                     onClick={() => setActiveTab('LIVE')}
                     className={`flex-1 py-4 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors ${activeTab === 'LIVE' ? 'bg-slate-700 text-red-500 border-b-2 border-red-500' : 'text-slate-500 hover:text-red-400 hover:bg-slate-750'}`}
                 >
@@ -3393,6 +3667,279 @@ function App() {
                      <ManualMatcher />
                 ) : activeTab === 'MONITOR' ? (
                      <MonitorDashboard />
+                ) : activeTab === 'ARBITRAGE' ? (
+                    <div className="p-4 space-y-4">
+                        <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                            <div className="space-y-1">
+                                <div className="text-[11px] uppercase tracking-wider font-bold text-amber-300">Preview Arbitraje</div>
+                                <div className="text-[10px] text-slate-400">
+                                    {arbitrageMeta?.generatedAt
+                                        ? `Snapshot: ${formatTimeSafe(arbitrageMeta.generatedAt)} | Source: ${arbitrageMeta.source || 'n/a'}`
+                                        : 'Sin snapshot reciente'}
+                                </div>
+                                <div className="text-[10px] text-slate-500">
+                                    {`Total ${Number(arbitrageMeta?.count || arbitrageOps.length || 0)} | 1x2 ${Number(arbitrageMeta?.diagnostics?.generatedByType?.surebet1x2 || 0)} | DC+Opuesto ${Number(arbitrageMeta?.diagnostics?.generatedByType?.surebetDcOpposite || 0)} | Filtradas riesgo ${Number(arbitrageMeta?.diagnostics?.filteredByRisk || 0)}`}
+                                </div>
+                                <div className="text-[10px] text-slate-500">
+                                    {`Stake ticket: S/. ${Number(arbitrageMeta?.risk?.stakeBankroll ?? arbitrageStakeContext.stakeBankroll ?? 0).toFixed(2)} | ROI mín: ${Number(arbitrageMeta?.risk?.minRoiPercent ?? arbitrageStakeContext.minRoiPercent ?? 0).toFixed(2)}% | Profit mín: S/. ${Number(arbitrageMeta?.risk?.minProfitAbs ?? arbitrageStakeContext.minProfitAbs ?? 0).toFixed(2)}`}
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
+                                    <button
+                                        onClick={() => setArbitrageView('PREMATCH')}
+                                        className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-colors ${arbitrageView === 'PREMATCH' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                                    >
+                                        Prematch
+                                    </button>
+                                    <button
+                                        onClick={() => setArbitrageView('LIVE')}
+                                        className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide border-l border-slate-700 transition-colors ${arbitrageView === 'LIVE' ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700/70'}`}
+                                    >
+                                        Live (prox)
+                                    </button>
+                                </div>
+                                <button
+                                    onClick={() => refreshArbitrageWithPrematch()}
+                                    disabled={arbitrageRefreshState.running}
+                                    className={`px-2.5 py-1.5 rounded border text-[10px] font-bold uppercase tracking-wide transition-colors ${arbitrageRefreshState.running
+                                        ? 'bg-amber-500/10 border-amber-500/30 text-amber-200/80 cursor-not-allowed'
+                                        : 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/40 text-amber-200'}`}
+                                >
+                                    <span className="inline-flex items-center gap-1.5">
+                                        <RefreshCw className={`w-3 h-3 ${arbitrageRefreshState.running ? 'animate-spin' : ''}`} />
+                                        {arbitrageRefreshState.running
+                                            ? (arbitrageRefreshState.phase === 'prematch' ? 'Refrescando Prematch...' : 'Calculando Arbitraje...')
+                                            : 'Refresh'}
+                                    </span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 space-y-2">
+                            <div className="text-[10px] uppercase tracking-wider font-bold text-slate-300">Gestion Monetaria Conservadora (Fase 1)</div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                {Object.entries(ARBITRAGE_RISK_PROFILE_PRESETS).map(([profileKey, profile]) => (
+                                    <button
+                                        key={profileKey}
+                                        onClick={() => applyArbitrageRiskProfile(profileKey)}
+                                        className={`px-2.5 py-1 rounded border text-[10px] font-bold uppercase tracking-wide transition-colors ${arbitrageRiskProfileKey === profileKey
+                                            ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                                            : 'border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'}`}
+                                    >
+                                        {profile.label}
+                                    </button>
+                                ))}
+                                {arbitrageRiskProfileKey === 'custom' && (
+                                    <span className="px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-[10px] font-bold uppercase tracking-wide text-amber-200">
+                                        Perfil Personalizado
+                                    </span>
+                                )}
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-6 gap-2 text-[10px]">
+                                <label className="flex flex-col gap-1">
+                                    <span className="text-slate-400 uppercase">Modo Stake</span>
+                                    <select
+                                        value={arbitrageRiskConfig.stakeMode}
+                                        onChange={(e) => updateArbitrageRiskField('stakeMode', e.target.value)}
+                                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                    >
+                                        <option value="percent_nav">% NAV</option>
+                                        <option value="fixed">Fijo (S/.)</option>
+                                    </select>
+                                </label>
+
+                                <label className="flex flex-col gap-1">
+                                    <span className="text-slate-400 uppercase">{arbitrageRiskConfig.stakeMode === 'fixed' ? 'Stake Fijo' : 'Stake % NAV'}</span>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        value={arbitrageRiskConfig.stakeMode === 'fixed' ? arbitrageRiskConfig.stakeFixedAmount : arbitrageRiskConfig.stakePercentNav}
+                                        onChange={(e) => updateArbitrageRiskField(arbitrageRiskConfig.stakeMode === 'fixed' ? 'stakeFixedAmount' : 'stakePercentNav', e.target.value)}
+                                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                    />
+                                </label>
+
+                                <label className="flex flex-col gap-1">
+                                    <span className="text-slate-400 uppercase">Cap % NAV</span>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        value={arbitrageRiskConfig.maxStakePercentNav}
+                                        onChange={(e) => updateArbitrageRiskField('maxStakePercentNav', e.target.value)}
+                                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                    />
+                                </label>
+
+                                <label className="flex flex-col gap-1">
+                                    <span className="text-slate-400 uppercase">Cap Absoluto (S/.)</span>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        value={arbitrageRiskConfig.maxStakeAbs}
+                                        onChange={(e) => updateArbitrageRiskField('maxStakeAbs', e.target.value)}
+                                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                    />
+                                </label>
+
+                                <label className="flex flex-col gap-1">
+                                    <span className="text-slate-400 uppercase">ROI Mín (%)</span>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        value={arbitrageRiskConfig.minRoiPercent}
+                                        onChange={(e) => updateArbitrageRiskField('minRoiPercent', e.target.value)}
+                                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                    />
+                                </label>
+
+                                <label className="flex flex-col gap-1">
+                                    <span className="text-slate-400 uppercase">Profit Mín (S/.)</span>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        value={arbitrageRiskConfig.minProfitAbs}
+                                        onChange={(e) => updateArbitrageRiskField('minProfitAbs', e.target.value)}
+                                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                    />
+                                </label>
+                            </div>
+                            <div className="text-[10px] text-slate-500">
+                                {`Stake solicitado: S/. ${Number(arbitrageStakeContext.requestedStake || 0).toFixed(2)} | Cap %NAV: S/. ${Number(arbitrageStakeContext.capByNavPct || 0).toFixed(2)} | Cap abs: S/. ${Number(arbitrageStakeContext.maxStakeAbs || 0).toFixed(2)} | Stake final ticket: S/. ${Number(arbitrageStakeContext.stakeBankroll || 0).toFixed(2)}`}
+                            </div>
+                        </div>
+
+                        {(arbitrageRefreshState.running || arbitrageRefreshState.lastOkAt || arbitrageRefreshState.lastError) && (
+                            <div className={`rounded-lg border p-2 text-[10px] ${arbitrageRefreshState.lastError
+                                ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                                : 'border-slate-700 bg-slate-900/40 text-slate-400'}`}>
+                                {arbitrageRefreshState.running
+                                    ? (arbitrageRefreshState.phase === 'prematch'
+                                        ? 'Actualizando oportunidades Prematch...'
+                                        : 'Recalculando preview de arbitraje con el snapshot más reciente...')
+                                    : arbitrageRefreshState.lastError
+                                        ? `Refresh falló: ${arbitrageRefreshState.lastError}`
+                                        : `Refresh completo: ${formatTimeSafe(arbitrageRefreshState.lastOkAt)}`}
+                            </div>
+                        )}
+
+                        {arbitrageView === 'LIVE' ? (
+                            <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-4 text-sm text-blue-100">
+                                La vista de arbitraje Live está reservada para la siguiente fase (ejecución dual con hedge y control de latencia).
+                            </div>
+                        ) : arbitrageOps.length === 0 ? (
+                            <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-8 text-center text-slate-400">
+                                No hay surebets en este snapshot. El motor está activo; espera el próximo refresco de cuotas.
+                            </div>
+                        ) : (
+                            <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                                {arbitrageOps.map((op, idx) => {
+                                    const isDcOpposite = String(op?.type || '').toUpperCase() === 'SUREBET_DC_OPPOSITE_PREMATCH';
+                                    const impliedSum = Number(op?.plan?.impliedSum || 0);
+                                    const edge = Number(op?.plan?.edgePercent || 0);
+                                    const roi = Number(op?.plan?.roiPercent || 0);
+                                    const guaranteedPayout = Number(op?.plan?.guaranteedPayout || 0);
+                                    const expectedProfit = Number(op?.plan?.expectedProfit || 0);
+
+                                    const fallbackLegs = [
+                                        {
+                                            market: '1x2',
+                                            selection: 'Home',
+                                            provider: op?.odds?.best?.home?.provider,
+                                            odd: op?.odds?.best?.home?.odd
+                                        },
+                                        {
+                                            market: '1x2',
+                                            selection: 'Draw',
+                                            provider: op?.odds?.best?.draw?.provider,
+                                            odd: op?.odds?.best?.draw?.odd
+                                        },
+                                        {
+                                            market: '1x2',
+                                            selection: 'Away',
+                                            provider: op?.odds?.best?.away?.provider,
+                                            odd: op?.odds?.best?.away?.odd
+                                        }
+                                    ].filter((leg) => Number.isFinite(Number(leg?.odd)) && Number(leg?.odd) > 1);
+
+                                    const legs = Array.isArray(op?.legs) && op.legs.length > 0 ? op.legs : fallbackLegs;
+                                    const providerSplit = buildArbitrageProviderSplit(op, legs);
+                                    const splitTotal = Number(providerSplit.total || 0);
+                                    const pctAlt = splitTotal > 0 ? ((providerSplit.altenar / splitTotal) * 100) : 0;
+                                    const pctArc = splitTotal > 0 ? ((providerSplit.arcadia / splitTotal) * 100) : 0;
+
+                                    return (
+                                        <article key={`${op?.type || 'ARB'}_${op?.eventId || idx}_${idx}`} className="rounded-lg border border-amber-500/25 bg-slate-900/40 p-3 space-y-2">
+                                            <div className="flex items-start justify-between gap-2">
+                                                <div>
+                                                    <div className="text-[10px] uppercase tracking-wide text-amber-300 font-bold">
+                                                        {isDcOpposite ? (op?.comboLabel || 'DC + Opuesto') : '1x2 Surebet'}
+                                                    </div>
+                                                    <div className="text-sm font-bold text-slate-100">{op?.match || '-'}</div>
+                                                    <div className="text-[10px] text-slate-500">{op?.league || '-'} | {formatTimeSafe(op?.matchDate)}</div>
+                                                </div>
+                                                <div className="text-right">
+                                                    <div className="text-[10px] text-slate-400">Edge</div>
+                                                    <div className="font-mono text-amber-300 font-bold">{edge.toFixed(3)}%</div>
+                                                </div>
+                                            </div>
+
+                                            <div className="rounded border border-slate-700 bg-slate-800/40 p-2 space-y-1">
+                                                {legs.map((leg, legIdx) => (
+                                                    <div key={`${leg?.selection || legIdx}_${legIdx}`} className="flex items-center justify-between text-[11px]">
+                                                        <span className="text-slate-300">{`${leg?.market || '-'} · ${leg?.selection || '-'}`}</span>
+                                                        <span className="font-mono text-slate-200">{`${String(leg?.provider || '-').toUpperCase()} @ ${Number(leg?.odd || 0).toFixed(3)}`}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+
+                                            <div className="grid grid-cols-2 gap-2 text-[11px]">
+                                                <div className="rounded border border-slate-700 bg-slate-800/40 p-2">
+                                                    <div className="text-slate-400 uppercase text-[9px]">ROI</div>
+                                                    <div className="font-mono text-emerald-300 font-bold">{roi.toFixed(3)}%</div>
+                                                </div>
+                                                <div className="rounded border border-slate-700 bg-slate-800/40 p-2">
+                                                    <div className="text-slate-400 uppercase text-[9px]">Implied Sum</div>
+                                                    <div className="font-mono text-slate-200 font-bold">{impliedSum.toFixed(6)}</div>
+                                                </div>
+                                                <div className="rounded border border-slate-700 bg-slate-800/40 p-2">
+                                                    <div className="text-slate-400 uppercase text-[9px]">Profit</div>
+                                                    <div className="font-mono text-emerald-300 font-bold">S/. {expectedProfit.toFixed(2)}</div>
+                                                </div>
+                                                <div className="rounded border border-slate-700 bg-slate-800/40 p-2">
+                                                    <div className="text-slate-400 uppercase text-[9px]">Payout Min</div>
+                                                    <div className="font-mono text-slate-200 font-bold">S/. {guaranteedPayout.toFixed(2)}</div>
+                                                </div>
+                                            </div>
+
+                                            <div className="text-[10px] text-slate-400 font-mono">
+                                                {isDcOpposite
+                                                    ? `${op?.plan?.labels?.cover || 'COVER'}: S/. ${Number(op?.plan?.stakes?.cover || 0).toFixed(2)} | ${op?.plan?.labels?.opposite || 'OPPOSITE'}: S/. ${Number(op?.plan?.stakes?.opposite || 0).toFixed(2)}`
+                                                    : `Home: S/. ${Number(op?.plan?.stakes?.home || 0).toFixed(2)} | Draw: S/. ${Number(op?.plan?.stakes?.draw || 0).toFixed(2)} | Away: S/. ${Number(op?.plan?.stakes?.away || 0).toFixed(2)}`}
+                                            </div>
+
+                                            <div className="rounded border border-cyan-500/25 bg-cyan-500/5 p-2 text-[10px]">
+                                                <div className="uppercase tracking-wide text-cyan-200 font-bold">Split Recomendado</div>
+                                                <div className="text-slate-300 font-mono">
+                                                    {`Altenar: S/. ${Number(providerSplit.altenar || 0).toFixed(2)} (${pctAlt.toFixed(1)}%) | Arcadia: S/. ${Number(providerSplit.arcadia || 0).toFixed(2)} (${pctArc.toFixed(1)}%)`}
+                                                </div>
+                                                {Number(providerSplit.other || 0) > 0 && (
+                                                    <div className="text-slate-500 font-mono">
+                                                        {`Otros providers: S/. ${Number(providerSplit.other || 0).toFixed(2)}`}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </article>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
                 ) : (
                 /* TABLA ESTÁNDAR */
                 <div className="overflow-x-auto">

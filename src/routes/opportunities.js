@@ -237,10 +237,14 @@ router.get('/arbitrage/preview', async (req, res) => {
   try {
     const bankrollRaw = Number(req.query?.bankroll);
     const limitRaw = Number(req.query?.limit);
+    const minRoiPercentRaw = Number(req.query?.minRoiPercent);
+    const minProfitAbsRaw = Number(req.query?.minProfitAbs);
 
     const payload = await getArbitragePreview1x2({
       bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
-      limit: Number.isFinite(limitRaw) ? limitRaw : undefined
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      minRoiPercent: Number.isFinite(minRoiPercentRaw) ? minRoiPercentRaw : undefined,
+      minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : undefined
     });
 
     res.json(payload);

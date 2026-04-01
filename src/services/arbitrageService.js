@@ -34,6 +34,12 @@ const toNumber = (value, fallback = NaN) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+const toNonNegative = (value, fallback = 0) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+};
+
 const safePositiveOdd = (value) => {
   const n = toNumber(value, NaN);
   if (!Number.isFinite(n) || n <= 1) return null;
@@ -264,7 +270,12 @@ const getDefaultBankroll = () => {
   return 100;
 };
 
-export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_PREVIEW_LIMIT } = {}) => {
+export const getArbitragePreview1x2 = async ({
+  bankroll = null,
+  limit = DEFAULT_PREVIEW_LIMIT,
+  minRoiPercent = null,
+  minProfitAbs = null
+} = {}) => {
   await initDB();
   await db.read();
 
@@ -280,6 +291,17 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
     if (!Number.isFinite(parsed) || parsed <= 0) return getDefaultBankroll();
     return Number(parsed);
   })();
+
+  const riskThresholds = {
+    minRoiPercent: toNonNegative(
+      minRoiPercent,
+      toNonNegative(process.env.ARBITRAGE_MIN_ROI_PERCENT, 0)
+    ),
+    minProfitAbs: toNonNegative(
+      minProfitAbs,
+      toNonNegative(process.env.ARBITRAGE_MIN_PROFIT_ABS, 0)
+    )
+  };
 
   const pinnacleRows = Array.isArray(db.data?.upcomingMatches) ? db.data.upcomingMatches : [];
   const altenarRows = Array.isArray(db.data?.altenarUpcoming) ? db.data.altenarUpcoming : [];
@@ -453,7 +475,17 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
     }
   }
 
-  const ordered = opportunities
+  const riskFiltered = opportunities.filter((op) => {
+    const roi = Number(op?.plan?.roiPercent || 0);
+    const profit = Number(op?.plan?.expectedProfit || 0);
+    if (roi < riskThresholds.minRoiPercent) return false;
+    if (profit < riskThresholds.minProfitAbs) return false;
+    return true;
+  });
+
+  const filteredByRisk = opportunities.length - riskFiltered.length;
+
+  const ordered = riskFiltered
     .sort((a, b) => Number(b?.plan?.edgePercent || 0) - Number(a?.plan?.edgePercent || 0))
     .slice(0, maxItems);
 
@@ -465,6 +497,10 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
     source: 'prematch-cache-db',
     generatedAt: new Date().toISOString(),
     bankroll: stakeBankroll,
+    risk: {
+      ...riskThresholds,
+      stakeBankroll
+    },
     count: ordered.length,
     data: ordered,
     diagnostics: {
@@ -475,6 +511,8 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
       skippedMissingOdds: skippedMissingOdds1x2 + skippedMissingOddsDcOpposite,
       skippedMissingOdds1x2,
       skippedMissingOddsDcOpposite,
+      filteredByRisk,
+      riskThresholds,
       generatedByType: {
         surebet1x2: generated1x2,
         surebetDcOpposite: generatedDcOpposite
