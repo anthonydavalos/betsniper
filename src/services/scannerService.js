@@ -5,6 +5,7 @@ import { scanLiveOpportunities as performValueScan, getLiveOverview } from './li
 import { scanLiveOpportunities as performTurnaroundScan, getLiveSnipeScanDiagnostics } from './liveScannerService.js'; 
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 import { prepareSemiAutoTicket, confirmSemiAutoTicket, confirmRealPlacementFast } from './bookySemiAutoService.js';
+import { fetchBookyBalance } from './bookyAccountService.js';
 import {
     preparePinnacleSemiAutoTicket,
     confirmPinnacleSemiAutoTicket,
@@ -79,6 +80,7 @@ const AUTO_SNIPE_COOLDOWN_PER_PICK_MS = parsePositiveIntOr(process.env.AUTO_SNIP
 const AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT = parsePositiveNumberOr(process.env.AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT, 8);
 const AUTO_SNIPE_REENTRY_MIN_ODD_POINTS = parsePositiveNumberOr(process.env.AUTO_SNIPE_REENTRY_MIN_ODD_POINTS, 0.30);
 const AUTO_SNIPE_MAX_ENTRIES_PER_PICK = parsePositiveIntOr(process.env.AUTO_SNIPE_MAX_ENTRIES_PER_PICK, 2);
+const AUTO_SNIPE_BALANCE_CHECK_CACHE_MS = parsePositiveIntOr(process.env.AUTO_SNIPE_BALANCE_CHECK_CACHE_MS, 10000);
 const AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(
     process.env.AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED,
     true
@@ -99,6 +101,10 @@ const LIVE_DIAG_FILE = path.resolve('data', 'live_opportunity_decisions.jsonl');
 const autoSnipeInFlight = new Set();
 const autoSnipeLastAttemptAt = new Map();
 const autoSnipePlacedAtHistory = [];
+let autoSnipeBookyBalanceCache = {
+    checkedAtMs: 0,
+    value: null
+};
 const liveDecisionLog = [];
 let lastLivePipelineStats = {
     at: null,
@@ -218,6 +224,20 @@ const pruneAutoSnipeState = () => {
     }
 };
 
+const getAutoSnipeBookyBalance = async ({ forceRefresh = false } = {}) => {
+    const now = Date.now();
+    if (!forceRefresh && autoSnipeBookyBalanceCache.value && (now - autoSnipeBookyBalanceCache.checkedAtMs) < AUTO_SNIPE_BALANCE_CHECK_CACHE_MS) {
+        return autoSnipeBookyBalanceCache.value;
+    }
+
+    const snapshot = await fetchBookyBalance({ forceRefresh, profileKey: null });
+    autoSnipeBookyBalanceCache = {
+        checkedAtMs: now,
+        value: snapshot || null
+    };
+    return snapshot;
+};
+
 const maybeRunAutoSnipe = async (opportunity) => {
     if (!AUTO_SNIPE_ENABLED) return { triggered: false, reason: 'disabled' };
     if (!isAutoSnipeOpportunity(opportunity)) return { triggered: false, reason: 'type-not-enabled' };
@@ -249,6 +269,39 @@ const maybeRunAutoSnipe = async (opportunity) => {
     const stake = Number(opportunity?.kellyStake || 0);
     if (!Number.isFinite(stake) || stake < AUTO_SNIPE_MIN_STAKE_SOL) {
         return { triggered: false, reason: 'stake-guard' };
+    }
+
+    if (!AUTO_SNIPE_DRY_RUN && placementProvider === 'booky' && providerRealEnabled) {
+        let balance = await getAutoSnipeBookyBalance({ forceRefresh: false });
+        let balanceAmount = Number(balance?.amount);
+
+        // Si detectamos saldo en cero, refrescamos una vez para confirmar y evitar falso bloqueo por caché viejo.
+        if (Number.isFinite(balanceAmount) && balanceAmount <= 0) {
+            balance = await getAutoSnipeBookyBalance({ forceRefresh: true });
+            balanceAmount = Number(balance?.amount);
+        }
+
+        if (Number.isFinite(balanceAmount) && balanceAmount <= 0) {
+            const currency = String(balance?.currency || 'PEN').toUpperCase();
+            return {
+                triggered: false,
+                reason: 'insufficient-balance',
+                placementProvider,
+                balanceAmount,
+                balanceCurrency: currency
+            };
+        }
+
+        if (Number.isFinite(balanceAmount) && stake > balanceAmount) {
+            const currency = String(balance?.currency || 'PEN').toUpperCase();
+            return {
+                triggered: false,
+                reason: 'insufficient-balance',
+                placementProvider,
+                balanceAmount,
+                balanceCurrency: currency
+            };
+        }
     }
 
     const opEventId = String(opportunity?.eventId || opportunity?.id || '');
@@ -419,6 +472,20 @@ const maybeRunAutoSnipe = async (opportunity) => {
                 error: msg,
                 code,
                 placementMode,
+                placementProvider
+            };
+        }
+
+        if (code === 'BOOKY_INSUFFICIENT_BALANCE') {
+            console.warn(
+                `💸 [AUTO_SNIPE] Bloqueado por saldo insuficiente | ${opportunity?.match || 'n/a'} ` +
+                `(${opportunity?.selection || 'n/a'}) | ${msg}`
+            );
+            return {
+                triggered: false,
+                reason: 'insufficient-balance',
+                error: msg,
+                code,
                 placementProvider
             };
         }
