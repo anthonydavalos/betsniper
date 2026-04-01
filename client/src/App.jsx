@@ -1838,6 +1838,36 @@ function App() {
         const apiBase = provider === 'pinnacle' ? '/api/pinnacle' : '/api/booky';
         const providerUpper = provider === 'pinnacle' ? 'ARCADIA' : 'ALTENAR';
 
+        const includesInsufficientFundsHint = (value = '') => {
+            const normalized = String(value || '').trim().toLowerCase();
+            return normalized.includes('insufficient_funds') || normalized.includes('insufficient funds');
+        };
+
+        const isArcadiaInsufficientFundsFromDiagnostic = (diag = {}) => {
+            const titleCandidates = [
+                diag?.title,
+                diag?.firstBody?.title,
+                diag?.secondBody?.title,
+                diag?.firstError?.providerBody?.title,
+                diag?.secondError?.providerBody?.title
+            ];
+
+            const detailCandidates = [
+                diag?.detail,
+                diag?.firstBody?.detail,
+                diag?.secondBody?.detail,
+                diag?.firstError?.providerBody?.detail,
+                diag?.secondError?.providerBody?.detail
+            ];
+
+            return titleCandidates.some(includesInsufficientFundsHint) || detailCandidates.some(includesInsufficientFundsHint);
+        };
+
+        const formatMoney2 = (value) => {
+            const n = Number(value);
+            return Number.isFinite(n) ? n.toFixed(2) : null;
+        };
+
         let ticketId = null;
         let dryRunPayload = null;
 
@@ -1870,11 +1900,53 @@ function App() {
             };
         } catch (error) {
             const payload = error?.response?.data || {};
-            const code = payload?.code || null;
-            const message = payload?.message || error?.message || `${providerUpper}: error de ejecución`;
-            const diagnostic = payload?.diagnostic || null;
+            let code = payload?.code || null;
+            let message = payload?.message || error?.message || `${providerUpper}: error de ejecución`;
+            let diagnostic = payload?.diagnostic || null;
 
-            if (ticketId && (!code || code === 'BOOKY_INSUFFICIENT_BALANCE' || code === 'PINNACLE_REAL_DISABLED')) {
+            const looksLegacyArcadiaBadRequest = (
+                provider === 'pinnacle'
+                && code === 'PINNACLE_QUOTE_BAD_REQUEST'
+                && isArcadiaInsufficientFundsFromDiagnostic(diagnostic || {})
+            );
+
+            if (looksLegacyArcadiaBadRequest) {
+                code = 'PINNACLE_INSUFFICIENT_BALANCE';
+
+                const requestedStake = Number(
+                    diagnostic?.requestedStake
+                    ?? opportunity?.kellyStake
+                    ?? opportunity?.stake
+                    ?? dryRunPayload?.payload?.stake
+                    ?? dryRunPayload?.preview?.stake
+                    ?? NaN
+                );
+                const availableBalance = Number(
+                    diagnostic?.availableBalance
+                    ?? NaN
+                );
+
+                const stakeLabel = formatMoney2(requestedStake);
+                const balanceLabel = formatMoney2(availableBalance);
+
+                let descriptiveMessage = 'Arcadia reporta saldo insuficiente para cotizar/apostar este ticket.';
+                if (stakeLabel && balanceLabel) {
+                    descriptiveMessage += ` Stake S/. ${stakeLabel} vs saldo S/. ${balanceLabel}.`;
+                } else if (stakeLabel) {
+                    descriptiveMessage += ` Stake solicitado S/. ${stakeLabel}.`;
+                }
+
+                message = descriptiveMessage;
+                diagnostic = {
+                    ...(diagnostic || {}),
+                    normalizedByClient: true,
+                    normalizedFromCode: 'PINNACLE_QUOTE_BAD_REQUEST',
+                    requestedStake: Number.isFinite(requestedStake) ? Number(requestedStake) : (diagnostic?.requestedStake ?? null),
+                    availableBalance: Number.isFinite(availableBalance) ? Number(availableBalance) : (diagnostic?.availableBalance ?? null)
+                };
+            }
+
+            if (ticketId && (!code || code === 'BOOKY_INSUFFICIENT_BALANCE' || code === 'PINNACLE_REAL_DISABLED' || code === 'PINNACLE_INSUFFICIENT_BALANCE')) {
                 await axios.post(`${apiBase}/cancel/${ticketId}`).catch(() => {});
             }
 
