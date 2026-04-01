@@ -34,6 +34,7 @@ const getPrematchHybridWindow = () => {
 
 export const ingestAltenarPrematch = async (force = false) => {
   await initDB();
+  await db.read();
 
   const activeIntegration = altenarClient?.defaults?.params?.integration || 'unknown';
 
@@ -98,6 +99,8 @@ export const ingestAltenarPrematch = async (force = false) => {
     const marketsMap = new Map((response.data.markets || []).map(m => [m.id, m]));
     const oddsMap = new Map((response.data.odds || []).map(o => [o.id, o]));
 
+    const existingEvents = db.data.altenarUpcoming || [];
+    const existingById = new Map(existingEvents.map(ev => [String(ev.id), ev]));
     const cleanEvents = [];
 
     for (const event of events) {
@@ -116,7 +119,15 @@ export const ingestAltenarPrematch = async (force = false) => {
       // Filtramos si no tiene al menos una cuota válida de algún tipo
       // Puede que solo tenga 1x2, o solo Totales, etc.
       // Modificamos para ser permisivos si hay ALGUNA información útil.
-      if (odds.home || odds.draw || odds.away || odds.totals.length > 0 || odds.btts.yes) {
+      const previous = existingById.get(String(event.id));
+      const extractedHasDc = Boolean(
+        odds?.doubleChance?.homeDraw || odds?.doubleChance?.homeAway || odds?.doubleChance?.drawAway
+      );
+      const mergedDoubleChance = extractedHasDc
+        ? odds.doubleChance
+        : (previous?.odds?.doubleChance || {});
+
+      if (odds.home || odds.draw || odds.away || odds.totals.length > 0 || odds.btts.yes || extractedHasDc) {
         const cleanObj = {
           id: event.id,
           name: event.name,
@@ -131,6 +142,7 @@ export const ingestAltenarPrematch = async (force = false) => {
               home: odds.home,
               draw: odds.draw,
               away: odds.away,
+              doubleChance: mergedDoubleChance,
               totals: odds.totals, // Array [{ line, over, under }]
               btts: odds.btts      // { yes, no }
           },
@@ -152,8 +164,6 @@ export const ingestAltenarPrematch = async (force = false) => {
     console.log(`✅ Filtrado: ${cleanEvents.length} eventos válidos (de ${events.length}).`);
     // Mantener eventos recientes de Altenar en memoria aunque desaparezcan del endpoint /Upcoming
     // LOGICA SIMPLIFICADA: Si es de HOY (00:00 - 23:59), se queda.
-    
-    const existingEvents = db.data.altenarUpcoming || [];
     
     const nowMs = Date.now();
     const NEAR_LIVE_GRACE_MS = 10 * 60 * 1000;
@@ -198,6 +208,14 @@ export const ingestAltenarPrematch = async (force = false) => {
 const extractOdds = (event, marketsMap, oddsMap) => {
   if (!event.marketIds) return { home: 0, draw: 0, away: 0, totals: [], btts: {} };
 
+  const flattenMarketOddIds = (market) => {
+    if (!market) return [];
+    if (Array.isArray(market.oddIds)) return market.oddIds.filter(Boolean);
+    if (Array.isArray(market.desktopOddIds)) return market.desktopOddIds.flat().filter(Boolean);
+    if (Array.isArray(market.mobileOddIds)) return market.mobileOddIds.flat().filter(Boolean);
+    return [];
+  };
+
   const extractLineFromText = (value = '') => {
     const normalized = String(value).toLowerCase().replace(',', '.');
     const match = normalized.match(/(\d+(?:\.\d+)?)/);
@@ -217,10 +235,11 @@ const extractOdds = (event, marketsMap, oddsMap) => {
     if (side === 'under' && (!entry.under || entry.under <= 0)) entry.under = price;
   };
   
-  let result = { 
+    let result = { 
       home: 0, 
       draw: 0, 
       away: 0,
+      doubleChance: {},
       totals: [], // Lista de lineas over/under encontradas
       btts: {}    // Both Teams To Score
   };
@@ -231,7 +250,7 @@ const extractOdds = (event, marketsMap, oddsMap) => {
 
     // A) Mercado 1x2 (typeId 1 o name '1x2')
     if (market.typeId === 1 || market.name === '1x2') {
-      for (const oddId of market.oddIds) {
+      for (const oddId of flattenMarketOddIds(market)) {
         const odd = oddsMap.get(oddId);
         if (odd) {
           if (odd.typeId === 1) result.home = odd.price;
@@ -306,7 +325,7 @@ const extractOdds = (event, marketsMap, oddsMap) => {
     if (isValidTotal && !isTeamTotal) {
           const marketLine = parseFloat(market.sv || market.sn || market.activeLine || market.specialOddValue);
 
-          for (const oddId of market.oddIds || []) {
+          for (const oddId of flattenMarketOddIds(market)) {
             const odd = oddsMap.get(oddId);
             if (!odd) continue;
 
@@ -331,7 +350,7 @@ const extractOdds = (event, marketsMap, oddsMap) => {
          let yesPrice = 0;
          let noPrice = 0;
 
-         for (const oddId of market.oddIds) {
+         for (const oddId of flattenMarketOddIds(market)) {
              const odd = oddsMap.get(oddId);
              if (odd) {
                  // TypeId 74 = Yes, TypeId 76 = No (Segun Blueprint)
@@ -344,6 +363,44 @@ const extractOdds = (event, marketsMap, oddsMap) => {
          if (yesPrice > 0 && noPrice > 0) {
              result.btts = { yes: yesPrice, no: noPrice };
          }
+    }
+
+    // D) Mercado Double Chance (typeId 10 o nombre compatible)
+    if (market.typeId === 10 || (market.name && /double chance|doble oportunidad/i.test(market.name))) {
+      for (const oddId of flattenMarketOddIds(market)) {
+        const odd = oddsMap.get(oddId);
+        if (!odd || !Number.isFinite(Number(odd.price)) || Number(odd.price) <= 1) continue;
+
+        // Mapeo estable por typeId del proveedor (9=1X, 10=12, 11=X2).
+        if (Number(odd.typeId) === 9) {
+          result.doubleChance.homeDraw = Number(odd.price);
+          continue;
+        }
+        if (Number(odd.typeId) === 10) {
+          result.doubleChance.homeAway = Number(odd.price);
+          continue;
+        }
+        if (Number(odd.typeId) === 11) {
+          result.doubleChance.drawAway = Number(odd.price);
+          continue;
+        }
+
+        const nameCompact = String(odd.name || '')
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/\s+/g, '');
+
+        if (nameCompact.includes('1x') || nameCompact.includes('homedraw') || nameCompact.includes('localempate')) {
+          result.doubleChance.homeDraw = Number(odd.price);
+        }
+        if (nameCompact.includes('12') || nameCompact.includes('homeaway') || nameCompact.includes('localvisitante')) {
+          result.doubleChance.homeAway = Number(odd.price);
+        }
+        if (nameCompact.includes('x2') || nameCompact.includes('drawaway') || nameCompact.includes('empatevisitante')) {
+          result.doubleChance.drawAway = Number(odd.price);
+        }
+      }
     }
   }
 

@@ -180,6 +180,19 @@ const extractOddsFromDetails = (details, eventName = '') => {
     if (dcMarket) {
         const odds = flattenOddIds(dcMarket).map(id => oddsMap.get(id)).filter(Boolean);
         for (const odd of odds) {
+            if (Number(odd?.typeId) === 9 && odd?.price > 1) {
+                safeOdds.doubleChance.homeDraw = odd.price;
+                continue;
+            }
+            if (Number(odd?.typeId) === 10 && odd?.price > 1) {
+                safeOdds.doubleChance.homeAway = odd.price;
+                continue;
+            }
+            if (Number(odd?.typeId) === 11 && odd?.price > 1) {
+                safeOdds.doubleChance.drawAway = odd.price;
+                continue;
+            }
+
             const name = normalizeText(odd.name || '').replace(/\s+/g, '');
             if (name.includes('1x') && odd?.price > 1) safeOdds.doubleChance.homeDraw = odd.price;
             if (name.includes('12') && odd?.price > 1) safeOdds.doubleChance.homeAway = odd.price;

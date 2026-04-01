@@ -244,6 +244,7 @@ export const scanPrematchOpportunities = async () => {
                             home: p.moneyline?.home || dbMatch?.odds?.home || 0,
                             draw: p.moneyline?.draw || dbMatch?.odds?.draw || 0,
                             away: p.moneyline?.away || dbMatch?.odds?.away || 0,
+                            doubleChance: p.doubleChance || dbMatch?.odds?.doubleChance || null,
                             totals: (p.totals && p.totals.length > 0) ? p.totals : (dbMatch?.odds?.totals || []),
                             btts: dbMatch?.odds?.btts || null
                         },

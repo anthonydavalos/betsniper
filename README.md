@@ -49,6 +49,19 @@
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-04-01 (v3.4.23)
+
+- Se dejó operativo el pipeline de `Double Chance + opuesto 1x2` para Sprint A.1 de arbitraje.
+- Hardening en persistencia de mercados DC para evitar pérdida de datos entre ingesta, cache-first y scanner:
+  - `scripts/ingest-pinnacle.js` ahora persiste `odds.doubleChance` derivado desde 1x2.
+  - `src/services/prematchScannerService.js` conserva `doubleChance` al hidratar `upcomingMatches` desde cache prematch.
+  - `scripts/ingest-altenar.js` y `src/services/altenarPrematchScheduler.js` ahora mapean DC con shape real de Altenar (`desktopOddIds/mobileOddIds`, `typeId` 9/10/11).
+- Validación operativa posterior al ajuste:
+  - `upcomingMatches=63`, `pinnacleWithDC=59`
+  - `altenarUpcoming=81`, `altenarWithDC=79`
+  - `linked=30`, `linkedAltWithDc=30`
+- Resultado: cobertura técnica de DC ya habilitada en ambos lados para oportunidades de arbitraje de 2 patas; si no hay oportunidades en un snapshot puntual, la causa pasa a ser de pricing/mercado y no de falta de datos DC.
+
 ### Actualización 2026-03-29 (v3.4.22)
 
 - Pinnacle ahora tiene recuperación histórica completa y reconciliación local:

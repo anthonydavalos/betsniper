@@ -7,6 +7,65 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.23] -- 2026-04-01 -- Sprint A.1: DC+Opuesto Operativo + Hardening de Ingesta/Cache
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Preview de arbitraje expandido a combinaciones de 2 patas
+- **`src/services/arbitrageService.js`**:
+  - Nuevo bloque de combinaciones `Double Chance + opuesto 1x2`:
+    - `1X + Away`
+    - `X2 + Home`
+    - `12 + Draw`
+  - Nuevo stake splitter de 2 patas con ajuste de residuos en centavos.
+  - Respuesta enriquecida con `markets` mixto y `generatedByType` en diagnósticos.
+
+#### Diagnóstico de cobertura por tipo de oportunidad
+- **`src/services/arbitrageService.js`**:
+  - Nuevos contadores de descarte para DC (`skippedMissingOddsDcOpposite`).
+  - Métricas separadas de generación para `surebet1x2` y `surebetDcOpposite`.
+
+### 🔄 Changed
+
+#### Persistencia robusta de Double Chance en Pinnacle prematch
+- **`scripts/ingest-pinnacle.js`**:
+  - Se deriva y persiste `odds.doubleChance` desde 1x2 (`home/draw/away`) durante la ingesta.
+  - Fallback de preservación al snapshot previo para evitar pérdida de DC ante fuentes parciales.
+
+#### Extracción Altenar compatible con shape real de mercados typeId=10
+- **`scripts/ingest-altenar.js`**:
+  - Se agrega soporte de flatten para `desktopOddIds`/`mobileOddIds` además de `oddIds`.
+  - Se mapea DC por `typeId` de odd (`9=1X`, `10=12`, `11=X2`) y fallback por nombre.
+  - Se persiste `odds.doubleChance` en `altenarUpcoming` y se conserva valor previo cuando un barrido no trae DC.
+
+- **`src/services/altenarPrematchScheduler.js`**:
+  - Mapeo DC reforzado con `typeId` (`9/10/11`) antes de la heurística por texto.
+
+#### Cache-first prematch sin pérdida de DC
+- **`src/services/prematchScannerService.js`**:
+  - Al hidratar `upcomingMatches` desde `getAllPinnaclePrematchOdds`, ahora persiste explícitamente `doubleChance`.
+
+#### Claridad documental del endpoint de arbitraje
+- **`src/routes/opportunities.js`**:
+  - Comentario de endpoint actualizado para reflejar mercado mixto `1x2 + DC/opuesto`.
+
+### 🧪 Validated
+
+- Verificación de fuente prematch Pinnacle:
+  - `getAllPinnaclePrematchOdds()` devolvió eventos con `doubleChance` activo.
+- Verificación post-fix en DB local:
+  - `upcomingMatches`: 63
+  - `pinnacleWithDC`: 59
+  - `altenarUpcoming`: 81
+  - `altenarWithDC`: 79
+  - `linked`: 30
+  - `linkedAltWithDc`: 30
+- Smoke preview arbitrage:
+  - Mercado mixto expuesto (`1x2`, `double_chance+opposite_1x2`).
+  - `skippedMissingOddsDcOpposite=0` en snapshot validado.
+
 ## [v3.4.22] -- 2026-03-29 -- Sprint: Pinnacle History Recovery + PnL Real + Sync UX
 
 > Rama: `master`

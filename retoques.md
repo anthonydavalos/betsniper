@@ -1,5 +1,24 @@
 # Registro de Retoques y Correcciones
 
+## [2026-04-01] Activación operativa DC para arbitraje (Pinnacle + Altenar)
+- **Pinnacle prematch:** `scripts/ingest-pinnacle.js` ahora deriva y persiste `odds.doubleChance` desde 1x2 para no depender del estado de un feed parcial.
+- **Cache-first prematch:** `src/services/prematchScannerService.js` conserva `doubleChance` al hidratar `upcomingMatches` desde `getAllPinnaclePrematchOdds`.
+- **Altenar GetUpcoming/GetEventDetails:** extractor reforzado para mercados typeId=10 usando `desktopOddIds/mobileOddIds` y mapeo por `odd.typeId` (`9=1X`, `10=12`, `11=X2`), con fallback por nombre.
+- **Scheduler adaptativo Altenar:** `src/services/altenarPrematchScheduler.js` mapea DC por `typeId` antes de heurística textual para robustez en perfiles multilenguaje.
+- **Verificación de cobertura post-fix:**
+  - `upcoming=63`, `pinnacleWithDC=59`
+  - `altenar=81`, `altenarWithDC=79`
+  - `linked=30`, `linkedAltWithDc=30`
+
+## [2026-03-30] Sprint A.1: Preview 2 patas (Double Chance + opuesto 1x2)
+- **Extensión de motor:** `src/services/arbitrageService.js` ahora combina, además del 1x2 de 3 patas, estas rutas de arbitraje de 2 patas:
+  - `1X + Away`
+  - `X2 + Home`
+  - `12 + Draw`
+- **Mapper contextual por orientación:** si el evento queda en `swapped`, se invierten correctamente `1X <-> X2` en Altenar para no romper la cobertura.
+- **Stake Splitter 2 patas:** se agrega cálculo específico con redondeo por centavos, ajuste de residuo y métricas (`edgePercent`, `guaranteedPayout`, `expectedProfit`, `roiPercent`).
+- **Respuesta API enriquecida:** `GET /api/opportunities/arbitrage/preview` ahora devuelve mercado mixto (`1x2` + `double_chance+opposite_1x2`) y diagnóstico por tipo generado/descartado.
+
 ## [2026-03-30] Sprint A MVP: Surebet 1x2 + Stake Splitter + API Preview
 - **Servicio nuevo:** `src/services/arbitrageService.js`.
   - Detector de surebet **1x2 prematch** usando `upcomingMatches` (Pinnacle) + `altenarUpcoming` (Altenar).

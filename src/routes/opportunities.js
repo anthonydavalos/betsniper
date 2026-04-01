@@ -232,7 +232,7 @@ router.get('/prematch', async (req, res) => {
 });
 
 // GET /api/opportunities/arbitrage/preview
-// Preview de arbitraje matemático (sin ejecución real).
+// Preview de arbitraje matematico (sin ejecucion real): 1x2 + DC/opuesto.
 router.get('/arbitrage/preview', async (req, res) => {
   try {
     const bankrollRaw = Number(req.query?.bankroll);
