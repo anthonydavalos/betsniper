@@ -2168,6 +2168,13 @@ function App() {
                     },
                     count: Number(arbitrageRes.data?.count || rows.length || 0)
                 });
+
+                const nowIso = new Date().toISOString();
+                setArbitrageRefreshState((prev) => ({
+                    ...prev,
+                    lastOkAt: nowIso,
+                    lastError: null
+                }));
             }
 
             lastArbitrageFetchAtRef.current = Date.now();
@@ -4350,7 +4357,7 @@ function App() {
                                         : 'Recalculando preview de arbitraje con el snapshot más reciente...')
                                     : arbitrageRefreshState.lastError
                                         ? `Refresh falló: ${arbitrageRefreshState.lastError}`
-                                        : `Refresh completo: ${formatTimeSafe(arbitrageRefreshState.lastOkAt)}`}
+                                        : `Última actualización de arbitraje: ${formatTimeSafe(arbitrageRefreshState.lastOkAt)}`}
                             </div>
                         )}
 
