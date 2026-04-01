@@ -7,6 +7,47 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.24] -- 2026-04-01 -- Sprint: ARBITRAGE Semi-Auto (Fase 1) + Dual Sequential (Fase 2)
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Fase 1: ejecución semi-automática por pata en ARBITRAGE
+- **`client/src/App.jsx`**:
+  - Nuevo botón `Semi-auto` por leg cuando el provider de la pata es Altenar.
+  - Conversión de legs de arbitraje (`1x2` y `Double Chance + opuesto`) a payload compatible con flujo Booky (`prepare`/`confirm`).
+  - Las patas Arcadia/Pinnacle se mantienen como referencia en Fase 1 (sin envío automático individual).
+
+#### Dry-run obligatorio antes de confirmación real en Booky
+- **`client/src/App.jsx`**:
+  - Antes de cualquier `confirm` real en Booky se ejecuta `POST /api/booky/real/dryrun/:id`.
+  - Si el dry-run falla, se cancela ticket draft y se aborta la ejecución real.
+  - Se muestra resumen operativo de dry-run (stake/odd/requestId) en el bloque de confirmación.
+
+#### Fase 2: ejecución dual secuencial Arcadia -> Altenar
+- **`client/src/App.jsx`**:
+  - Nuevo botón `Ejecutar Dual` en tarjeta de arbitraje.
+  - Plan dual automático con selección de pata Arcadia y pata Altenar por mayor stake por lado.
+  - Secuencia transaccional UI:
+    - Arcadia: `prepare -> dryrun -> real/confirm-fast`
+    - Altenar: `prepare -> dryrun -> real/confirm-fast`
+  - Lock por tarjeta para evitar doble disparo simultáneo.
+
+### 🔄 Changed
+
+#### Outcome final explícito en ejecución dual
+- **`client/src/App.jsx`**:
+  - `CONFIRMED`: ambas patas confirmadas.
+  - `REJECTED`: falla Arcadia y no se ejecuta Altenar.
+  - `HEDGE_REQUIRED`: Arcadia confirmada y Altenar `REJECTED` o `UNCERTAIN`.
+  - Mensajería final con ticket ids y acción operativa sugerida cuando queda exposición.
+
+### 🧪 Validated
+
+- Build frontend exitoso (`vite build`) tras integración de Fase 1 + Fase 2.
+- Sin errores estáticos reportados en `client/src/App.jsx` tras los cambios.
+
 ## [v3.4.23] -- 2026-04-01 -- Sprint A.1: DC+Opuesto Operativo + Hardening de Ingesta/Cache
 
 > Rama: `master`

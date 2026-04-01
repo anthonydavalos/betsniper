@@ -781,6 +781,7 @@ function App() {
         lastOkAt: null,
         lastError: null
     });
+    const [arbitrageExecutingKeys, setArbitrageExecutingKeys] = useState(new Set());
     const [arbitrageRiskProfileKey, setArbitrageRiskProfileKey] = useState('conservative');
     const [arbitrageRiskConfig, setArbitrageRiskConfig] = useState(() => ({
         ...ARBITRAGE_RISK_PROFILE_PRESETS.conservative.config
@@ -869,6 +870,7 @@ function App() {
     const autoTokenRenewInFlightRef = useRef(false);
     const lastSilentTokenRenewAttemptAtRef = useRef(0);
     const placementProviderFetchInFlightRef = useRef(false);
+    const arbitrageExecutingKeysRef = useRef(new Set());
 
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
@@ -1630,6 +1632,339 @@ function App() {
         return split;
     };
 
+    const resolveArbitrageLegStake = ({ op = {}, leg = {}, legIdx = 0 } = {}) => {
+        const isDcOpposite = String(op?.type || '').toUpperCase() === 'SUREBET_DC_OPPOSITE_PREMATCH';
+        if (isDcOpposite) {
+            const coverStake = Number(op?.plan?.stakes?.cover || 0);
+            const oppositeStake = Number(op?.plan?.stakes?.opposite || 0);
+            const coverLabel = String(op?.plan?.labels?.cover || '').trim().toUpperCase();
+            const oppositeLabel = String(op?.plan?.labels?.opposite || '').trim().toUpperCase();
+            const legSelection = String(leg?.selection || '').trim().toUpperCase();
+
+            if (coverLabel && legSelection === coverLabel) return coverStake;
+            if (oppositeLabel && legSelection === oppositeLabel) return oppositeStake;
+            if (legIdx === 0) return coverStake;
+            if (legIdx === 1) return oppositeStake;
+            return 0;
+        }
+
+        const selection = String(leg?.selection || '').trim().toUpperCase();
+        if (selection === 'HOME' || selection === '1' || selection.includes('LOCAL')) return Number(op?.plan?.stakes?.home || 0);
+        if (selection === 'DRAW' || selection === 'X' || selection.includes('EMPATE')) return Number(op?.plan?.stakes?.draw || 0);
+        if (selection === 'AWAY' || selection === '2' || selection.includes('VISITA')) return Number(op?.plan?.stakes?.away || 0);
+        return 0;
+    };
+
+    const normalizeArbitrageLegSelection = (marketRaw = '', selectionRaw = '') => {
+        const market = String(marketRaw || '').trim().toLowerCase();
+        const selection = String(selectionRaw || '').trim();
+        const selectionUpper = selection.toUpperCase();
+
+        if (market === '1x2') {
+            if (selectionUpper === '1' || selectionUpper === 'HOME' || selectionUpper.includes('LOCAL')) return 'Home';
+            if (selectionUpper === 'X' || selectionUpper === 'DRAW' || selectionUpper.includes('EMPATE')) return 'Draw';
+            if (selectionUpper === '2' || selectionUpper === 'AWAY' || selectionUpper.includes('VISITA')) return 'Away';
+        }
+
+        if (market.includes('double chance')) {
+            if (selectionUpper === '1X' || selectionUpper === 'X2' || selectionUpper === '12') return selectionUpper;
+        }
+
+        return selection || '-';
+    };
+
+    const buildArbitrageLegOpportunity = ({ op = {}, leg = {}, legIdx = 0 } = {}) => {
+        const providerBucket = normalizeArbitrageProviderBucket(leg?.provider || '');
+        if (providerBucket !== 'altenar') return null;
+
+        const odd = Number(leg?.odd);
+        if (!(Number.isFinite(odd) && odd > 1)) return null;
+
+        const stake = Number(resolveArbitrageLegStake({ op, leg, legIdx }));
+        if (!(Number.isFinite(stake) && stake > 0)) return null;
+
+        const market = String(leg?.market || op?.market || '1x2').trim();
+        const selection = normalizeArbitrageLegSelection(market, leg?.selection || '');
+        const ev = Number(op?.plan?.roiPercent || 0);
+        const realProb = (Number.isFinite(ev) && Number.isFinite(odd) && odd > 1)
+            ? Number((((1 + (ev / 100)) / odd) * 100).toFixed(4))
+            : null;
+
+        return {
+            type: 'PREMATCH_VALUE',
+            strategy: 'PREMATCH_VALUE',
+            eventId: op?.eventId || null,
+            pinnacleId: op?.pinnacleId || null,
+            match: op?.match || '-',
+            league: op?.league || '-',
+            date: op?.matchDate || null,
+            market,
+            selection,
+            action: `Apostar ${selection}`,
+            odd,
+            price: odd,
+            kellyStake: Number(stake.toFixed(2)),
+            ev: Number.isFinite(ev) ? ev : 0,
+            realProb,
+            provider: 'altenar',
+            source: 'ARBITRAGE_PREVIEW_LEG',
+            arbitrageType: op?.type || null,
+            arbitrageLegIndex: legIdx
+        };
+    };
+
+    const buildArbitrageLegOpportunityPinnacle = ({ op = {}, leg = {}, legIdx = 0 } = {}) => {
+        const providerBucket = normalizeArbitrageProviderBucket(leg?.provider || '');
+        if (providerBucket !== 'arcadia') return null;
+
+        const odd = Number(leg?.odd);
+        if (!(Number.isFinite(odd) && odd > 1)) return null;
+
+        const stake = Number(resolveArbitrageLegStake({ op, leg, legIdx }));
+        if (!(Number.isFinite(stake) && stake > 0)) return null;
+
+        const market = String(leg?.market || '').trim();
+        if (market !== '1x2') return null;
+
+        const selection = normalizeArbitrageLegSelection(market, leg?.selection || '');
+        if (!(selection === 'Home' || selection === 'Draw' || selection === 'Away')) return null;
+
+        const ev = Number(op?.plan?.roiPercent || 0);
+        const realProb = (Number.isFinite(ev) && Number.isFinite(odd) && odd > 1)
+            ? Number((((1 + (ev / 100)) / odd) * 100).toFixed(4))
+            : null;
+
+        return {
+            type: 'PREMATCH_VALUE',
+            strategy: 'PREMATCH_VALUE',
+            eventId: op?.eventId || null,
+            pinnacleId: op?.pinnacleId || null,
+            match: op?.match || '-',
+            league: op?.league || '-',
+            date: op?.matchDate || null,
+            market: '1x2',
+            selection,
+            action: `Apostar ${selection}`,
+            odd,
+            price: odd,
+            pinnaclePrice: odd,
+            realPrice: odd,
+            kellyStake: Number(stake.toFixed(2)),
+            ev: Number.isFinite(ev) ? ev : 0,
+            realProb,
+            provider: 'pinnacle',
+            source: 'ARBITRAGE_PREVIEW_LEG',
+            arbitrageType: op?.type || null,
+            arbitrageLegIndex: legIdx
+        };
+    };
+
+    const pickMaxStakeLeg = (candidates = []) => {
+        if (!Array.isArray(candidates) || candidates.length === 0) return null;
+        return candidates
+            .slice()
+            .sort((a, b) => Number(b?.stake || 0) - Number(a?.stake || 0))[0] || null;
+    };
+
+    const buildDualExecutionPlan = (op = {}, legs = []) => {
+        const normalizedLegs = Array.isArray(legs) ? legs : [];
+
+        const arcadiaCandidates = normalizedLegs
+            .map((leg, legIdx) => {
+                const opportunity = buildArbitrageLegOpportunityPinnacle({ op, leg, legIdx });
+                if (!opportunity) return null;
+                return {
+                    leg,
+                    legIdx,
+                    opportunity,
+                    stake: Number(opportunity?.kellyStake || 0)
+                };
+            })
+            .filter(Boolean);
+
+        const altenarCandidates = normalizedLegs
+            .map((leg, legIdx) => {
+                const opportunity = buildArbitrageLegOpportunity({ op, leg, legIdx });
+                if (!opportunity) return null;
+                return {
+                    leg,
+                    legIdx,
+                    opportunity,
+                    stake: Number(opportunity?.kellyStake || 0)
+                };
+            })
+            .filter(Boolean);
+
+        const arcadia = pickMaxStakeLeg(arcadiaCandidates);
+        const altenar = pickMaxStakeLeg(altenarCandidates);
+
+        if (!arcadia || !altenar) {
+            return {
+                canExecute: false,
+                reason: 'requires-arcadia-and-altenar-legs',
+                arcadia: arcadia || null,
+                altenar: altenar || null
+            };
+        }
+
+        if (!arcadia?.opportunity?.pinnacleId) {
+            return {
+                canExecute: false,
+                reason: 'missing-pinnacle-id',
+                arcadia,
+                altenar
+            };
+        }
+
+        return {
+            canExecute: true,
+            reason: null,
+            arcadia,
+            altenar
+        };
+    };
+
+    const getArbitrageExecutionKey = (op = {}, idx = 0) => `${String(op?.type || 'ARB')}_${String(op?.eventId || idx)}_${idx}`;
+
+    const setArbitrageExecutionRunning = (executionKey, running) => {
+        const next = new Set(arbitrageExecutingKeysRef.current);
+        if (running) next.add(executionKey);
+        else next.delete(executionKey);
+        arbitrageExecutingKeysRef.current = next;
+        setArbitrageExecutingKeys(new Set(next));
+    };
+
+    const runProviderRealPlacement = async ({ provider = 'booky', opportunity = null, confirmMode = 'confirm-fast' } = {}) => {
+        const apiBase = provider === 'pinnacle' ? '/api/pinnacle' : '/api/booky';
+        const providerUpper = provider === 'pinnacle' ? 'ARCADIA' : 'ALTENAR';
+
+        let ticketId = null;
+        let dryRunPayload = null;
+
+        try {
+            const prepRes = await axios.post(`${apiBase}/prepare`, opportunity, { timeout: 45000 });
+            const ticket = prepRes?.data?.ticket || null;
+            ticketId = ticket?.id || null;
+
+            if (!prepRes?.data?.success || !ticketId) {
+                throw new Error(prepRes?.data?.message || `${providerUpper}: prepare sin ticket válido.`);
+            }
+
+            const dryRunRes = await axios.post(`${apiBase}/real/dryrun/${ticketId}`, undefined, { timeout: 25000 });
+            dryRunPayload = dryRunRes?.data?.draft || dryRunRes?.data || null;
+            if (!dryRunRes?.data?.success || !dryRunPayload) {
+                throw new Error(dryRunRes?.data?.message || `${providerUpper}: dry-run inválido.`);
+            }
+
+            const confirmRes = await axios.post(`${apiBase}/real/${confirmMode}/${ticketId}`, undefined, { timeout: 30000 });
+            if (!confirmRes?.data?.success) {
+                throw new Error(confirmRes?.data?.message || `${providerUpper}: confirm no exitoso.`);
+            }
+
+            return {
+                provider,
+                outcome: 'confirmed',
+                ticketId,
+                dryRunPayload,
+                response: confirmRes.data
+            };
+        } catch (error) {
+            const payload = error?.response?.data || {};
+            const code = payload?.code || null;
+            const message = payload?.message || error?.message || `${providerUpper}: error de ejecución`;
+            const diagnostic = payload?.diagnostic || null;
+
+            if (ticketId && (!code || code === 'BOOKY_INSUFFICIENT_BALANCE' || code === 'PINNACLE_REAL_DISABLED')) {
+                await axios.post(`${apiBase}/cancel/${ticketId}`).catch(() => {});
+            }
+
+            let outcome = 'rejected';
+            if (code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') outcome = 'uncertain';
+
+            return {
+                provider,
+                outcome,
+                ticketId,
+                dryRunPayload,
+                code,
+                message,
+                diagnostic
+            };
+        }
+    };
+
+    const handleExecuteArbitrageDual = async ({ op = {}, legs = [], idx = 0 } = {}) => {
+        const executionKey = getArbitrageExecutionKey(op, idx);
+        if (arbitrageExecutingKeysRef.current.has(executionKey)) return;
+
+        const dualPlan = buildDualExecutionPlan(op, legs);
+        if (!dualPlan?.canExecute) {
+            alert('⚠️ Esta oportunidad no tiene patas ejecutables Arcadia + Altenar para ejecución dual secuencial.');
+            return;
+        }
+
+        const arcadiaLeg = dualPlan.arcadia;
+        const altenarLeg = dualPlan.altenar;
+        const confirmMsg =
+            'Ejecución dual secuencial (Arcadia → Altenar)\n\n' +
+            `Partido: ${op?.match || '-'}\n` +
+            `Arcadia: ${arcadiaLeg?.opportunity?.selection || '-'} @ ${Number(arcadiaLeg?.opportunity?.odd || 0).toFixed(3)} | Stake S/. ${Number(arcadiaLeg?.opportunity?.kellyStake || 0).toFixed(2)}\n` +
+            `Altenar: ${altenarLeg?.opportunity?.selection || '-'} @ ${Number(altenarLeg?.opportunity?.odd || 0).toFixed(3)} | Stake S/. ${Number(altenarLeg?.opportunity?.kellyStake || 0).toFixed(2)}\n\n` +
+            'Se ejecutará dry-run obligatorio en ambos providers antes de confirmar real.\n\n' +
+            '¿Continuar?';
+
+        if (!window.confirm(confirmMsg)) return;
+
+        setArbitrageExecutionRunning(executionKey, true);
+
+        try {
+            const arcadiaResult = await runProviderRealPlacement({
+                provider: 'pinnacle',
+                opportunity: arcadiaLeg.opportunity,
+                confirmMode: 'confirm-fast'
+            });
+
+            if (arcadiaResult.outcome !== 'confirmed') {
+                const code = arcadiaResult?.code ? ` | code=${arcadiaResult.code}` : '';
+                alert(`❌ Resultado final=REJECTED (Arcadia)${code}\n${arcadiaResult?.message || 'No se pudo confirmar pata Arcadia.'}`);
+                await fetchData({ forceBookyRefresh: true });
+                return;
+            }
+
+            const altenarResult = await runProviderRealPlacement({
+                provider: 'booky',
+                opportunity: altenarLeg.opportunity,
+                confirmMode: 'confirm-fast'
+            });
+
+            if (altenarResult.outcome === 'confirmed') {
+                alert(
+                    '✅ Resultado final=CONFIRMED (DUAL)\n\n' +
+                    `Arcadia ticket: ${arcadiaResult?.ticketId || 'n/a'}\n` +
+                    `Altenar ticket: ${altenarResult?.ticketId || 'n/a'}`
+                );
+                await fetchData({ forceBookyRefresh: true });
+                return;
+            }
+
+            const secondOutcome = altenarResult.outcome === 'uncertain' ? 'UNCERTAIN' : 'REJECTED';
+            const code = altenarResult?.code ? ` | code=${altenarResult.code}` : '';
+            alert(
+                `⚠️ Resultado final=HEDGE_REQUIRED\n\n` +
+                `Arcadia CONFIRMED (ticket ${arcadiaResult?.ticketId || 'n/a'})\n` +
+                `Altenar ${secondOutcome}${code}\n` +
+                `${altenarResult?.message || 'Sin detalle adicional.'}\n\n` +
+                'Acción: cubrir manualmente el riesgo de la pata Arcadia ya ejecutada.'
+            );
+            await fetchData({ forceBookyRefresh: true });
+        } catch (error) {
+            alert(`❌ Fallo inesperado en ejecución dual: ${error?.message || 'Error desconocido.'}`);
+            await fetchData({ forceBookyRefresh: true });
+        } finally {
+            setArbitrageExecutionRunning(executionKey, false);
+        }
+    };
+
     const applyArbitrageRiskProfile = (profileKey = 'conservative') => {
         const normalized = String(profileKey || '').toLowerCase();
         const preset = ARBITRAGE_RISK_PROFILE_PRESETS[normalized];
@@ -2347,6 +2682,37 @@ function App() {
             useRealPlacement = Boolean(token?.realPlacementEnabled);
         }
 
+        let dryRunSummaryLine = '';
+        if (isBookyManualPlacement && useRealPlacement) {
+            try {
+                const dryRunRes = await axios.post(`${providerApiBase}/real/dryrun/${ticket.id}`, undefined, { timeout: 20000 });
+                const dryDraft = dryRunRes?.data?.draft || null;
+                if (!dryRunRes?.data?.success || !dryDraft) {
+                    throw new Error(dryRunRes?.data?.message || 'Dry-run no devolvió payload válido.');
+                }
+
+                const dryStake = Number(dryDraft?.payload?.stakes?.[0]);
+                const dryOdd = Number(dryDraft?.payload?.betMarkets?.[0]?.odds?.[0]?.price);
+                const dryRequestId = String(dryDraft?.payload?.requestId || '').trim();
+                const stakeTxt = Number.isFinite(dryStake) && dryStake > 0 ? `S/. ${dryStake.toFixed(2)}` : 'n/a';
+                const oddTxt = Number.isFinite(dryOdd) && dryOdd > 1 ? dryOdd.toFixed(3) : 'n/a';
+                dryRunSummaryLine = `Dry-run OK: stake ${stakeTxt} | odd ${oddTxt}${dryRequestId ? ` | req ${dryRequestId}` : ''}`;
+            } catch (dryRunError) {
+                const dryData = dryRunError?.response?.data;
+                const dryMsg = dryData?.message || dryRunError?.message || 'No se pudo validar dry-run.';
+                const dryDiag = dryData?.diagnostic;
+                const dryDiagText = dryDiag
+                    ? `\n\nDiagnóstico:\nproviderStatus: ${dryDiag.providerStatus ?? 'n/a'}\nproviderCode: ${dryDiag.providerCode ?? 'n/a'}\nrequestId: ${dryDiag.requestId ?? 'n/a'}`
+                    : '';
+                await axios.post(`${providerApiBase}/cancel/${ticket.id}`).catch(() => {});
+                alert(`⚠️ Dry-run REAL falló en ${providerLabel}.\nNo se enviará confirmación real.${dryDiagText}\n\nDetalle: ${dryMsg}`);
+                localPlacedBetIdsRef.current.delete(id);
+                delete pendingBetDetailsRef.current[id];
+                forceUpdate();
+                return;
+            }
+        }
+
         pendingBetDetailsRef.current[id] = {
             ...opportunity,
             ...(ticket?.opportunity || {}),
@@ -2413,6 +2779,7 @@ function App() {
         if (evDeltaLine) refreshLines.push(`Delta EV: ${evDeltaLine}`);
         if (probDeltaLine) refreshLines.push(`Delta prob real: ${probDeltaLine}`);
         if (fairProbSource) refreshLines.push(`Fuente fair prob: ${fairProbSource}`);
+        if (dryRunSummaryLine) refreshLines.push(dryRunSummaryLine);
 
         const refreshBlock = `${refreshLines.join('\n')}\n\n`;
 
@@ -3872,6 +4239,9 @@ function App() {
                                     const splitTotal = Number(providerSplit.total || 0);
                                     const pctAlt = splitTotal > 0 ? ((providerSplit.altenar / splitTotal) * 100) : 0;
                                     const pctArc = splitTotal > 0 ? ((providerSplit.arcadia / splitTotal) * 100) : 0;
+                                    const executionKey = getArbitrageExecutionKey(op, idx);
+                                    const dualPlan = buildDualExecutionPlan(op, legs);
+                                    const dualRunning = arbitrageExecutingKeys.has(executionKey);
 
                                     return (
                                         <article key={`${op?.type || 'ARB'}_${op?.eventId || idx}_${idx}`} className="rounded-lg border border-amber-500/25 bg-slate-900/40 p-3 space-y-2">
@@ -3890,12 +4260,34 @@ function App() {
                                             </div>
 
                                             <div className="rounded border border-slate-700 bg-slate-800/40 p-2 space-y-1">
-                                                {legs.map((leg, legIdx) => (
-                                                    <div key={`${leg?.selection || legIdx}_${legIdx}`} className="flex items-center justify-between text-[11px]">
-                                                        <span className="text-slate-300">{`${leg?.market || '-'} · ${leg?.selection || '-'}`}</span>
-                                                        <span className="font-mono text-slate-200">{`${String(leg?.provider || '-').toUpperCase()} @ ${Number(leg?.odd || 0).toFixed(3)}`}</span>
-                                                    </div>
-                                                ))}
+                                                {legs.map((leg, legIdx) => {
+                                                    const legOpportunity = buildArbitrageLegOpportunity({ op, leg, legIdx });
+                                                    const legOpId = legOpportunity ? getOpportunityId(legOpportunity) : null;
+                                                    const legProcessing = legOpId ? processingBets.has(legOpId) : false;
+
+                                                    return (
+                                                        <div key={`${leg?.selection || legIdx}_${legIdx}`} className="flex items-center justify-between gap-2 text-[11px]">
+                                                            <div className="min-w-0">
+                                                                <span className="text-slate-300">{`${leg?.market || '-'} · ${leg?.selection || '-'}`}</span>
+                                                                <div className="font-mono text-slate-200">{`${String(leg?.provider || '-').toUpperCase()} @ ${Number(leg?.odd || 0).toFixed(3)}`}</div>
+                                                            </div>
+                                                            {legOpportunity ? (
+                                                                <button
+                                                                    onClick={() => handlePlaceBet(legOpportunity, { confirmModeHint: 'confirm' })}
+                                                                    disabled={legProcessing}
+                                                                    className={`px-2 py-1 rounded border text-[9px] font-bold uppercase tracking-wide transition-colors ${legProcessing
+                                                                        ? 'border-slate-600 text-slate-500 cursor-not-allowed'
+                                                                        : 'border-emerald-500/60 text-emerald-200 hover:bg-emerald-500/20'}`}
+                                                                    title="Flujo semi-auto: prepare + dry-run + confirm"
+                                                                >
+                                                                    {legProcessing ? 'Procesando...' : 'Semi-auto'}
+                                                                </button>
+                                                            ) : (
+                                                                <span className="text-[9px] uppercase tracking-wide text-slate-500">Solo referencia</span>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
                                             </div>
 
                                             <div className="grid grid-cols-2 gap-2 text-[11px]">
@@ -3933,6 +4325,27 @@ function App() {
                                                         {`Otros providers: S/. ${Number(providerSplit.other || 0).toFixed(2)}`}
                                                     </div>
                                                 )}
+                                            </div>
+
+                                            <div className="flex items-center justify-between gap-2 rounded border border-emerald-500/20 bg-emerald-500/5 p-2">
+                                                <div className="text-[10px] text-slate-300">
+                                                    <div className="uppercase tracking-wide text-emerald-200 font-bold">Fase 2 · Ejecución Dual</div>
+                                                    <div className="text-slate-400">
+                                                        {dualPlan?.canExecute
+                                                            ? 'Secuencia: Arcadia -> Altenar (dry-run obligatorio en ambas patas)'
+                                                            : 'No ejecutable en dual: requiere pata Arcadia + pata Altenar válidas'}
+                                                    </div>
+                                                </div>
+                                                <button
+                                                    onClick={() => handleExecuteArbitrageDual({ op, legs, idx })}
+                                                    disabled={!dualPlan?.canExecute || dualRunning}
+                                                    className={`px-2.5 py-1.5 rounded border text-[10px] font-bold uppercase tracking-wide transition-colors ${(!dualPlan?.canExecute || dualRunning)
+                                                        ? 'border-slate-600 text-slate-500 cursor-not-allowed'
+                                                        : 'border-emerald-500/60 text-emerald-200 hover:bg-emerald-500/20'}`}
+                                                    title="Ejecutar patas Arcadia + Altenar en secuencia"
+                                                >
+                                                    {dualRunning ? 'Ejecutando...' : 'Ejecutar Dual'}
+                                                </button>
                                             </div>
                                         </article>
                                     );
