@@ -2,6 +2,32 @@ import db, { initDB } from '../db/database.js';
 
 const DEFAULT_PREVIEW_LIMIT = 50;
 const MAX_PREVIEW_LIMIT = 500;
+const DC_OPPOSITE_COMBOS = [
+  {
+    code: '1X_PLUS_AWAY',
+    label: '1X + Away',
+    dcKey: 'homeDraw',
+    dcSelection: '1X',
+    oppositeKey: 'away',
+    oppositeSelection: 'Away'
+  },
+  {
+    code: 'X2_PLUS_HOME',
+    label: 'X2 + Home',
+    dcKey: 'drawAway',
+    dcSelection: 'X2',
+    oppositeKey: 'home',
+    oppositeSelection: 'Home'
+  },
+  {
+    code: '12_PLUS_DRAW',
+    label: '12 + Draw',
+    dcKey: 'homeAway',
+    dcSelection: '12',
+    oppositeKey: 'draw',
+    oppositeSelection: 'Draw'
+  }
+];
 
 const toNumber = (value, fallback = NaN) => {
   const n = Number(value);
@@ -92,7 +118,7 @@ const chooseBestOdd = ({ pinnacleOdd, altenarOdd } = {}) => {
   return { provider: 'pinnacle', odd: pin };
 };
 
-const buildStakePlan = ({ bankroll, bestOdds } = {}) => {
+const buildThreeLegStakePlan = ({ bankroll, bestOdds } = {}) => {
   const base = toNumber(bankroll, NaN);
   if (!Number.isFinite(base) || base <= 0) return null;
 
@@ -150,6 +176,88 @@ const buildStakePlan = ({ bankroll, bestOdds } = {}) => {
   };
 };
 
+const buildTwoLegStakePlan = ({ bankroll, bestOdds } = {}) => {
+  const base = toNumber(bankroll, NaN);
+  if (!Number.isFinite(base) || base <= 0) return null;
+
+  const oCover = safePositiveOdd(bestOdds?.cover?.odd);
+  const oOpposite = safePositiveOdd(bestOdds?.opposite?.odd);
+  if (!oCover || !oOpposite) return null;
+
+  const impliedSum = (1 / oCover) + (1 / oOpposite);
+  if (!(impliedSum < 1)) return null;
+
+  const rawStakes = {
+    cover: base * ((1 / oCover) / impliedSum),
+    opposite: base * ((1 / oOpposite) / impliedSum)
+  };
+
+  const rounded = {
+    cover: Number(rawStakes.cover.toFixed(2)),
+    opposite: Number(rawStakes.opposite.toFixed(2))
+  };
+
+  const sumRounded = rounded.cover + rounded.opposite;
+  const diff = Number((base - sumRounded).toFixed(2));
+  if (Math.abs(diff) > 0) {
+    const targetLeg = oOpposite >= oCover ? 'opposite' : 'cover';
+    rounded[targetLeg] = Number((rounded[targetLeg] + diff).toFixed(2));
+  }
+
+  const payoutCover = Number((rounded.cover * oCover).toFixed(2));
+  const payoutOpposite = Number((rounded.opposite * oOpposite).toFixed(2));
+  const guaranteedPayout = Number(Math.min(payoutCover, payoutOpposite).toFixed(2));
+  const expectedProfit = Number((guaranteedPayout - base).toFixed(2));
+  const roiPercent = Number(((expectedProfit / base) * 100).toFixed(3));
+  const edgePercent = Number(((1 - impliedSum) * 100).toFixed(3));
+
+  return {
+    impliedSum: Number(impliedSum.toFixed(6)),
+    edgePercent,
+    stakes: rounded,
+    payouts: {
+      cover: payoutCover,
+      opposite: payoutOpposite
+    },
+    guaranteedPayout,
+    expectedProfit,
+    roiPercent
+  };
+};
+
+const getDoubleChanceOdd = ({ odds = {}, key = '' } = {}) => {
+  const source = odds || {};
+  if (key === 'homeDraw') {
+    return safePositiveOdd(source.homeDraw ?? source['1X'] ?? source['1x'] ?? source.home_draw);
+  }
+  if (key === 'homeAway') {
+    return safePositiveOdd(source.homeAway ?? source['12'] ?? source.home_away);
+  }
+  if (key === 'drawAway') {
+    return safePositiveOdd(source.drawAway ?? source['X2'] ?? source['x2'] ?? source.draw_away);
+  }
+  return null;
+};
+
+const normalizeDoubleChanceOdds = (doubleChance = {}) => ({
+  homeDraw: getDoubleChanceOdd({ odds: doubleChance, key: 'homeDraw' }),
+  homeAway: getDoubleChanceOdd({ odds: doubleChance, key: 'homeAway' }),
+  drawAway: getDoubleChanceOdd({ odds: doubleChance, key: 'drawAway' })
+});
+
+const mapDoubleChanceByOrientation = ({ doubleChance = {}, orientation = 'normal' } = {}) => {
+  const normalized = normalizeDoubleChanceOdds(doubleChance);
+  if (orientation === 'swapped') {
+    // En swap, 1X <-> X2 porque home/away se invierten; 12 permanece igual.
+    return {
+      homeDraw: normalized.drawAway,
+      homeAway: normalized.homeAway,
+      drawAway: normalized.homeDraw
+    };
+  }
+  return normalized;
+};
+
 const getDefaultBankroll = () => {
   const configBankroll = toNumber(db.data?.config?.bankroll, NaN);
   if (Number.isFinite(configBankroll) && configBankroll > 0) return Number(configBankroll);
@@ -180,7 +288,10 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
   const opportunities = [];
   let skippedUnlinked = 0;
   let skippedOrientation = 0;
-  let skippedMissingOdds = 0;
+  let skippedMissingOdds1x2 = 0;
+  let skippedMissingOddsDcOpposite = 0;
+  let generated1x2 = 0;
+  let generatedDcOpposite = 0;
 
   for (const pin of pinnacleRows) {
     const altenarId = pin?.altenarId;
@@ -208,6 +319,7 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
 
     const pinOdds = pin?.odds || {};
     const altOdds = alt?.odds || {};
+    const pinDoubleChance = normalizeDoubleChanceOdds(pinOdds.doubleChance || {});
 
     const altMapped = orientationInfo.orientation === 'swapped'
       ? {
@@ -221,6 +333,11 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
         away: altOdds.away
       };
 
+    const altDoubleChance = mapDoubleChanceByOrientation({
+      doubleChance: altOdds.doubleChance || {},
+      orientation: orientationInfo.orientation
+    });
+
     const bestOdds = {
       home: chooseBestOdd({ pinnacleOdd: pinOdds.home, altenarOdd: altMapped.home }),
       draw: chooseBestOdd({ pinnacleOdd: pinOdds.draw, altenarOdd: altMapped.draw }),
@@ -228,37 +345,112 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
     };
 
     if (!bestOdds.home || !bestOdds.draw || !bestOdds.away) {
-      skippedMissingOdds += 1;
-      continue;
+      skippedMissingOdds1x2 += 1;
+    } else {
+      const plan = buildThreeLegStakePlan({ bankroll: stakeBankroll, bestOdds });
+      if (plan) {
+        opportunities.push({
+          type: 'SUREBET_1X2_PREMATCH',
+          eventId: alt?.id || null,
+          pinnacleId: pin?.id || null,
+          match: `${pin?.home || ''} vs ${pin?.away || ''}`.trim(),
+          matchDate: pin?.date || alt?.startDate || null,
+          league: pin?.league?.name || alt?.league || null,
+          country: alt?.country || null,
+          orientation: orientationInfo,
+          odds: {
+            pinnacle: {
+              home: safePositiveOdd(pinOdds.home),
+              draw: safePositiveOdd(pinOdds.draw),
+              away: safePositiveOdd(pinOdds.away)
+            },
+            altenar: {
+              home: safePositiveOdd(altMapped.home),
+              draw: safePositiveOdd(altMapped.draw),
+              away: safePositiveOdd(altMapped.away)
+            },
+            best: bestOdds
+          },
+          plan
+        });
+        generated1x2 += 1;
+      }
     }
 
-    const plan = buildStakePlan({ bankroll: stakeBankroll, bestOdds });
-    if (!plan) continue;
+    for (const combo of DC_OPPOSITE_COMBOS) {
+      const dcBest = chooseBestOdd({
+        pinnacleOdd: pinDoubleChance[combo.dcKey],
+        altenarOdd: altDoubleChance[combo.dcKey]
+      });
+      const oppositeBest = chooseBestOdd({
+        pinnacleOdd: pinOdds[combo.oppositeKey],
+        altenarOdd: altMapped[combo.oppositeKey]
+      });
 
-    opportunities.push({
-      type: 'SUREBET_1X2_PREMATCH',
-      eventId: alt?.id || null,
-      pinnacleId: pin?.id || null,
-      match: `${pin?.home || ''} vs ${pin?.away || ''}`.trim(),
-      matchDate: pin?.date || alt?.startDate || null,
-      league: pin?.league?.name || alt?.league || null,
-      country: alt?.country || null,
-      orientation: orientationInfo,
-      odds: {
-        pinnacle: {
-          home: safePositiveOdd(pinOdds.home),
-          draw: safePositiveOdd(pinOdds.draw),
-          away: safePositiveOdd(pinOdds.away)
+      if (!dcBest || !oppositeBest) {
+        skippedMissingOddsDcOpposite += 1;
+        continue;
+      }
+
+      const plan = buildTwoLegStakePlan({
+        bankroll: stakeBankroll,
+        bestOdds: {
+          cover: dcBest,
+          opposite: oppositeBest
+        }
+      });
+      if (!plan) continue;
+
+      opportunities.push({
+        type: 'SUREBET_DC_OPPOSITE_PREMATCH',
+        market: 'double_chance+opposite_1x2',
+        comboCode: combo.code,
+        comboLabel: combo.label,
+        eventId: alt?.id || null,
+        pinnacleId: pin?.id || null,
+        match: `${pin?.home || ''} vs ${pin?.away || ''}`.trim(),
+        matchDate: pin?.date || alt?.startDate || null,
+        league: pin?.league?.name || alt?.league || null,
+        country: alt?.country || null,
+        orientation: orientationInfo,
+        legs: [
+          {
+            market: 'Double Chance',
+            selection: combo.dcSelection,
+            provider: dcBest.provider,
+            odd: dcBest.odd
+          },
+          {
+            market: '1x2',
+            selection: combo.oppositeSelection,
+            provider: oppositeBest.provider,
+            odd: oppositeBest.odd
+          }
+        ],
+        odds: {
+          pinnacle: {
+            doubleChance: pinDoubleChance[combo.dcKey],
+            opposite: safePositiveOdd(pinOdds[combo.oppositeKey])
+          },
+          altenar: {
+            doubleChance: altDoubleChance[combo.dcKey],
+            opposite: safePositiveOdd(altMapped[combo.oppositeKey])
+          },
+          best: {
+            doubleChance: dcBest,
+            opposite: oppositeBest
+          }
         },
-        altenar: {
-          home: safePositiveOdd(altMapped.home),
-          draw: safePositiveOdd(altMapped.draw),
-          away: safePositiveOdd(altMapped.away)
-        },
-        best: bestOdds
-      },
-      plan
-    });
+        plan: {
+          ...plan,
+          labels: {
+            cover: combo.dcSelection,
+            opposite: combo.oppositeSelection
+          }
+        }
+      });
+      generatedDcOpposite += 1;
+    }
   }
 
   const ordered = opportunities
@@ -268,7 +460,8 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
   return {
     success: true,
     mode: 'preview-only',
-    market: '1x2',
+    market: 'mixed',
+    markets: ['1x2', 'double_chance+opposite_1x2'],
     source: 'prematch-cache-db',
     generatedAt: new Date().toISOString(),
     bankroll: stakeBankroll,
@@ -279,7 +472,13 @@ export const getArbitragePreview1x2 = async ({ bankroll = null, limit = DEFAULT_
       scannedAltenarRows: altenarRows.length,
       skippedUnlinked,
       skippedOrientation,
-      skippedMissingOdds
+      skippedMissingOdds: skippedMissingOdds1x2 + skippedMissingOddsDcOpposite,
+      skippedMissingOdds1x2,
+      skippedMissingOddsDcOpposite,
+      generatedByType: {
+        surebet1x2: generated1x2,
+        surebetDcOpposite: generatedDcOpposite
+      }
     }
   };
 };

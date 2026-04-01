@@ -79,6 +79,29 @@ function processMoneyline(markets) {
     };
 }
 
+function calculateDoubleChanceFrom1x2(home, draw, away) {
+    const h = Number(home);
+    const d = Number(draw);
+    const a = Number(away);
+    if (!Number.isFinite(h) || !Number.isFinite(d) || !Number.isFinite(a)) return null;
+    if (h <= 1 || d <= 1 || a <= 1) return null;
+
+    const probH = 1 / h;
+    const probD = 1 / d;
+    const probA = 1 / a;
+
+    const sum1X = probH + probD;
+    const sum12 = probH + probA;
+    const sumX2 = probD + probA;
+    if (sum1X <= 0 || sum12 <= 0 || sumX2 <= 0) return null;
+
+    return {
+        homeDraw: Number((1 / sum1X).toFixed(3)),
+        homeAway: Number((1 / sum12).toFixed(3)),
+        drawAway: Number((1 / sumX2).toFixed(3))
+    };
+}
+
 function processTotals(markets) {
     // Buscar mercados de tipo 'total' para el periodo 0 (partido completo)
     // El endpoint /straight puede devolver múltiples líneas (incluyendo alternativos)
@@ -266,6 +289,11 @@ export const ingestPinnaclePrematch = async (force = false, options = {}) => {
 
                     if (oddsML && oddsML.home && oddsML.away) {
                         const existing = existingById.get(String(match.id)) || {};
+                        const inferredDoubleChance = calculateDoubleChanceFrom1x2(
+                            oddsML.home,
+                            oddsML.draw,
+                            oddsML.away
+                        );
                         refinedMatches.push({
                             id: match.id.toString(),
                             home: match.participants.find(p => p.alignment === 'home')?.name, 
@@ -277,6 +305,7 @@ export const ingestPinnaclePrematch = async (force = false, options = {}) => {
                             bookmaker: "Pinnacle",
                             odds: {
                                 ...oddsML,         // home, draw, away
+                                doubleChance: inferredDoubleChance || existing?.odds?.doubleChance || null,
                                 totals: oddsTotals, // array of {line, over, under}
                                 btts: oddsBTTS      // {yes, no} or null
                             },
