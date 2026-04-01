@@ -272,6 +272,173 @@ const inferDesignationFromOpportunity = (opportunity = {}, fallbackMarketKey = '
   return 'home';
 };
 
+const normalizeDesignation = (value = '') => {
+  const normalized = normalizeText(value);
+  if (normalized === 'local') return 'home';
+  if (normalized === 'visitante') return 'away';
+  if (normalized === 'empate') return 'draw';
+  return normalized;
+};
+
+const inferMarketTypeFromMarketKey = (marketKey = 's;0;m') => {
+  const key = normalizeText(marketKey);
+  if (key === 's;0;t') return 'total';
+  return 'moneyline';
+};
+
+const isArcadiaMarketOpen = (market = {}) => {
+  const status = normalizeText(market?.status || 'open');
+  return !status || status === 'open';
+};
+
+const getArcadiaMarketPriceByDesignation = (market = {}, designation = '') => {
+  const targetDesignation = normalizeDesignation(designation);
+  if (!targetDesignation) return null;
+
+  const prices = Array.isArray(market?.prices) ? market.prices : [];
+  const priceRow = prices.find((row) => normalizeDesignation(row?.designation) === targetDesignation);
+  const price = Number(priceRow?.price);
+  return Number.isFinite(price) ? Number(price) : null;
+};
+
+const summarizeAvailableDesignations = (markets = []) => {
+  const list = Array.isArray(markets) ? markets : [];
+  const out = new Set();
+
+  list.forEach((market) => {
+    const prices = Array.isArray(market?.prices) ? market.prices : [];
+    prices.forEach((priceRow) => {
+      const designation = normalizeDesignation(priceRow?.designation);
+      if (designation) out.add(designation);
+    });
+  });
+
+  return Array.from(out);
+};
+
+const pickPreferredArcadiaMarket = (markets = [], targetMarketKey = 's;0;m') => {
+  const list = Array.isArray(markets) ? markets : [];
+  if (list.length === 0) return null;
+
+  const targetKey = normalizeText(targetMarketKey);
+  const sorted = list.slice().sort((a, b) => {
+    const aExactKey = normalizeText(a?.key) === targetKey ? 0 : 1;
+    const bExactKey = normalizeText(b?.key) === targetKey ? 0 : 1;
+    if (aExactKey !== bExactKey) return aExactKey - bExactKey;
+
+    const aOpen = isArcadiaMarketOpen(a) ? 0 : 1;
+    const bOpen = isArcadiaMarketOpen(b) ? 0 : 1;
+    if (aOpen !== bOpen) return aOpen - bOpen;
+
+    const aPeriod = Number(a?.period) === 0 ? 0 : 1;
+    const bPeriod = Number(b?.period) === 0 ? 0 : 1;
+    if (aPeriod !== bPeriod) return aPeriod - bPeriod;
+
+    const aCutoff = String(a?.cutoffAt || '9999-12-31T23:59:59Z');
+    const bCutoff = String(b?.cutoffAt || '9999-12-31T23:59:59Z');
+    return aCutoff.localeCompare(bCutoff);
+  });
+
+  return sorted[0] || null;
+};
+
+const resolveArcadiaQuoteSelectionFromRelatedMarkets = async (opportunity = {}, baseSelection = {}) => {
+  const matchupId = getMatchupIdFromOpportunity(opportunity);
+  if (!matchupId) {
+    return {
+      ok: false,
+      reason: 'missing-matchup-id',
+      availableDesignations: []
+    };
+  }
+
+  const desiredMarketKey = normalizeText(baseSelection?.marketKey || inferMarketKeyFromOpportunity(opportunity));
+  const desiredDesignation = normalizeDesignation(baseSelection?.designation || inferDesignationFromOpportunity(opportunity, desiredMarketKey));
+  const desiredType = inferMarketTypeFromMarketKey(desiredMarketKey);
+
+  const response = await arcadiaRequest('GET', `/matchups/${matchupId}/markets/related/straight`);
+  const markets = Array.isArray(response?.data) ? response.data : [];
+  const availableDesignations = summarizeAvailableDesignations(markets);
+
+  const withDesignation = markets.filter((market) => {
+    const price = getArcadiaMarketPriceByDesignation(market, desiredDesignation);
+    return Number.isFinite(price);
+  });
+
+  const exactKey = withDesignation.filter((market) => normalizeText(market?.key) === desiredMarketKey);
+  const byType = withDesignation.filter((market) => normalizeText(market?.type) === desiredType);
+
+  const pool = exactKey.length > 0
+    ? exactKey
+    : (byType.length > 0 ? byType : withDesignation);
+
+  const market = pickPreferredArcadiaMarket(pool, desiredMarketKey);
+  if (!market) {
+    return {
+      ok: false,
+      reason: 'selection-unavailable',
+      desiredMarketKey,
+      desiredDesignation,
+      desiredType,
+      availableDesignations,
+      marketsCount: markets.length
+    };
+  }
+
+  const refreshedPriceAmerican = getArcadiaMarketPriceByDesignation(market, desiredDesignation);
+  if (!Number.isFinite(refreshedPriceAmerican)) {
+    return {
+      ok: false,
+      reason: 'selection-price-missing',
+      desiredMarketKey,
+      desiredDesignation,
+      desiredType,
+      availableDesignations,
+      marketsCount: markets.length
+    };
+  }
+
+  return {
+    ok: true,
+    selection: {
+      matchupId,
+      marketKey: String(market?.key || desiredMarketKey || 's;0;m').trim().toLowerCase(),
+      designation: desiredDesignation,
+      price: Number(refreshedPriceAmerican)
+    },
+    diagnostic: {
+      desiredMarketKey,
+      desiredDesignation,
+      desiredType,
+      selectedMarketId: market?.id ?? null,
+      selectedMarketKey: market?.key ?? null,
+      selectedMarketType: market?.type ?? null,
+      selectedMarketPeriod: market?.period ?? null,
+      selectedMarketStatus: market?.status ?? null,
+      selectedMarketCutoffAt: market?.cutoffAt ?? null,
+      availableDesignations,
+      marketsCount: markets.length
+    }
+  };
+};
+
+const isArcadiaInsufficientFundsError = (error = {}) => {
+  const body = error?.diagnostic?.providerBody || {};
+  const title = normalizeText(body?.title || '');
+  const detail = normalizeText(body?.detail || '');
+  return title.includes('insufficient_funds') || detail.includes('insufficient funds');
+};
+
+const getArcadiaBalanceAmountSafe = async () => {
+  try {
+    const response = await arcadiaRequest('GET', '/wallet/balance');
+    const amount = Number(response?.data?.amount);
+    return Number.isFinite(amount) ? Number(amount) : null;
+  } catch {
+    return null;
+  }
+};
+
 const getMatchupIdFromOpportunity = (opportunity = {}) => {
   const id = Number(
     opportunity.pinnacleId
@@ -428,7 +595,7 @@ const buildDraftPreviewPayload = (opportunity = {}) => {
   };
 };
 
-const buildQuoteRequestPayload = (opportunity = {}) => {
+const buildQuoteRequestPayload = (opportunity = {}, { omitPrice = false, selectionOverride = null } = {}) => {
   const preview = buildDraftPreviewPayload(opportunity);
 
   if (!preview.matchupId) {
@@ -444,7 +611,20 @@ const buildQuoteRequestPayload = (opportunity = {}) => {
     designation: preview.designation
   };
 
-  if (Number.isFinite(Number(preview.referencePriceAmerican))) {
+  if (selectionOverride && typeof selectionOverride === 'object') {
+    const overrideMatchupId = Number(selectionOverride?.matchupId);
+    const overrideMarketKey = String(selectionOverride?.marketKey || '').trim().toLowerCase();
+    const overrideDesignation = normalizeDesignation(selectionOverride?.designation || '');
+
+    if (Number.isFinite(overrideMatchupId) && overrideMatchupId > 0) selection.matchupId = overrideMatchupId;
+    if (overrideMarketKey) selection.marketKey = overrideMarketKey;
+    if (overrideDesignation) selection.designation = overrideDesignation;
+  }
+
+  const overridePrice = Number(selectionOverride?.price);
+  if (!omitPrice && Number.isFinite(overridePrice)) {
+    selection.price = Number(overridePrice);
+  } else if (!omitPrice && Number.isFinite(Number(preview.referencePriceAmerican))) {
     selection.price = Number(preview.referencePriceAmerican);
   }
 
@@ -506,13 +686,186 @@ const prepareRealPlacementDraftInternal = async (ticketId) => {
   }
 
   const quotePayload = buildQuoteRequestPayload(ticket.opportunity);
-  const quoteRes = await arcadiaRequest('POST', '/bets/straight/quote', { data: quotePayload });
+  let quoteRes = null;
+  let quotePayloadUsed = quotePayload;
+  let quoteRetriedWithoutPrice = false;
+  let quoteRetriedWithMarketRefresh = false;
+  let quoteResolution = null;
+  try {
+    quoteRes = await arcadiaRequest('POST', '/bets/straight/quote', { data: quotePayload });
+  } catch (error) {
+    const status = Number(error?.statusCode || 0);
+    const firstBody = error?.diagnostic?.providerBody || null;
+    if (isArcadiaInsufficientFundsError(error)) {
+      const requestedStake = getStakeFromOpportunity(ticket.opportunity);
+      const availableBalance = await getArcadiaBalanceAmountSafe();
+      throw createPinnacleError(
+        'Arcadia reporta saldo insuficiente para cotizar/apostar este ticket.',
+        {
+          code: 'PINNACLE_INSUFFICIENT_BALANCE',
+          statusCode: 409,
+          diagnostic: {
+            ticketId,
+            requestedStake,
+            availableBalance,
+            quotePayload,
+            firstError: error?.diagnostic || null,
+            observedAt: nowIso()
+          }
+        }
+      );
+    }
+
+    // Fallback robusto: refrescar marketKey/designation/price desde related/straight
+    // y reintentar quote una sola vez con precio vigente.
+    if (status === 400 || status === 410) {
+      let refreshedSelection = null;
+      try {
+        refreshedSelection = await resolveArcadiaQuoteSelectionFromRelatedMarkets(
+          ticket.opportunity,
+          quotePayload?.selections?.[0] || {}
+        );
+      } catch (resolutionError) {
+        refreshedSelection = {
+          ok: false,
+          reason: 'related-fetch-failed',
+          error: {
+            message: resolutionError?.message || 'No se pudo consultar related/straight.',
+            code: resolutionError?.code || null,
+            statusCode: Number(resolutionError?.statusCode || 0) || null,
+            diagnostic: resolutionError?.diagnostic || null
+          }
+        };
+      }
+
+      if (!refreshedSelection?.ok) {
+        if (refreshedSelection?.reason === 'selection-unavailable') {
+          throw createPinnacleError(
+            'Arcadia no tiene disponible la seleccion solicitada en mercados abiertos para este matchup.',
+            {
+              code: 'PINNACLE_SELECTION_UNAVAILABLE',
+              statusCode: 409,
+              diagnostic: {
+                ticketId,
+                providerStatus: status,
+                quotePayload,
+                firstError: error?.diagnostic || null,
+                resolution: refreshedSelection,
+                observedAt: nowIso()
+              }
+            }
+          );
+        }
+
+        throw createPinnacleError(
+          'Arcadia quote no pudo refrescarse desde related/straight. Refresca y reintenta.',
+          {
+            code: status === 410 ? 'PINNACLE_QUOTE_GONE' : 'PINNACLE_QUOTE_BAD_REQUEST',
+            statusCode: 409,
+            diagnostic: {
+              ticketId,
+              providerStatus: status,
+              quotePayload,
+              firstError: error?.diagnostic || null,
+              resolution: refreshedSelection,
+              observedAt: nowIso()
+            }
+          }
+        );
+      }
+
+      const quotePayloadRefreshed = buildQuoteRequestPayload(ticket.opportunity, {
+        selectionOverride: refreshedSelection.selection
+      });
+      quotePayloadUsed = quotePayloadRefreshed;
+      quoteRetriedWithMarketRefresh = true;
+      quoteResolution = refreshedSelection?.diagnostic || null;
+      try {
+        quoteRes = await arcadiaRequest('POST', '/bets/straight/quote', { data: quotePayloadRefreshed });
+      } catch (retryError) {
+        const retryStatus = Number(retryError?.statusCode || 0);
+        const retryBody = retryError?.diagnostic?.providerBody || null;
+        if (isArcadiaInsufficientFundsError(retryError)) {
+          const requestedStake = getStakeFromOpportunity(ticket.opportunity);
+          const availableBalance = await getArcadiaBalanceAmountSafe();
+          throw createPinnacleError(
+            'Arcadia reporta saldo insuficiente para cotizar/apostar este ticket.',
+            {
+              code: 'PINNACLE_INSUFFICIENT_BALANCE',
+              statusCode: 409,
+              diagnostic: {
+                ticketId,
+                requestedStake,
+                availableBalance,
+                quotePayload,
+                quotePayloadRefreshed,
+                firstError: error?.diagnostic || null,
+                secondError: retryError?.diagnostic || null,
+                resolution: quoteResolution,
+                observedAt: nowIso()
+              }
+            }
+          );
+        }
+        if (retryStatus === 410) {
+          throw createPinnacleError(
+            'Arcadia quote no disponible (HTTP 410): la seleccion/mercado ya no esta cotizable en este momento. Refresca y reintenta.',
+            {
+              code: 'PINNACLE_QUOTE_GONE',
+              statusCode: 409,
+              diagnostic: {
+                ticketId,
+                providerStatus: 410,
+                retriedWithoutPrice: false,
+                retriedWithMarketRefresh: true,
+                quotePayload,
+                quotePayloadRefreshed,
+                firstError: error?.diagnostic || null,
+                secondError: retryError?.diagnostic || null,
+                resolution: quoteResolution,
+                observedAt: nowIso()
+              }
+            }
+          );
+        }
+        if (retryStatus === 400) {
+          throw createPinnacleError(
+            'Arcadia quote invalido (HTTP 400): request no aceptado para la seleccion actual. Refresca y reintenta.',
+            {
+              code: 'PINNACLE_QUOTE_BAD_REQUEST',
+              statusCode: 409,
+              diagnostic: {
+                ticketId,
+                providerStatus: 400,
+                retriedWithoutPrice: false,
+                retriedWithMarketRefresh: true,
+                quotePayload,
+                quotePayloadRefreshed,
+                firstError: error?.diagnostic || null,
+                secondError: retryError?.diagnostic || null,
+                firstBody,
+                secondBody: retryBody,
+                resolution: quoteResolution,
+                observedAt: nowIso()
+              }
+            }
+          );
+        }
+        throw retryError;
+      }
+    } else {
+      throw error;
+    }
+  }
   const payload = buildRealPlacementPayloadFromQuote({ quoteResponse: quoteRes.data, opportunity: ticket.opportunity });
 
   return {
     endpoint: '/bets/straight',
     quoteEndpoint: '/bets/straight/quote',
-    quotePayload,
+    quotePayload: quotePayloadUsed,
+    quoteRetriedWithoutPrice,
+    quoteRetriedWithMarketRefresh,
+    quoteResolution,
     quoteResponse: quoteRes.data,
     payload,
     opportunity: ticket.opportunity,
