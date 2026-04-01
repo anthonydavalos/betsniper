@@ -3,6 +3,7 @@ import altenarClient from '../config/axiosClient.js';
 import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../config/altenarPublicConfig.js';
 import { refreshOpportunity } from './oddsService.js';
 import { placeAutoBet } from './paperTradingService.js';
+import { fetchBookyBalance } from './bookyAccountService.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -562,6 +563,51 @@ const enforceValueGuardsOrThrow = ({ ticket, draft }) => {
           minEvPercent,
           computedEvPercent: Number(evPercent.toFixed(2)),
           requestId: draft?.payload?.requestId || null,
+          observedAt: nowIso()
+        }
+      }
+    );
+  }
+};
+
+const ensureBalanceGuardsOrThrow = async ({ ticket }) => {
+  const stake = safeNumber(ticket?.opportunity?.kellyStake, 0);
+  if (!Number.isFinite(stake) || stake <= 0) return;
+
+  const balance = await fetchBookyBalance({ forceRefresh: true, profileKey: null });
+  const balanceAmount = Number(balance?.amount);
+  const currency = String(balance?.currency || 'PEN').toUpperCase();
+
+  if (Number.isFinite(balanceAmount) && balanceAmount <= 0) {
+    throw createBookyError(
+      `Saldo insuficiente en Booky (${currency} ${balanceAmount.toFixed(2)}).`,
+      {
+        statusCode: 409,
+        code: 'BOOKY_INSUFFICIENT_BALANCE',
+        diagnostic: {
+          reason: 'INSUFFICIENT_BALANCE',
+          balanceAmount,
+          requiredStake: Number(stake.toFixed(2)),
+          currency,
+          balanceStale: Boolean(balance?.stale),
+          observedAt: nowIso()
+        }
+      }
+    );
+  }
+
+  if (Number.isFinite(balanceAmount) && balanceAmount < stake) {
+    throw createBookyError(
+      `Saldo insuficiente en Booky para stake requerido (${currency} ${balanceAmount.toFixed(2)} < ${currency} ${stake.toFixed(2)}).`,
+      {
+        statusCode: 409,
+        code: 'BOOKY_INSUFFICIENT_BALANCE',
+        diagnostic: {
+          reason: 'BALANCE_BELOW_STAKE',
+          balanceAmount,
+          requiredStake: Number(stake.toFixed(2)),
+          currency,
+          balanceStale: Boolean(balance?.stale),
           observedAt: nowIso()
         }
       }
@@ -1367,6 +1413,8 @@ export const confirmRealPlacement = async (ticketId) => {
   const { idx, ticket } = lookup;
   if (ticket.status !== 'DRAFT') throw new Error(`Ticket en estado no válido: ${ticket.status}`);
 
+  await ensureBalanceGuardsOrThrow({ ticket });
+
   const draft = await prepareRealPlacementDraftInternal(ticketId);
   const auth = getActiveAuthHeader();
   if (!auth) throw new Error('Falta ALTENAR_BOOKY_AUTH_TOKEN en .env para placeWidget real.');
@@ -1533,6 +1581,8 @@ export const confirmRealPlacementFast = async (ticketId) => {
 
   const { idx, ticket } = lookup;
   if (ticket.status !== 'DRAFT') throw new Error(`Ticket en estado no válido: ${ticket.status}`);
+
+  await ensureBalanceGuardsOrThrow({ ticket });
 
   const draft = await prepareRealPlacementDraftInternal(ticketId, { skipTicketDrift: true });
   const auth = getActiveAuthHeader();
