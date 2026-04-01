@@ -57,6 +57,27 @@ This project demonstrates real-world techniques used in:
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-04-01 (v3.4.24)
+
+- **Fase 1 (Semi-Auto por pata en ARBITRAGE):**
+  - `client/src/App.jsx` ahora permite ejecutar pata individual desde cada tarjeta de arbitraje cuando el provider de la pata es Altenar.
+  - Si la pata es Arcadia/Pinnacle se muestra como **referencia**, sin envío automático en Fase 1.
+  - Se agregó conversión de legs de arbitraje (`1x2` y `DC+opuesto`) a oportunidad ejecutable para flujo semi-auto.
+- **Dry-run obligatorio antes de envío real (Booky):**
+  - Antes de `confirm` real se ejecuta `POST /api/booky/real/dryrun/:id` de forma obligatoria.
+  - Si el dry-run falla, el ticket se cancela y no se envía `placeWidget`.
+  - El resumen del dry-run (stake/odd/requestId) se integra en el bloque de confirmación visible en UI.
+- **Fase 2 (Ejecución Dual Secuencial Arcadia -> Altenar):**
+  - Nuevo botón `Ejecutar Dual` por oportunidad en la pestaña ARBITRAGE.
+  - Secuencia operativa: Arcadia (`prepare -> dryrun -> confirm-fast`) y luego Altenar (`prepare -> dryrun -> confirm-fast`).
+  - Selección automática de patas por provider (Arcadia y Altenar) priorizando la de mayor stake por lado.
+  - Outcomes explícitos en UI:
+    - `CONFIRMED` (ambas patas confirmadas),
+    - `REJECTED` (falla Arcadia antes de ejecutar Altenar),
+    - `HEDGE_REQUIRED` (Arcadia confirmada y Altenar rechazada o incierta).
+- **Control de ejecución concurrente:**
+  - Lock por tarjeta de arbitraje para evitar doble disparo simultáneo durante la secuencia dual.
+
 ### Actualización 2026-04-01 (v3.4.23)
 
 - Se dejó operativo el pipeline de `Double Chance + opuesto 1x2` para Sprint A.1 de arbitraje.
