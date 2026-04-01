@@ -536,20 +536,30 @@ export const scanPrematchOpportunities = async () => {
 
                 // A.1) Analizar Double Chance
                 // ==========================================
-                if (pinMatch.odds?.doubleChance && altenarOdds?.doubleChance) {
+                const dcFairProbs = realProbs1x2
+                    ? {
+                        homeDraw: realProbs1x2.home + realProbs1x2.draw,
+                        homeAway: realProbs1x2.home + realProbs1x2.away,
+                        drawAway: realProbs1x2.draw + realProbs1x2.away
+                    }
+                    : null;
+
+                // Para DC usamos probabilidad fair (sin vig) derivada del 1x2 de Pinnacle.
+                // Evita inflar EV por usar 1/cuota DC cruda.
+                if (dcFairProbs && pinMatch.odds?.doubleChance && altenarOdds?.doubleChance) {
                     const dcPin = pinMatch.odds.doubleChance;
                     const dcAlt = altenarOdds.doubleChance;
 
                     if (dcAlt.homeDraw && dcPin.homeDraw) {
-                        const realProb = 1 / dcPin.homeDraw;
+                        const realProb = dcFairProbs.homeDraw;
                         evaluateOpportunity(valueBets, pinMatch, altenarEvent, '1X', dcAlt.homeDraw, realProb, currentBankroll, 'Double Chance', dcPin.homeDraw);
                     }
                     if (dcAlt.homeAway && dcPin.homeAway) {
-                        const realProb = 1 / dcPin.homeAway;
+                        const realProb = dcFairProbs.homeAway;
                         evaluateOpportunity(valueBets, pinMatch, altenarEvent, '12', dcAlt.homeAway, realProb, currentBankroll, 'Double Chance', dcPin.homeAway);
                     }
                     if (dcAlt.drawAway && dcPin.drawAway) {
-                        const realProb = 1 / dcPin.drawAway;
+                        const realProb = dcFairProbs.drawAway;
                         evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'X2', dcAlt.drawAway, realProb, currentBankroll, 'Double Chance', dcPin.drawAway);
                     }
                 }
