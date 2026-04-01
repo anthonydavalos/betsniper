@@ -56,6 +56,21 @@ const isExcludedMarketVariant = ({ home = '', away = '', league = '', units = ''
     return EXCLUDED_MATCH_TERMS.some(term => blob.includes(term));
 };
 
+const getCanonicalTeams = (participants = []) => {
+    const home = Array.isArray(participants)
+        ? participants.find(p => p?.alignment === 'home')
+        : null;
+    const away = Array.isArray(participants)
+        ? participants.find(p => p?.alignment === 'away')
+        : null;
+
+    return {
+        hasCanonicalTeams: Boolean(home && away),
+        homeName: home?.name || '',
+        awayName: away?.name || ''
+    };
+};
+
 const parsePositiveNumber = (rawValue, fallbackValue) => {
     const parsed = Number(rawValue);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
@@ -105,6 +120,8 @@ class PinnacleLight {
         this.liveHttpMaxStaleMs = parsePositiveNumber(process.env.PINNACLE_LIVE_HTTP_MAX_STALE_MS, DEFAULT_LIVE_HTTP_MAX_STALE_MS);
         this.liveWsFreshWindowMs = parsePositiveNumber(process.env.PINNACLE_LIVE_WS_FRESH_WINDOW_MS, DEFAULT_LIVE_WS_FRESH_WINDOW_MS);
         this.liveHttpSkipCount = 0;
+        this.lastPrematchOddsLogAt = 0;
+        this.lastPrematchOddsStoreCount = 0;
     }
 
     isProcessAlive(pid) {
@@ -361,10 +378,11 @@ class PinnacleLight {
                 const activeIds = new Set();
 
                 data.forEach(fix => {
-                     const home = fix.participants?.find(p => p.alignment === 'home')?.name || '';
-                     const away = fix.participants?.find(p => p.alignment === 'away')?.name || '';
+                     const { hasCanonicalTeams, homeName, awayName } = getCanonicalTeams(fix.participants);
+                     if (!hasCanonicalTeams) return;
+
                      const leagueName = fix.league?.name || '';
-                     if (isExcludedMarketVariant({ home, away, league: leagueName, units: fix.units })) {
+                     if (isExcludedMarketVariant({ home: homeName, away: awayName, league: leagueName, units: fix.units })) {
                          return;
                      }
 
@@ -486,20 +504,24 @@ class PinnacleLight {
 
             const { nowUtcMs, startUtcMs, endUtcMs, primaryHours, prefetchHours, overlapMinutes } = getPrematchWindowUtc();
             const activeIds = new Set();
+            let skippedNonCanonical = 0;
 
             data.forEach(fix => {
                 const startTs = fix.startTime ? new Date(fix.startTime).getTime() : 0;
                 const looksLive = fix.liveMode || fix.state?.minutes !== undefined;
-                const home = fix.participants?.find(p => p.alignment === 'home')?.name || '';
-                const away = fix.participants?.find(p => p.alignment === 'away')?.name || '';
+                const { hasCanonicalTeams, homeName, awayName } = getCanonicalTeams(fix.participants);
                 const leagueName = fix.league?.name || '';
 
                 // PREMATCH ONLY: excluir live y partidos vencidos
                 if (looksLive) return;
+                if (!hasCanonicalTeams) {
+                    skippedNonCanonical += 1;
+                    return;
+                }
                 if (!startTs || startTs < startUtcMs) return;
                 if (startTs < nowUtcMs) return;
                 if (startTs > endUtcMs) return;
-                if (isExcludedMarketVariant({ home, away, league: leagueName, units: fix.units })) return;
+                if (isExcludedMarketVariant({ home: homeName, away: awayName, league: leagueName, units: fix.units })) return;
 
                 activeIds.add(String(fix.id));
                 this.prematchFixturesStore[fix.id] = {
@@ -526,7 +548,7 @@ class PinnacleLight {
 
             const count = activeIds.size;
             if (deletedCount > 0 || !this.lastPreFixCount || Math.abs(this.lastPreFixCount - count) > 20) {
-                console.log(`🗓️ Prematch Fixtures: ${count} activos. (🗑️ Limpiados: ${deletedCount}) [window ${primaryHours}h+${prefetchHours}h, overlap ${overlapMinutes}m]`);
+                console.log(`🗓️ Prematch Fixtures: ${count} activos. (🗑️ Limpiados: ${deletedCount}, 🚫 no canónicos: ${skippedNonCanonical}) [window ${primaryHours}h+${prefetchHours}h, overlap ${overlapMinutes}m]`);
                 this.lastPreFixCount = count;
             }
         } catch (e) {
@@ -556,6 +578,19 @@ class PinnacleLight {
             Object.keys(freshSnapshot).forEach(matchId => {
                 this.prematchOddsStore[matchId] = freshSnapshot[matchId];
             });
+
+            const now = Date.now();
+            const payloadMatchups = Object.keys(freshSnapshot).length;
+            const storeMatchups = Object.keys(this.prematchOddsStore).length;
+            const shouldLog =
+                (now - this.lastPrematchOddsLogAt) >= 60000 ||
+                Math.abs(storeMatchups - this.lastPrematchOddsStoreCount) >= 15;
+
+            if (shouldLog) {
+                console.log(`💹 Prematch Odds sync: payload=${payloadMatchups} ids, fixtureValidIds=${validIds.size}, store=${storeMatchups} ids.`);
+                this.lastPrematchOddsLogAt = now;
+                this.lastPrematchOddsStoreCount = storeMatchups;
+            }
         } catch (e) {
             if (this.ws && this.ws.readyState === 1) {
                 console.warn(`⚠️ Prematch Odds Polling falló (${e.response?.status || e.message}), WS Live activo.`);

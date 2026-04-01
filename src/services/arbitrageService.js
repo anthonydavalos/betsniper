@@ -2,6 +2,10 @@ import db, { initDB } from '../db/database.js';
 
 const DEFAULT_PREVIEW_LIMIT = 50;
 const MAX_PREVIEW_LIMIT = 500;
+const ARBITRAGE_PREMATCH_START_GRACE_MINUTES = Math.max(
+  0,
+  Math.floor(Number(process.env.ARBITRAGE_PREMATCH_START_GRACE_MINUTES || 0))
+);
 const DC_OPPOSITE_COMBOS = [
   {
     code: '1X_PLUS_AWAY',
@@ -307,6 +311,26 @@ export const getArbitragePreview1x2 = async ({
   const altenarRows = Array.isArray(db.data?.altenarUpcoming) ? db.data.altenarUpcoming : [];
   const altenarById = new Map(altenarRows.map((row) => [String(row?.id), row]));
 
+  const nowMs = Date.now();
+  const startCutoffMs = nowMs - (ARBITRAGE_PREMATCH_START_GRACE_MINUTES * 60 * 1000);
+  let skippedByStartedAt = 0;
+  let skippedByInvalidDate = 0;
+
+  const eligiblePinnacleRows = pinnacleRows.filter((pin) => {
+    const matchDateMs = new Date(pin?.date || 0).getTime();
+    if (!Number.isFinite(matchDateMs)) {
+      skippedByInvalidDate += 1;
+      return false;
+    }
+
+    if (matchDateMs <= startCutoffMs) {
+      skippedByStartedAt += 1;
+      return false;
+    }
+
+    return true;
+  });
+
   const opportunities = [];
   let skippedUnlinked = 0;
   let skippedOrientation = 0;
@@ -315,7 +339,7 @@ export const getArbitragePreview1x2 = async ({
   let generated1x2 = 0;
   let generatedDcOpposite = 0;
 
-  for (const pin of pinnacleRows) {
+  for (const pin of eligiblePinnacleRows) {
     const altenarId = pin?.altenarId;
     if (altenarId === null || altenarId === undefined || String(altenarId).trim() === '') {
       skippedUnlinked += 1;
@@ -505,7 +529,12 @@ export const getArbitragePreview1x2 = async ({
     data: ordered,
     diagnostics: {
       scannedPinnacleRows: pinnacleRows.length,
+      eligiblePinnacleRows: eligiblePinnacleRows.length,
       scannedAltenarRows: altenarRows.length,
+      skippedByStartedAt,
+      skippedByInvalidDate,
+      startCutoffIso: new Date(startCutoffMs).toISOString(),
+      startGraceMinutes: ARBITRAGE_PREMATCH_START_GRACE_MINUTES,
       skippedUnlinked,
       skippedOrientation,
       skippedMissingOdds: skippedMissingOdds1x2 + skippedMissingOddsDcOpposite,

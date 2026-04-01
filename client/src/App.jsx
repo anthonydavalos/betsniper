@@ -85,7 +85,7 @@ const ARBITRAGE_RISK_PROFILE_PRESETS = {
     conservative: {
         label: 'Conservador',
         config: {
-            stakeMode: 'fixed',
+            stakeMode: 'percent_nav',
             stakePercentNav: 12,
             stakeFixedAmount: 12,
             maxStakePercentNav: 20,
@@ -97,7 +97,7 @@ const ARBITRAGE_RISK_PROFILE_PRESETS = {
     moderate: {
         label: 'Moderado',
         config: {
-            stakeMode: 'fixed',
+            stakeMode: 'percent_nav',
             stakePercentNav: 20,
             stakeFixedAmount: 20,
             maxStakePercentNav: 30,
@@ -109,7 +109,7 @@ const ARBITRAGE_RISK_PROFILE_PRESETS = {
     aggressive: {
         label: 'Agresivo',
         config: {
-            stakeMode: 'fixed',
+            stakeMode: 'percent_nav',
             stakePercentNav: 28,
             stakeFixedAmount: 28,
             maxStakePercentNav: 40,
@@ -1556,8 +1556,38 @@ function App() {
         const sourceConfig = (configOverride && typeof configOverride === 'object')
             ? configOverride
             : arbitrageRiskConfig;
-        const navRaw = Number(portfolio?.balance);
-        const nav = Number.isFinite(navRaw) && navRaw > 0 ? navRaw : 0;
+
+        const portfolioNavRaw = Number(portfolio?.balance);
+        const portfolioNav = Number.isFinite(portfolioNavRaw) && portfolioNavRaw > 0 ? portfolioNavRaw : 0;
+
+        const bookyBalanceRaw = Number(bookyAccount?.balance?.amount);
+        const bookyBalance = Number.isFinite(bookyBalanceRaw) && bookyBalanceRaw >= 0 ? bookyBalanceRaw : NaN;
+        const bookyCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
+
+        const pinnacleBalanceRaw = Number(pinnacleAccount?.balance?.amount);
+        const pinnacleBalance = Number.isFinite(pinnacleBalanceRaw) && pinnacleBalanceRaw >= 0 ? pinnacleBalanceRaw : NaN;
+        const pinnacleCurrency = String(pinnacleAccount?.balance?.currency || 'USD').toUpperCase();
+
+        let nav = portfolioNav;
+        let navSource = 'portfolio.balance';
+        let navCurrency = String(portfolio?.currency || bookyCurrency || 'PEN').toUpperCase();
+
+        const hasBooky = Number.isFinite(bookyBalance);
+        const hasPinnacle = Number.isFinite(pinnacleBalance);
+        if (hasBooky && hasPinnacle && bookyCurrency === pinnacleCurrency) {
+            nav = Number((bookyBalance + pinnacleBalance).toFixed(2));
+            navSource = 'booky+pinnacle.balance';
+            navCurrency = bookyCurrency;
+        } else if (hasBooky) {
+            nav = Number(bookyBalance.toFixed(2));
+            navSource = 'booky.balance';
+            navCurrency = bookyCurrency;
+        } else if (hasPinnacle) {
+            nav = Number(pinnacleBalance.toFixed(2));
+            navSource = 'pinnacle.balance';
+            navCurrency = pinnacleCurrency;
+        }
+
         const stakeMode = String(sourceConfig?.stakeMode || 'percent_nav') === 'fixed'
             ? 'fixed'
             : 'percent_nav';
@@ -1581,6 +1611,8 @@ function App() {
 
         return {
             nav,
+            navSource,
+            navCurrency,
             stakeMode,
             stakePercentNav,
             stakeFixedAmount,
@@ -1590,7 +1622,51 @@ function App() {
             minProfitAbs,
             requestedStake: Number(requestedStake.toFixed(2)),
             capByNavPct: Number(capByNavPct.toFixed(2)),
-            stakeBankroll
+            stakeBankroll,
+            balances: {
+                booky: Number.isFinite(bookyBalance) ? Number(bookyBalance.toFixed(2)) : null,
+                pinnacle: Number.isFinite(pinnacleBalance) ? Number(pinnacleBalance.toFixed(2)) : null,
+                bookyCurrency,
+                pinnacleCurrency
+            }
+        };
+    };
+
+    const resolveArbitrageLiquidityGuard = ({ providerSplit = {} } = {}) => {
+        const altenarRequired = Number(providerSplit?.altenar || 0);
+        const arcadiaRequired = Number(providerSplit?.arcadia || 0);
+
+        const bookyAvailableRaw = Number(bookyAccount?.balance?.amount);
+        const pinnacleAvailableRaw = Number(pinnacleAccount?.balance?.amount);
+        const bookyCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
+        const pinnacleCurrency = String(pinnacleAccount?.balance?.currency || 'USD').toUpperCase();
+
+        const hasBookyAvailable = Number.isFinite(bookyAvailableRaw) && bookyAvailableRaw >= 0;
+        const hasPinnacleAvailable = Number.isFinite(pinnacleAvailableRaw) && pinnacleAvailableRaw >= 0;
+
+        // Comparamos solo cuando tenemos saldo y la moneda esperada del stake (PEN).
+        const canCompareBooky = hasBookyAvailable && bookyCurrency === 'PEN';
+        const canComparePinnacle = hasPinnacleAvailable && pinnacleCurrency === 'PEN';
+
+        const altenarShortfall = canCompareBooky
+            ? Math.max(0, Number((altenarRequired - bookyAvailableRaw).toFixed(2)))
+            : 0;
+        const arcadiaShortfall = canComparePinnacle
+            ? Math.max(0, Number((arcadiaRequired - pinnacleAvailableRaw).toFixed(2)))
+            : 0;
+
+        return {
+            altenarRequired,
+            arcadiaRequired,
+            bookyAvailable: hasBookyAvailable ? Number(bookyAvailableRaw.toFixed(2)) : null,
+            pinnacleAvailable: hasPinnacleAvailable ? Number(pinnacleAvailableRaw.toFixed(2)) : null,
+            bookyCurrency,
+            pinnacleCurrency,
+            canCompareBooky,
+            canComparePinnacle,
+            altenarShortfall,
+            arcadiaShortfall,
+            canFund: altenarShortfall <= 0 && arcadiaShortfall <= 0
         };
     };
 
@@ -1813,6 +1889,17 @@ function App() {
                 reason: 'missing-pinnacle-id',
                 arcadia,
                 altenar
+            };
+        }
+
+        const matchDateMs = new Date(op?.matchDate || arcadia?.opportunity?.date || altenar?.opportunity?.date || 0).getTime();
+        if (Number.isFinite(matchDateMs) && Date.now() >= matchDateMs) {
+            return {
+                canExecute: false,
+                reason: 'match-started',
+                arcadia,
+                altenar,
+                matchDate: new Date(matchDateMs).toISOString()
             };
         }
 
@@ -4249,7 +4336,7 @@ function App() {
                                 </label>
                             </div>
                             <div className="text-[10px] text-slate-500">
-                                {`Stake solicitado: S/. ${Number(arbitrageStakeContext.requestedStake || 0).toFixed(2)} | Cap %NAV: S/. ${Number(arbitrageStakeContext.capByNavPct || 0).toFixed(2)} | Cap abs: S/. ${Number(arbitrageStakeContext.maxStakeAbs || 0).toFixed(2)} | Stake final ticket: S/. ${Number(arbitrageStakeContext.stakeBankroll || 0).toFixed(2)}`}
+                                {`NAV base (${String(arbitrageStakeContext.navSource || 'n/a')}): ${String(arbitrageStakeContext.navCurrency || 'PEN')} ${Number(arbitrageStakeContext.nav || 0).toFixed(2)} | Stake solicitado: S/. ${Number(arbitrageStakeContext.requestedStake || 0).toFixed(2)} | Cap %NAV: S/. ${Number(arbitrageStakeContext.capByNavPct || 0).toFixed(2)} | Cap abs: S/. ${Number(arbitrageStakeContext.maxStakeAbs || 0).toFixed(2)} | Stake final ticket: S/. ${Number(arbitrageStakeContext.stakeBankroll || 0).toFixed(2)}`}
                             </div>
                         </div>
 
@@ -4311,9 +4398,23 @@ function App() {
                                     const splitTotal = Number(providerSplit.total || 0);
                                     const pctAlt = splitTotal > 0 ? ((providerSplit.altenar / splitTotal) * 100) : 0;
                                     const pctArc = splitTotal > 0 ? ((providerSplit.arcadia / splitTotal) * 100) : 0;
+                                    const liquidityGuard = resolveArbitrageLiquidityGuard({ providerSplit });
                                     const executionKey = getArbitrageExecutionKey(op, idx);
                                     const dualPlan = buildDualExecutionPlan(op, legs);
                                     const dualRunning = arbitrageExecutingKeys.has(executionKey);
+                                    const dualBlockedByLiquidity = Boolean(dualPlan?.canExecute) && !liquidityGuard.canFund;
+                                    const dualReasonText = (() => {
+                                        if (dualBlockedByLiquidity) {
+                                            return 'Bloqueado por liquidez: el split recomendado excede saldo disponible por provider.';
+                                        }
+                                        if (dualPlan?.canExecute) {
+                                            return 'Secuencia: Arcadia -> Altenar (dry-run obligatorio en ambas patas)';
+                                        }
+                                        if (dualPlan?.reason === 'match-started') {
+                                            return 'No ejecutable en dual: el partido ya inició (prematch expirado).';
+                                        }
+                                        return 'No ejecutable en dual: requiere pata Arcadia + pata Altenar válidas';
+                                    })();
 
                                     return (
                                         <article key={`${op?.type || 'ARB'}_${op?.eventId || idx}_${idx}`} className="rounded-lg border border-amber-500/25 bg-slate-900/40 p-3 space-y-2">
@@ -4402,16 +4503,17 @@ function App() {
                                             <div className="flex items-center justify-between gap-2 rounded border border-emerald-500/20 bg-emerald-500/5 p-2">
                                                 <div className="text-[10px] text-slate-300">
                                                     <div className="uppercase tracking-wide text-emerald-200 font-bold">Fase 2 · Ejecución Dual</div>
-                                                    <div className="text-slate-400">
-                                                        {dualPlan?.canExecute
-                                                            ? 'Secuencia: Arcadia -> Altenar (dry-run obligatorio en ambas patas)'
-                                                            : 'No ejecutable en dual: requiere pata Arcadia + pata Altenar válidas'}
-                                                    </div>
+                                                    <div className="text-slate-400">{dualReasonText}</div>
+                                                    {dualBlockedByLiquidity && (
+                                                        <div className="mt-1 text-[10px] text-red-300 font-mono">
+                                                            {`Requerido Altenar: S/. ${Number(liquidityGuard.altenarRequired || 0).toFixed(2)} vs disponible: ${liquidityGuard.bookyCurrency} ${Number(liquidityGuard.bookyAvailable || 0).toFixed(2)} | Requerido Arcadia: S/. ${Number(liquidityGuard.arcadiaRequired || 0).toFixed(2)} vs disponible: ${liquidityGuard.pinnacleCurrency} ${Number(liquidityGuard.pinnacleAvailable || 0).toFixed(2)}`}
+                                                        </div>
+                                                    )}
                                                 </div>
                                                 <button
                                                     onClick={() => handleExecuteArbitrageDual({ op, legs, idx })}
-                                                    disabled={!dualPlan?.canExecute || dualRunning}
-                                                    className={`px-2.5 py-1.5 rounded border text-[10px] font-bold uppercase tracking-wide transition-colors ${(!dualPlan?.canExecute || dualRunning)
+                                                    disabled={!dualPlan?.canExecute || dualRunning || dualBlockedByLiquidity}
+                                                    className={`px-2.5 py-1.5 rounded border text-[10px] font-bold uppercase tracking-wide transition-colors ${(!dualPlan?.canExecute || dualRunning || dualBlockedByLiquidity)
                                                         ? 'border-slate-600 text-slate-500 cursor-not-allowed'
                                                         : 'border-emerald-500/60 text-emerald-200 hover:bg-emerald-500/20'}`}
                                                     title="Ejecutar patas Arcadia + Altenar en secuencia"
