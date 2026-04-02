@@ -1,10 +1,19 @@
-import db, { initDB } from '../db/database.js';
+import db, { initDB, writeDBWithRetry } from '../db/database.js';
 
 const DEFAULT_PREVIEW_LIMIT = 50;
 const MAX_PREVIEW_LIMIT = 500;
 const ARBITRAGE_PREMATCH_START_GRACE_MINUTES = Math.max(
   0,
   Math.floor(Number(process.env.ARBITRAGE_PREMATCH_START_GRACE_MINUTES || 0))
+);
+const ARBITRAGE_DIAG_MAX_HISTORY = Math.max(
+  200,
+  Math.floor(Number(process.env.ARBITRAGE_DIAG_MAX_HISTORY || 5000))
+);
+const ARBITRAGE_DIAG_DEFAULT_LIMIT = 200;
+const ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES = Math.max(
+  10,
+  Math.floor(Number(process.env.ARBITRAGE_DIAG_SUMMARY_WINDOW_MINUTES || 180))
 );
 const DC_OPPOSITE_COMBOS = [
   {
@@ -268,6 +277,211 @@ const mapDoubleChanceByOrientation = ({ doubleChance = {}, orientation = 'normal
   return normalized;
 };
 
+const ensureArbitrageDiagnosticsStore = () => {
+  if (!db.data.arbitrageDiagnostics || typeof db.data.arbitrageDiagnostics !== 'object') {
+    db.data.arbitrageDiagnostics = {
+      history: [],
+      lastInventoryAt: null,
+      lastSummary: null
+    };
+  }
+
+  if (!Array.isArray(db.data.arbitrageDiagnostics.history)) {
+    db.data.arbitrageDiagnostics.history = [];
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(db.data.arbitrageDiagnostics, 'lastInventoryAt')) {
+    db.data.arbitrageDiagnostics.lastInventoryAt = null;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(db.data.arbitrageDiagnostics, 'lastSummary')) {
+    db.data.arbitrageDiagnostics.lastSummary = null;
+  }
+
+  return db.data.arbitrageDiagnostics;
+};
+
+const clampPositiveInt = (value, fallback) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+};
+
+const summarizeArbitrageDiagnostics = (history = [], { windowMinutes = ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES } = {}) => {
+  const windowSafe = clampPositiveInt(windowMinutes, ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES);
+  const nowMs = Date.now();
+  const windowStartMs = nowMs - (windowSafe * 60 * 1000);
+
+  const inWindow = history.filter((row) => {
+    const ts = new Date(row?.at || 0).getTime();
+    return Number.isFinite(ts) && ts >= windowStartMs;
+  });
+
+  const reasonTotals = {};
+  const generatedTotals = {
+    surebet1x2: 0,
+    surebetDcOpposite: 0
+  };
+
+  let withOps = 0;
+  let zeroOps = 0;
+  let eligibleRowsSum = 0;
+
+  for (const row of inWindow) {
+    const count = Number(row?.result?.count || 0);
+    if (count > 0) withOps += 1;
+    else zeroOps += 1;
+
+    eligibleRowsSum += Number(row?.diagnostics?.eligiblePinnacleRows || 0);
+
+    const generatedByType = row?.diagnostics?.generatedByType || {};
+    generatedTotals.surebet1x2 += Number(generatedByType?.surebet1x2 || 0);
+    generatedTotals.surebetDcOpposite += Number(generatedByType?.surebetDcOpposite || 0);
+
+    const reasons = row?.rejections || {};
+    Object.entries(reasons).forEach(([key, val]) => {
+      const num = Number(val || 0);
+      if (!Number.isFinite(num) || num <= 0) return;
+      reasonTotals[key] = (reasonTotals[key] || 0) + num;
+    });
+  }
+
+  return {
+    windowMinutes: windowSafe,
+    snapshotsInWindow: inWindow.length,
+    withOpportunities: withOps,
+    zeroOpportunities: zeroOps,
+    avgEligiblePinnacleRows: inWindow.length > 0
+      ? Number((eligibleRowsSum / inWindow.length).toFixed(2))
+      : 0,
+    generatedTotals,
+    rejectionReasonTotals: reasonTotals
+  };
+};
+
+const buildRejectionBreakdown = (diagnostics = {}) => {
+  const generatedByType = diagnostics?.generatedByType || {};
+  const generatedTotal = Number(generatedByType?.surebet1x2 || 0) + Number(generatedByType?.surebetDcOpposite || 0);
+
+  return {
+    startedAt: Number(diagnostics?.skippedByStartedAt || 0),
+    invalidDate: Number(diagnostics?.skippedByInvalidDate || 0),
+    unlinked: Number(diagnostics?.skippedUnlinked || 0),
+    orientation: Number(diagnostics?.skippedOrientation || 0),
+    missingOdds1x2: Number(diagnostics?.skippedMissingOdds1x2 || 0),
+    missingOddsDcOpposite: Number(diagnostics?.skippedMissingOddsDcOpposite || 0),
+    filteredByRisk: Number(diagnostics?.filteredByRisk || 0),
+    noSurebetEdge: generatedTotal <= 0 ? 1 : 0
+  };
+};
+
+const persistArbitrageDiagnosticSnapshot = async ({
+  payload,
+  query,
+  trigger = 'request',
+  tag = null
+} = {}) => {
+  if (!payload || !payload?.diagnostics) return;
+
+  ensureArbitrageDiagnosticsStore();
+  const store = db.data.arbitrageDiagnostics;
+
+  const row = {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    at: payload.generatedAt || new Date().toISOString(),
+    trigger: String(trigger || 'request').toLowerCase(),
+    tag: tag ? String(tag) : null,
+    query: {
+      bankroll: Number(query?.bankroll || 0),
+      limit: Number(query?.limit || 0),
+      minRoiPercent: Number(query?.minRoiPercent || 0),
+      minProfitAbs: Number(query?.minProfitAbs || 0)
+    },
+    result: {
+      count: Number(payload?.count || 0),
+      source: payload?.source || null,
+      market: payload?.market || null
+    },
+    diagnostics: payload.diagnostics,
+    rejections: buildRejectionBreakdown(payload.diagnostics)
+  };
+
+  store.history.push(row);
+  if (store.history.length > ARBITRAGE_DIAG_MAX_HISTORY) {
+    store.history.splice(0, store.history.length - ARBITRAGE_DIAG_MAX_HISTORY);
+  }
+
+  if (row.trigger === 'scheduled') {
+    store.lastInventoryAt = row.at;
+  }
+
+  store.lastSummary = summarizeArbitrageDiagnostics(store.history, {
+    windowMinutes: ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES
+  });
+
+  await writeDBWithRetry();
+};
+
+export const getArbitrageDiagnosticsReport = async ({
+  limit = ARBITRAGE_DIAG_DEFAULT_LIMIT,
+  trigger = 'all',
+  windowMinutes = ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES
+} = {}) => {
+  await initDB();
+  await db.read();
+
+  const store = ensureArbitrageDiagnosticsStore();
+  const safeLimit = Math.min(5000, clampPositiveInt(limit, ARBITRAGE_DIAG_DEFAULT_LIMIT));
+  const triggerKey = String(trigger || 'all').trim().toLowerCase();
+
+  const filtered = triggerKey === 'all'
+    ? store.history
+    : store.history.filter((row) => String(row?.trigger || '').toLowerCase() === triggerKey);
+
+  const recent = filtered.slice(-safeLimit);
+  const summary = summarizeArbitrageDiagnostics(filtered, { windowMinutes });
+
+  return {
+    generatedAt: new Date().toISOString(),
+    trigger: triggerKey,
+    storedSnapshots: store.history.length,
+    filteredSnapshots: filtered.length,
+    returnedSnapshots: recent.length,
+    lastInventoryAt: store.lastInventoryAt || null,
+    summary,
+    recent
+  };
+};
+
+export const runArbitrageDiagnosticsInventory = async ({
+  bankroll = null,
+  limit = DEFAULT_PREVIEW_LIMIT,
+  minRoiPercent = null,
+  minProfitAbs = null,
+  tag = 'scheduler'
+} = {}) => {
+  const payload = await getArbitragePreview1x2(
+    {
+      bankroll,
+      limit,
+      minRoiPercent,
+      minProfitAbs
+    },
+    {
+      persistDiagnostics: true,
+      trigger: 'scheduled',
+      tag
+    }
+  );
+
+  return {
+    ok: true,
+    generatedAt: payload?.generatedAt || new Date().toISOString(),
+    count: Number(payload?.count || 0),
+    diagnostics: payload?.diagnostics || null
+  };
+};
+
 const getDefaultBankroll = () => {
   const configBankroll = toNumber(db.data?.config?.bankroll, NaN);
   if (Number.isFinite(configBankroll) && configBankroll > 0) return Number(configBankroll);
@@ -279,6 +493,10 @@ export const getArbitragePreview1x2 = async ({
   limit = DEFAULT_PREVIEW_LIMIT,
   minRoiPercent = null,
   minProfitAbs = null
+} = {}, {
+  persistDiagnostics = true,
+  trigger = 'request',
+  tag = null
 } = {}) => {
   await initDB();
   await db.read();
@@ -513,7 +731,7 @@ export const getArbitragePreview1x2 = async ({
     .sort((a, b) => Number(b?.plan?.edgePercent || 0) - Number(a?.plan?.edgePercent || 0))
     .slice(0, maxItems);
 
-  return {
+  const payload = {
     success: true,
     mode: 'preview-only',
     market: 'mixed',
@@ -548,4 +766,24 @@ export const getArbitragePreview1x2 = async ({
       }
     }
   };
+
+  if (persistDiagnostics) {
+    try {
+      await persistArbitrageDiagnosticSnapshot({
+        payload,
+        query: {
+          bankroll: stakeBankroll,
+          limit: maxItems,
+          minRoiPercent: riskThresholds.minRoiPercent,
+          minProfitAbs: riskThresholds.minProfitAbs
+        },
+        trigger,
+        tag
+      });
+    } catch (error) {
+      console.warn(`⚠️ No se pudo persistir diagnostico de arbitraje: ${error?.message || error}`);
+    }
+  }
+
+  return payload;
 };
