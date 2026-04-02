@@ -7,6 +7,32 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.27] -- 2026-04-02 -- Sprint: Matcher High-Confidence Bulk Linking (Anti-Timeout)
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Endpoint de enlace masivo para matcher manual
+- **`src/routes/matcher.js`**:
+  - Nuevo endpoint `POST /api/matcher/link/bulk` para aplicar lotes de links High Confidence en una sola operación.
+  - Reduce latencia acumulada de `N` requests secuenciales y minimiza timeouts en lotes grandes.
+  - Respuesta detallada por ítem (`applied`/`failed`) para diagnóstico fino de fallos.
+
+### 🔄 Changed
+
+#### Aplicación de sugerencias High Confidence con estrategia bulk-first
+- **`client/src/components/ManualMatcher.jsx`**:
+  - `APLICAR`/`APLICAR TOP 20` ahora intenta primero el endpoint bulk.
+  - Mantiene fallback secuencial automático si el endpoint bulk no está disponible.
+  - Timeout del request bulk ajustado al tamaño del lote para evitar cortes prematuros.
+  - Se conserva aprendizaje de aliases en modo bulk (`learnAliases=true`) para no perder la mejora progresiva del matcher.
+
+### 🧪 Validated
+
+- Build frontend exitoso (`npm --prefix client run build`).
+- Sin errores estáticos en backend del matcher (`node --check src/routes/matcher.js`).
+
 ## [v3.4.26] -- 2026-04-02 -- Sprint: Arbitraje Diagnostics Persistence + Inventory Scheduler
 
 > Rama: `master`

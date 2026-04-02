@@ -321,41 +321,95 @@ const ManualMatcher = () => {
         let failed = 0;
         const failedItems = [];
         const appliedByPinId = new Map();
+        let usedBulkPath = false;
 
         try {
-            for (const suggestion of batch) {
-                const payload = {
-                    pinnacleId: suggestion.pin.id,
-                    altenarId: suggestion.alt.id,
-                    altenarName: suggestion.alt.name
-                };
-
-                const doLink = () => axios.post('http://localhost:3000/api/matcher/link', payload, { timeout: 45000 });
-
-                try {
-                    try {
-                        await doLink();
-                    } catch (linkError) {
-                        const status = Number(linkError?.response?.status);
-                        const linkMsg = String(linkError?.response?.data?.error || linkError?.message || '').toLowerCase();
-                        const isTimeout = linkError?.code === 'ECONNABORTED' || linkMsg.includes('timeout');
-                        const isRace409 = status === 409;
-                        if (!isTimeout && !isRace409) throw linkError;
-
-                        await new Promise(resolve => setTimeout(resolve, 900));
-                        await doLink();
-                    }
-
-                    applied += 1;
-                    appliedByPinId.set(suggestion.pin.id, {
+            try {
+                const bulkPayload = {
+                    // Mantener aprendizaje de alias también en modo bulk.
+                    learnAliases: true,
+                    links: batch.map(suggestion => ({
+                        pinnacleId: suggestion.pin.id,
                         altenarId: suggestion.alt.id,
                         altenarName: suggestion.alt.name
-                    });
-                } catch (error) {
-                    failed += 1;
-                    failedItems.push(
-                        `${suggestion.pin.home} vs ${suggestion.pin.away} -> ${suggestion.alt.name}: ${error?.response?.data?.error || error?.message || 'Error desconocido'}`
-                    );
+                    }))
+                };
+
+                const bulkRes = await axios.post('http://localhost:3000/api/matcher/link/bulk', bulkPayload, {
+                    timeout: Math.max(45000, batch.length * 5000)
+                });
+
+                if (bulkRes?.data?.success && Array.isArray(bulkRes?.data?.results)) {
+                    usedBulkPath = true;
+                    const suggestionByPinId = new Map(batch.map(s => [String(s.pin.id), s]));
+
+                    for (const row of bulkRes.data.results) {
+                        const pinId = String(row?.pinnacleId ?? '');
+                        const suggestion = suggestionByPinId.get(pinId);
+
+                        if (row?.status === 'applied') {
+                            applied += 1;
+                            if (suggestion) {
+                                appliedByPinId.set(suggestion.pin.id, {
+                                    altenarId: suggestion.alt.id,
+                                    altenarName: suggestion.alt.name
+                                });
+                            }
+                            continue;
+                        }
+
+                        failed += 1;
+                        if (suggestion) {
+                            failedItems.push(
+                                `${suggestion.pin.home} vs ${suggestion.pin.away} -> ${suggestion.alt.name}: ${row?.error || 'Error desconocido'}`
+                            );
+                        } else {
+                            failedItems.push(
+                                `${pinId || 'n/a'}: ${row?.error || 'Error desconocido'}`
+                            );
+                        }
+                    }
+                }
+            } catch (bulkError) {
+                usedBulkPath = false;
+                console.warn('Bulk matcher link no disponible. Fallback secuencial.', bulkError?.message || bulkError);
+            }
+
+            if (!usedBulkPath) {
+                for (const suggestion of batch) {
+                    const payload = {
+                        pinnacleId: suggestion.pin.id,
+                        altenarId: suggestion.alt.id,
+                        altenarName: suggestion.alt.name
+                    };
+
+                    const doLink = () => axios.post('http://localhost:3000/api/matcher/link', payload, { timeout: 45000 });
+
+                    try {
+                        try {
+                            await doLink();
+                        } catch (linkError) {
+                            const status = Number(linkError?.response?.status);
+                            const linkMsg = String(linkError?.response?.data?.error || linkError?.message || '').toLowerCase();
+                            const isTimeout = linkError?.code === 'ECONNABORTED' || linkMsg.includes('timeout');
+                            const isRace409 = status === 409;
+                            if (!isTimeout && !isRace409) throw linkError;
+
+                            await new Promise(resolve => setTimeout(resolve, 900));
+                            await doLink();
+                        }
+
+                        applied += 1;
+                        appliedByPinId.set(suggestion.pin.id, {
+                            altenarId: suggestion.alt.id,
+                            altenarName: suggestion.alt.name
+                        });
+                    } catch (error) {
+                        failed += 1;
+                        failedItems.push(
+                            `${suggestion.pin.home} vs ${suggestion.pin.away} -> ${suggestion.alt.name}: ${error?.response?.data?.error || error?.message || 'Error desconocido'}`
+                        );
+                    }
                 }
             }
 
