@@ -12,6 +12,7 @@ const __dirname = path.dirname(__filename);
 const DYNAMIC_ALIASES_PATH = path.resolve(__dirname, '../utils/dynamicAliases.json');
 
 const wait = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
+const MAX_BULK_LINK_ITEMS = 200;
 
 const loadDynamicAliases = async () => {
     try {
@@ -180,6 +181,163 @@ router.post('/link', async (req, res) => {
     } catch (e) {
         console.error("Link Error:", e);
         res.status(500).json({ error: e.message });
+    }
+});
+
+// POST /api/matcher/link/bulk
+// Enlace masivo para high-confidence (una sola escritura de DB, menor latencia).
+router.post('/link/bulk', async (req, res) => {
+    const rawLinks = Array.isArray(req.body?.links) ? req.body.links : [];
+    const learnAliases = req.body?.learnAliases === true;
+
+    if (!rawLinks.length) {
+        return res.status(400).json({
+            success: false,
+            error: 'Body inválido: links[] es requerido.'
+        });
+    }
+
+    const links = rawLinks
+        .slice(0, MAX_BULK_LINK_ITEMS)
+        .map(item => ({
+            pinnacleId: item?.pinnacleId,
+            altenarId: item?.altenarId,
+            altenarName: item?.altenarName
+        }))
+        .filter(item => item.pinnacleId != null && item.altenarId != null && String(item.altenarName || '').trim() !== '');
+
+    if (!links.length) {
+        return res.status(400).json({
+            success: false,
+            error: 'No hay items válidos para enlazar en links[].'
+        });
+    }
+
+    try {
+        await pruneStaleEventCaches({
+            upcomingGraceMinutes: Number(process.env.DB_UPCOMING_RETENTION_MINUTES || 180),
+            altenarGraceMinutes: Number(process.env.DB_ALTENAR_RETENTION_MINUTES || 180),
+            persist: true
+        });
+        await db.read();
+
+        const results = [];
+        const toVerify = [];
+        const updatedAt = new Date().toISOString();
+        const upcomingRows = db.data.upcomingMatches || [];
+        const altenarRows = db.data.altenarUpcoming || [];
+
+        for (const link of links) {
+            const { pinnacleId, altenarId, altenarName } = link;
+            const match = upcomingRows.find(m => m.id == pinnacleId);
+
+            if (!match) {
+                results.push({
+                    pinnacleId,
+                    altenarId,
+                    altenarName,
+                    status: 'failed',
+                    error: 'Pinnacle Match not found in DB'
+                });
+                continue;
+            }
+
+            const targetKey = buildTupleKey(match);
+            let appliedCount = 0;
+
+            for (const row of upcomingRows) {
+                const sameId = String(row?.id || '') === String(pinnacleId);
+                const sameTuple = targetKey && buildTupleKey(row) === targetKey;
+                if (!sameId && !sameTuple) continue;
+
+                row.altenarId = altenarId;
+                row.altenarName = altenarName;
+                row.linkSource = 'manual';
+                row.linkUpdatedAt = updatedAt;
+                appliedCount += 1;
+            }
+
+            if (appliedCount <= 0) {
+                results.push({
+                    pinnacleId,
+                    altenarId,
+                    altenarName,
+                    status: 'failed',
+                    error: 'No se encontraron filas para aplicar link.'
+                });
+                continue;
+            }
+
+            toVerify.push({
+                pinnacleId,
+                altenarId,
+                altenarName,
+                targetKey,
+                match,
+                altenarMatch: altenarRows.find(m => m.id == altenarId) || null,
+                appliedCount
+            });
+        }
+
+        await writeDBWithRetry({ maxAttempts: 10, baseDelayMs: 140 });
+        await db.read();
+
+        for (const item of toVerify) {
+            const persisted = hasPersistedManualLink({
+                rows: db.data.upcomingMatches || [],
+                pinnacleId: item.pinnacleId,
+                altenarId: item.altenarId,
+                targetKey: item.targetKey
+            });
+
+            if (!persisted) {
+                results.push({
+                    pinnacleId: item.pinnacleId,
+                    altenarId: item.altenarId,
+                    altenarName: item.altenarName,
+                    status: 'failed',
+                    error: 'Link no persistido tras escritura (race condition).',
+                    appliedCount: item.appliedCount
+                });
+                continue;
+            }
+
+            let learned = false;
+            if (learnAliases && item.altenarMatch) {
+                const pHome = item.match.home;
+                const pAway = item.match.away;
+                const aHome = item.altenarMatch.home || (item.altenarMatch.name ? item.altenarMatch.name.split(/ vs\.? /i)[0] : '');
+                const aAway = item.altenarMatch.away || (item.altenarMatch.name ? item.altenarMatch.name.split(/ vs\.? /i)[1] : '');
+
+                const learnedHome = pHome && aHome ? registerDynamicAlias(pHome, aHome) : false;
+                const learnedAway = pAway && aAway ? registerDynamicAlias(pAway, aAway) : false;
+                learned = Boolean(learnedHome || learnedAway);
+            }
+
+            results.push({
+                pinnacleId: item.pinnacleId,
+                altenarId: item.altenarId,
+                altenarName: item.altenarName,
+                status: 'applied',
+                learned,
+                appliedCount: item.appliedCount
+            });
+        }
+
+        const applied = results.filter(r => r.status === 'applied').length;
+        const failed = results.length - applied;
+
+        res.json({
+            success: true,
+            requested: rawLinks.length,
+            processed: links.length,
+            applied,
+            failed,
+            results
+        });
+    } catch (e) {
+        console.error('Bulk Link Error:', e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
