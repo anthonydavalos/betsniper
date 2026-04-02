@@ -120,6 +120,11 @@ const ARBITRAGE_RISK_PROFILE_PRESETS = {
     }
 };
 
+const ARBITRAGE_HEALTH_ALERT_HOURS = (() => {
+    const raw = Number(import.meta?.env?.VITE_ARBITRAGE_HEALTH_ALERT_HOURS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 6;
+})();
+
 const normalizeFinishedProviderFilter = (value = 'ALL') => {
     const normalized = String(value || '').trim().toUpperCase();
     return FINISHED_PROVIDER_FILTER_ALLOWED.includes(normalized) ? normalized : 'ALL';
@@ -415,6 +420,26 @@ const formatDateSafe = (candidate) => {
     const date = candidate ? new Date(candidate) : null;
     if (!date || !Number.isFinite(date.getTime())) return '--/--/----';
     return date.toLocaleDateString();
+};
+
+const formatElapsedSinceIso = (candidate) => {
+    const date = candidate ? new Date(candidate) : null;
+    if (!date || !Number.isFinite(date.getTime())) return 'sin dato';
+
+    const diffMs = Date.now() - date.getTime();
+    if (!Number.isFinite(diffMs) || diffMs < 0) return 'ahora';
+
+    const totalMinutes = Math.floor(diffMs / 60000);
+    if (totalMinutes < 1) return 'hace <1m';
+    if (totalMinutes < 60) return `hace ${totalMinutes}m`;
+
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours < 24) return minutes > 0 ? `hace ${hours}h ${minutes}m` : `hace ${hours}h`;
+
+    const days = Math.floor(hours / 24);
+    const remHours = hours % 24;
+    return remHours > 0 ? `hace ${days}d ${remHours}h` : `hace ${days}d`;
 };
 
 const normalizeMarketLabel = (value) => {
@@ -781,6 +806,15 @@ function App() {
         lastOkAt: null,
         lastError: null
     });
+    const [arbitrageHealth24h, setArbitrageHealth24h] = useState({
+        fetchedAt: null,
+        windowMinutes: 1440,
+        request: null,
+        scheduled: null,
+        lastSignalAt: null,
+        lastSignalTrigger: null,
+        error: null
+    });
     const [arbitrageExecutingKeys, setArbitrageExecutingKeys] = useState(new Set());
     const [arbitrageRiskProfileKey, setArbitrageRiskProfileKey] = useState('conservative');
     const [arbitrageRiskConfig, setArbitrageRiskConfig] = useState(() => ({
@@ -852,10 +886,12 @@ function App() {
     const fetchInFlightRef = useRef(false);
     const prematchFetchInFlightRef = useRef(false);
     const arbitrageFetchInFlightRef = useRef(false);
+    const arbitrageHealthFetchInFlightRef = useRef(false);
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
     const lastPrematchFetchAtRef = useRef(0);
     const lastArbitrageFetchAtRef = useRef(0);
+    const lastArbitrageHealthFetchAtRef = useRef(0);
     const lastPlacementProviderFetchAtRef = useRef(0);
     const lastPinnacleAccountFetchAtRef = useRef(0);
     const pinnacleBalanceFetchInFlightRef = useRef(false);
@@ -875,7 +911,10 @@ function App() {
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
     const ARBITRAGE_POLL_MS = 30000;
+    const ARBITRAGE_HEALTH_POLL_MS = 180000;
     const ARBITRAGE_PREVIEW_LIMIT = 80;
+    const ARBITRAGE_HEALTH_WINDOW_MINUTES = 1440;
+    const ARBITRAGE_HEALTH_RECENT_LIMIT = 500;
     const PLACEMENT_PROVIDER_POLL_MS = 20000;
     const PINNACLE_BALANCE_POLL_MS = 15000;
     const PINNACLE_HISTORY_SYNC_DAYS = 180;
@@ -2185,6 +2224,86 @@ function App() {
         }
     };
 
+    const fetchArbitrageHealth24h = async ({ force = false } = {}) => {
+        if (arbitrageHealthFetchInFlightRef.current) return;
+
+        const nowMs = Date.now();
+        if (!force && (nowMs - lastArbitrageHealthFetchAtRef.current) < ARBITRAGE_HEALTH_POLL_MS - 500) return;
+
+        arbitrageHealthFetchInFlightRef.current = true;
+        try {
+            const params = {
+                windowMinutes: ARBITRAGE_HEALTH_WINDOW_MINUTES,
+                limit: ARBITRAGE_HEALTH_RECENT_LIMIT
+            };
+
+            const [requestRes, scheduledRes] = await Promise.all([
+                axios.get('/api/opportunities/arbitrage/diagnostics', {
+                    params: { ...params, trigger: 'request' },
+                    timeout: 20000
+                }),
+                axios.get('/api/opportunities/arbitrage/diagnostics', {
+                    params: { ...params, trigger: 'scheduled' },
+                    timeout: 20000
+                })
+            ]);
+
+            const requestSummary = requestRes?.data?.summary || null;
+            const scheduledSummary = scheduledRes?.data?.summary || null;
+            const requestRecent = Array.isArray(requestRes?.data?.recent) ? requestRes.data.recent : [];
+            const scheduledRecent = Array.isArray(scheduledRes?.data?.recent) ? scheduledRes.data.recent : [];
+
+            const findLastWithSignals = (rows = []) => {
+                const reversed = [...rows].reverse();
+                return reversed.find((row) => {
+                    const shown = Number(row?.result?.count || 0);
+                    if (shown > 0) return true;
+                    const generated = row?.diagnostics?.generatedByType || {};
+                    const generatedTotal = Object.values(generated).reduce((acc, value) => acc + Number(value || 0), 0);
+                    return generatedTotal > 0;
+                }) || null;
+            };
+
+            const reqLast = findLastWithSignals(requestRecent);
+            const schLast = findLastWithSignals(scheduledRecent);
+            const reqLastMs = reqLast?.at ? new Date(reqLast.at).getTime() : NaN;
+            const schLastMs = schLast?.at ? new Date(schLast.at).getTime() : NaN;
+
+            let lastSignalAt = null;
+            let lastSignalTrigger = null;
+            if (Number.isFinite(reqLastMs) || Number.isFinite(schLastMs)) {
+                if (!Number.isFinite(schLastMs) || (Number.isFinite(reqLastMs) && reqLastMs >= schLastMs)) {
+                    lastSignalAt = reqLast?.at || null;
+                    lastSignalTrigger = 'request';
+                } else {
+                    lastSignalAt = schLast?.at || null;
+                    lastSignalTrigger = 'scheduled';
+                }
+            }
+
+            setArbitrageHealth24h({
+                fetchedAt: new Date().toISOString(),
+                windowMinutes: ARBITRAGE_HEALTH_WINDOW_MINUTES,
+                request: requestSummary,
+                scheduled: scheduledSummary,
+                lastSignalAt,
+                lastSignalTrigger,
+                error: null
+            });
+            lastArbitrageHealthFetchAtRef.current = Date.now();
+        } catch (error) {
+            const message = error?.message || 'Error consultando diagnóstico 24h';
+            setArbitrageHealth24h((prev) => ({
+                ...prev,
+                fetchedAt: new Date().toISOString(),
+                error: message
+            }));
+            console.warn('⚠️ Arbitrage 24h health fetch falló.', message);
+        } finally {
+            arbitrageHealthFetchInFlightRef.current = false;
+        }
+    };
+
     const waitUntilInFlightClears = async (ref, timeoutMs = 25000) => {
         const startedAt = Date.now();
         while (ref.current && (Date.now() - startedAt) < timeoutMs) {
@@ -2213,6 +2332,7 @@ function App() {
 
             await waitUntilInFlightClears(arbitrageFetchInFlightRef);
             await fetchArbitrageData({ force: true, riskConfigOverride });
+            await fetchArbitrageHealth24h({ force: true });
 
             setArbitrageRefreshState({
                 running: false,
@@ -2330,6 +2450,7 @@ function App() {
         if (isUnmounted) return;
         fetchPrematchData();
         fetchArbitrageData({ force: true });
+        fetchArbitrageHealth24h({ force: true });
     };
 
     bootstrap();
@@ -2341,6 +2462,7 @@ function App() {
     const prematchInterval = setInterval(() => {
         fetchPrematchData();
         fetchArbitrageData();
+        fetchArbitrageHealth24h();
     }, PREMATCH_POLL_MS);
 
     return () => {
@@ -3795,6 +3917,20 @@ function App() {
     }, 0);
     const arbitrageFilteredByRisk = Number(arbitrageMeta?.diagnostics?.filteredByRisk || 0);
     const arbitrageDisplayedCount = Number(arbitrageMeta?.count || arbitrageOps.length || 0);
+    const arbitrageHealthRequestWithOps = Number(arbitrageHealth24h?.request?.withOpportunities || 0);
+    const arbitrageHealthRequestSnapshots = Number(arbitrageHealth24h?.request?.snapshotsInWindow || 0);
+    const arbitrageHealthScheduledWithOps = Number(arbitrageHealth24h?.scheduled?.withOpportunities || 0);
+    const arbitrageHealthScheduledSnapshots = Number(arbitrageHealth24h?.scheduled?.snapshotsInWindow || 0);
+    const arbitrageHealthLastSignalMs = arbitrageHealth24h?.lastSignalAt
+        ? new Date(arbitrageHealth24h.lastSignalAt).getTime()
+        : NaN;
+    const arbitrageHealthHoursWithoutSignal = Number.isFinite(arbitrageHealthLastSignalMs)
+        ? Math.max(0, (Date.now() - arbitrageHealthLastSignalMs) / 3600000)
+        : Number.POSITIVE_INFINITY;
+    const arbitrageHealthStale = arbitrageHealthHoursWithoutSignal >= ARBITRAGE_HEALTH_ALERT_HOURS;
+    const arbitrageHealthLastSignalLabel = arbitrageHealth24h?.lastSignalAt
+        ? `${formatTimeSafe(arbitrageHealth24h.lastSignalAt)} (${formatElapsedSinceIso(arbitrageHealth24h.lastSignalAt)})`
+        : 'sin señal reciente';
     const arbitrageStatus = (() => {
         if (arbitrageDisplayedCount > 0) {
             return {
@@ -4255,6 +4391,19 @@ function App() {
                                 <div className={`inline-flex items-center rounded-md border px-2 py-1 text-[10px] font-semibold ${arbitrageStatus.className}`}>
                                     {arbitrageStatus.label}
                                 </div>
+                                <div className="text-[10px] text-slate-400">
+                                    {`Pulso 24h | Request ${arbitrageHealthRequestWithOps}/${arbitrageHealthRequestSnapshots} con señal | Scheduled ${arbitrageHealthScheduledWithOps}/${arbitrageHealthScheduledSnapshots} | Última señal: ${arbitrageHealthLastSignalLabel}${arbitrageHealth24h?.lastSignalTrigger ? ` (${arbitrageHealth24h.lastSignalTrigger})` : ''}`}
+                                </div>
+                                {!arbitrageHealth24h?.error && arbitrageHealthStale && (
+                                    <div className="inline-flex items-center rounded-md border border-red-500/40 bg-red-500/15 px-2 py-1 text-[10px] font-semibold text-red-200">
+                                        {`Alerta: mas de ${ARBITRAGE_HEALTH_ALERT_HOURS}h sin señal detectada en arbitraje.`}
+                                    </div>
+                                )}
+                                {arbitrageHealth24h?.error && (
+                                    <div className="text-[10px] text-amber-300">
+                                        {`Pulso 24h no disponible: ${arbitrageHealth24h.error}`}
+                                    </div>
+                                )}
                             </div>
                             <div className="flex items-center gap-2">
                                 <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
