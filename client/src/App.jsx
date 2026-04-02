@@ -3786,6 +3786,42 @@ function App() {
 
     const filteredOps = getFilteredData();
     const arbitrageStakeContext = resolveArbitrageStakeContext();
+    const arbitrageGeneratedByType = arbitrageMeta?.diagnostics?.generatedByType || {};
+    const arbitrageGenerated1x2 = Number(arbitrageGeneratedByType?.surebet1x2 || 0);
+    const arbitrageGeneratedDcOpposite = Number(arbitrageGeneratedByType?.surebetDcOpposite || 0);
+    const arbitrageGeneratedTotal = Object.values(arbitrageGeneratedByType).reduce((acc, value) => {
+        const n = Number(value || 0);
+        return acc + (Number.isFinite(n) ? n : 0);
+    }, 0);
+    const arbitrageFilteredByRisk = Number(arbitrageMeta?.diagnostics?.filteredByRisk || 0);
+    const arbitrageDisplayedCount = Number(arbitrageMeta?.count || arbitrageOps.length || 0);
+    const arbitrageStatus = (() => {
+        if (arbitrageDisplayedCount > 0) {
+            return {
+                label: `Mostrando ${arbitrageDisplayedCount} oportunidad(es)`,
+                className: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+            };
+        }
+
+        if (arbitrageGeneratedTotal > 0 && arbitrageFilteredByRisk >= arbitrageGeneratedTotal) {
+            return {
+                label: `Motor OK: detecto ${arbitrageGeneratedTotal}, pero quedaron filtradas por riesgo`,
+                className: 'border-amber-500/40 bg-amber-500/15 text-amber-200'
+            };
+        }
+
+        if (arbitrageGeneratedTotal > 0) {
+            return {
+                label: `Motor OK: detecto ${arbitrageGeneratedTotal} señal(es)`,
+                className: 'border-cyan-500/40 bg-cyan-500/15 text-cyan-200'
+            };
+        }
+
+        return {
+            label: 'Motor activo: sin señales en este snapshot',
+            className: 'border-slate-600/60 bg-slate-800/70 text-slate-300'
+        };
+    })();
     const finishedRowsForDate = getFinishedDataForSelectedDate();
     const finishedTabCount = finishedRowsForDate.length;
     const finishedProviderCounts = finishedRowsForDate.reduce((acc, row) => {
@@ -4211,10 +4247,13 @@ function App() {
                                         : 'Sin snapshot reciente'}
                                 </div>
                                 <div className="text-[10px] text-slate-500">
-                                    {`Total ${Number(arbitrageMeta?.count || arbitrageOps.length || 0)} | 1x2 ${Number(arbitrageMeta?.diagnostics?.generatedByType?.surebet1x2 || 0)} | DC+Opuesto ${Number(arbitrageMeta?.diagnostics?.generatedByType?.surebetDcOpposite || 0)} | Filtradas riesgo ${Number(arbitrageMeta?.diagnostics?.filteredByRisk || 0)}`}
+                                    {`Mostradas ${arbitrageDisplayedCount} | Generadas ${arbitrageGeneratedTotal} | 1x2 ${arbitrageGenerated1x2} | DC+Opuesto ${arbitrageGeneratedDcOpposite} | Filtradas riesgo ${arbitrageFilteredByRisk}`}
                                 </div>
                                 <div className="text-[10px] text-slate-500">
                                     {`Stake ticket: S/. ${Number(arbitrageMeta?.risk?.stakeBankroll ?? arbitrageStakeContext.stakeBankroll ?? 0).toFixed(2)} | ROI mín: ${Number(arbitrageMeta?.risk?.minRoiPercent ?? arbitrageStakeContext.minRoiPercent ?? 0).toFixed(2)}% | Profit mín: S/. ${Number(arbitrageMeta?.risk?.minProfitAbs ?? arbitrageStakeContext.minProfitAbs ?? 0).toFixed(2)}`}
+                                </div>
+                                <div className={`inline-flex items-center rounded-md border px-2 py-1 text-[10px] font-semibold ${arbitrageStatus.className}`}>
+                                    {arbitrageStatus.label}
                                 </div>
                             </div>
                             <div className="flex items-center gap-2">
@@ -4367,7 +4406,9 @@ function App() {
                             </div>
                         ) : arbitrageOps.length === 0 ? (
                             <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-8 text-center text-slate-400">
-                                No hay surebets en este snapshot. El motor está activo; espera el próximo refresco de cuotas.
+                                {arbitrageGeneratedTotal > 0 && arbitrageFilteredByRisk >= arbitrageGeneratedTotal
+                                    ? `Se detectaron ${arbitrageGeneratedTotal} oportunidad(es), pero todas fueron filtradas por riesgo (ROI/Profit).`
+                                    : 'No hay surebets en este snapshot. El motor está activo; espera el próximo refresco de cuotas.'}
                             </div>
                         ) : (
                             <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
