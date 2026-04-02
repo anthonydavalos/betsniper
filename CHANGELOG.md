@@ -16,6 +16,7 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 #### Endpoint de enlace masivo para matcher manual
 - **`src/routes/matcher.js`**:
   - Nuevo endpoint `POST /api/matcher/link/bulk` para aplicar lotes de links High Confidence en una sola operación.
+  - Soporte `dryRun=true` para smoke test seguro (valida lote sin escribir en DB ni aprender aliases).
   - Reduce latencia acumulada de `N` requests secuenciales y minimiza timeouts en lotes grandes.
   - Respuesta detallada por ítem (`applied`/`failed`) para diagnóstico fino de fallos.
 
@@ -32,6 +33,7 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 - Build frontend exitoso (`npm --prefix client run build`).
 - Sin errores estáticos en backend del matcher (`node --check src/routes/matcher.js`).
+- Smoke test recomendado vía consola/Postman sobre `POST /api/matcher/link/bulk` con `dryRun=true`.
 
 ## [v3.4.26] -- 2026-04-02 -- Sprint: Arbitraje Diagnostics Persistence + Inventory Scheduler
 

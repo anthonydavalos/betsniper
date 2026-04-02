@@ -189,6 +189,7 @@ router.post('/link', async (req, res) => {
 router.post('/link/bulk', async (req, res) => {
     const rawLinks = Array.isArray(req.body?.links) ? req.body.links : [];
     const learnAliases = req.body?.learnAliases === true;
+    const dryRun = req.body?.dryRun === true;
 
     if (!rawLinks.length) {
         return res.status(400).json({
@@ -226,6 +227,64 @@ router.post('/link/bulk', async (req, res) => {
         const updatedAt = new Date().toISOString();
         const upcomingRows = db.data.upcomingMatches || [];
         const altenarRows = db.data.altenarUpcoming || [];
+
+        if (dryRun) {
+            for (const link of links) {
+                const { pinnacleId, altenarId, altenarName } = link;
+                const match = upcomingRows.find(m => m.id == pinnacleId);
+
+                if (!match) {
+                    results.push({
+                        pinnacleId,
+                        altenarId,
+                        altenarName,
+                        status: 'failed',
+                        error: 'Pinnacle Match not found in DB'
+                    });
+                    continue;
+                }
+
+                const targetKey = buildTupleKey(match);
+                let wouldApplyCount = 0;
+                for (const row of upcomingRows) {
+                    const sameId = String(row?.id || '') === String(pinnacleId);
+                    const sameTuple = targetKey && buildTupleKey(row) === targetKey;
+                    if (sameId || sameTuple) wouldApplyCount += 1;
+                }
+
+                if (wouldApplyCount <= 0) {
+                    results.push({
+                        pinnacleId,
+                        altenarId,
+                        altenarName,
+                        status: 'failed',
+                        error: 'No se encontraron filas para aplicar link.'
+                    });
+                    continue;
+                }
+
+                results.push({
+                    pinnacleId,
+                    altenarId,
+                    altenarName,
+                    status: 'would-apply',
+                    appliedCount: wouldApplyCount
+                });
+            }
+
+            const wouldApply = results.filter(r => r.status === 'would-apply').length;
+            const failed = results.length - wouldApply;
+
+            return res.json({
+                success: true,
+                dryRun: true,
+                requested: rawLinks.length,
+                processed: links.length,
+                wouldApply,
+                failed,
+                results
+            });
+        }
 
         for (const link of links) {
             const { pinnacleId, altenarId, altenarName } = link;
@@ -329,6 +388,7 @@ router.post('/link/bulk', async (req, res) => {
 
         res.json({
             success: true,
+            dryRun: false,
             requested: rawLinks.length,
             processed: links.length,
             applied,
