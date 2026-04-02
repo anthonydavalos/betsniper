@@ -59,6 +59,11 @@ const REENTRY_MIN_EV_PERCENT = 3;
 const REENTRY_MIN_STAKE_SOL = 1;
 const MIN_BOOKY_STAKE_SOL = 1;
 const AUTO_PLACEMENT_PROVIDER_ALLOWED = ['booky', 'pinnacle'];
+const LIVE_REQUOTE_RETRY_DELAY_MS = 900;
+const LIVE_MANUAL_MAX_ODD_DROP_PCT = (() => {
+    const raw = Number(import.meta?.env?.VITE_LIVE_MANUAL_MAX_ODD_DROP_PCT);
+    return Number.isFinite(raw) && raw > 0 ? raw : 2.5;
+})();
 
 const normalizeAutoPlacementProvider = (value = '', fallback = 'booky') => {
     const normalized = String(value || '').trim().toLowerCase();
@@ -2823,13 +2828,21 @@ function App() {
                 const forcedConfirmMode = options?.confirmModeHint === 'confirm-fast'
                         ? 'confirm-fast'
                         : (options?.confirmModeHint === 'confirm' ? 'confirm' : null);
-        const optimisticIsSnipe = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE';
+        const opportunityTypeUpper = String(opportunity?.type || opportunity?.strategy || '').toUpperCase();
+        const optimisticIsSnipe = opportunityTypeUpper === 'LIVE_SNIPE';
+        const optimisticIsLiveExecution = opportunityTypeUpper.startsWith('LIVE_') || opportunityTypeUpper === 'LA_VOLTEADA';
             const manualPlacementProvider = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
             const isBookyManualPlacement = manualPlacementProvider === 'booky';
             const providerApiBase = isBookyManualPlacement ? '/api/booky' : '/api/pinnacle';
             const providerLabel = isBookyManualPlacement ? 'Booky' : 'Pinnacle';
             const providerPrefix = isBookyManualPlacement ? 'BOOKY' : 'PINNACLE';
             let useRealPlacement = !isBookyManualPlacement;
+
+        const resolveFreshOpportunityForRetry = () => {
+            const latest = latestLiveCandidatesByKeyRef.current?.get(id) || null;
+            if (latest) return latest;
+            return opportunity;
+        };
 
         const recoverPreparedTicket = async () => {
             const ticketsRes = await axios.get(`${providerApiBase}/tickets`, { timeout: 7000 });
@@ -2857,26 +2870,35 @@ function App() {
             forceUpdate();
         };
 
-        const offerImmediateRequoteRetry = () => {
+        const offerImmediateRequoteRetry = ({ reason = 'requote' } = {}) => {
             if (requoteRetryCount >= 1) return;
 
-            const suggestedMode = String(opportunity?.type || opportunity?.strategy || '').toUpperCase() === 'LIVE_SNIPE'
-                ? 'confirm-fast'
-                : 'confirm';
+            const suggestedMode = optimisticIsLiveExecution ? 'confirm-fast' : 'confirm';
+            const shouldAutoRetry = optimisticIsLiveExecution;
 
-            const wantsRetryNow = window.confirm(
-                '🔁 La casa devolvió re-quote (cuota/selección cambió en vivo).\n\n' +
-                '¿Deseas reintentar ahora con ticket refrescado?'
-            );
+            if (!shouldAutoRetry) {
+                const wantsRetryNow = window.confirm(
+                    '🔁 La casa devolvió re-quote (cuota/selección cambió en vivo).\n\n' +
+                    '¿Deseas reintentar ahora con ticket refrescado?'
+                );
+                if (!wantsRetryNow) return;
+            }
 
-            if (!wantsRetryNow) return;
+            const retryOpportunity = resolveFreshOpportunityForRetry();
 
             setTimeout(() => {
-                handlePlaceBet(opportunity, {
+                handlePlaceBet(retryOpportunity, {
                     requoteRetryCount: requoteRetryCount + 1,
                     confirmModeHint: suggestedMode
                 });
-            }, 1300);
+            }, shouldAutoRetry ? LIVE_REQUOTE_RETRY_DELAY_MS : 1300);
+
+            if (shouldAutoRetry) {
+                const reasonLabel = reason === 'odd-drop'
+                    ? `caída de cuota > ${LIVE_MANUAL_MAX_ODD_DROP_PCT.toFixed(2)}%`
+                    : 're-quote provider';
+                alert(`↻ Reintento automático (${reasonLabel}) con ticket refrescado.`);
+            }
         };
 
         const shouldKeepBlockedAfterForcedRefresh = () => {
@@ -2918,7 +2940,10 @@ function App() {
             : Promise.resolve(null);
 
         const prepareTimeoutMs = 45000;
-        const doPrepare = () => axios.post(`${providerApiBase}/prepare`, opportunity, { timeout: prepareTimeoutMs });
+        const doPrepare = () => {
+            const payload = resolveFreshOpportunityForRetry();
+            return axios.post(`${providerApiBase}/prepare`, payload, { timeout: prepareTimeoutMs });
+        };
 
         let prepRes;
         try {
@@ -3088,8 +3113,36 @@ function App() {
             return;
         }
 
-        const isLiveSnipe = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase() === 'LIVE_SNIPE';
-        const confirmMode = forcedConfirmMode || (isLiveSnipe ? 'confirm-fast' : 'confirm');
+        const ticketTypeUpper = String(ticket?.opportunity?.type || opportunity?.type || '').toUpperCase();
+        const isLiveSnipe = ticketTypeUpper === 'LIVE_SNIPE';
+        const isLiveExecution = ticketTypeUpper.startsWith('LIVE_') || ticketTypeUpper === 'LA_VOLTEADA';
+        const normalizedForcedConfirmMode = (forcedConfirmMode === 'confirm' && isLiveExecution)
+            ? 'confirm-fast'
+            : forcedConfirmMode;
+        const confirmMode = normalizedForcedConfirmMode || (isLiveExecution ? 'confirm-fast' : 'confirm');
+
+        const oddDropPct = (Number.isFinite(oldOdd) && oldOdd > 1 && Number.isFinite(odd) && odd > 1)
+            ? ((oldOdd - odd) / oldOdd) * 100
+            : 0;
+        const exceededOddDropGuard = isLiveExecution && useRealPlacement && oddDropPct >= LIVE_MANUAL_MAX_ODD_DROP_PCT;
+        if (exceededOddDropGuard) {
+            await axios.post(`${providerApiBase}/cancel/${ticket.id}`).catch(() => {});
+            localPlacedBetIdsRef.current.delete(id);
+            delete pendingBetDetailsRef.current[id];
+            forceUpdate();
+
+            alert(
+                '⚠️ Abortado por hardening de cuota en vivo.\n\n' +
+                `Cuota original: ${oldOdd.toFixed(2)}\n` +
+                `Cuota refrescada: ${odd.toFixed(2)}\n` +
+                `Caída: ${oddDropPct.toFixed(2)}% (umbral ${LIVE_MANUAL_MAX_ODD_DROP_PCT.toFixed(2)}%)\n\n` +
+                'No se envió confirmación real para evitar ejecución stale.'
+            );
+
+            offerImmediateRequoteRetry({ reason: 'odd-drop' });
+            return;
+        }
+
         const confirmEndpoint = useRealPlacement
             ? `${providerApiBase}/real/${confirmMode}/${ticket.id}`
             : `${providerApiBase}/confirm/${ticket.id}`;
@@ -3352,7 +3405,8 @@ function App() {
                             const recovered = await recoverPreparedTicket();
                             if (recovered?.id) {
                                 const recoveredType = String(recovered?.opportunity?.type || opportunity?.type || '').toUpperCase();
-                                const recoveredMode = recoveredType === 'LIVE_SNIPE' ? 'confirm-fast' : 'confirm';
+                                const recoveredIsLive = recoveredType.startsWith('LIVE_') || recoveredType === 'LA_VOLTEADA';
+                                const recoveredMode = recoveredIsLive ? 'confirm-fast' : 'confirm';
                                 const retryEndpoint = useRealPlacement
                                     ? `${providerApiBase}/real/${recoveredMode}/${recovered.id}`
                                     : `${providerApiBase}/confirm/${recovered.id}`;
