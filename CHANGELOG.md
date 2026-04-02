@@ -7,6 +7,19 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.28] -- 2026-04-02 -- Mini Note: Indicador de Estado Arbitraje
+
+> Rama: `master`
+
+### 🔄 Changed
+
+- **`client/src/App.jsx`**:
+  - Nuevo indicador visual en la cabecera de ARBITRAGE para distinguir entre:
+    - oportunidades mostradas,
+    - oportunidades generadas pero filtradas por riesgo,
+    - snapshot sin señales (motor activo).
+  - Mensaje vacío mejorado cuando el motor detecta oportunidades pero todas quedan fuera por `ROI/Profit`.
+
 ## [v3.4.27] -- 2026-04-02 -- Sprint: Matcher High-Confidence Bulk Linking (Anti-Timeout)
 
 > Rama: `master`
