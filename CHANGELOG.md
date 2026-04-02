@@ -7,6 +7,56 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.26] -- 2026-04-02 -- Sprint: Arbitraje Diagnostics Persistence + Inventory Scheduler
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Persistencia de diagnósticos de arbitraje en lowdb
+- **`src/db/database.js`**:
+  - Nueva estructura `arbitrageDiagnostics` para auditoría histórica:
+    - `history[]` (snapshots por ejecución)
+    - `lastInventoryAt`
+    - `lastSummary`
+  - Inicialización defensiva automática en `initDB()` para compatibilidad con DBs existentes.
+
+#### Registro detallado de razones de rechazo por snapshot
+- **`src/services/arbitrageService.js`**:
+  - Persistencia automática del resultado de `getArbitragePreview1x2()` en cada ejecución.
+  - Desglose de rechazo persistido por snapshot:
+    - `startedAt`, `invalidDate`, `unlinked`, `orientation`,
+    - `missingOdds1x2`, `missingOddsDcOpposite`,
+    - `filteredByRisk`, `noSurebetEdge`.
+  - Nuevo resumen agregado por ventana temporal (`summarizeArbitrageDiagnostics`) con estadísticas operativas:
+    - snapshots con/sin oportunidades,
+    - promedio de elegibles,
+    - totales por razón de rechazo.
+
+#### API para consulta e inventario manual
+- **`src/routes/opportunities.js`**:
+  - Nuevo endpoint `GET /api/opportunities/arbitrage/diagnostics`.
+  - Nuevo endpoint `POST /api/opportunities/arbitrage/diagnostics/inventory` para disparar inventario bajo demanda.
+
+#### Inventario periódico automático de arbitraje
+- **`server.js`**:
+  - Nuevo scheduler de inventario continuo con log operativo `[ARB_DIAG]`.
+  - Corre en background con intervalo configurable para mantener trazabilidad sin intervención manual.
+
+### 🔄 Changed
+
+#### Contrato de preview de arbitraje con auditoría integrada
+- **`src/services/arbitrageService.js`**:
+  - `getArbitragePreview1x2()` ahora admite opciones de persistencia (`persistDiagnostics`, `trigger`, `tag`) para diferenciar ejecuciones por API y scheduler.
+
+### 🧪 Validated
+
+- Sin errores estáticos en archivos modificados (`node --check`):
+  - `src/services/arbitrageService.js`
+  - `src/routes/opportunities.js`
+  - `src/db/database.js`
+  - `server.js`
+
 ## [v3.4.25] -- 2026-04-01 -- Sprint: Prematch Eligibility Hardening + NAV/Liquidity Guards
 
 > Rama: `master` | Commit: `1bf0a95`

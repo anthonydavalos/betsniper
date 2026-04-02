@@ -22,6 +22,7 @@ await initDB();
 import { startBackgroundScanner } from './src/services/scannerService.js';
 import { ingestPinnaclePrematch } from './scripts/ingest-pinnacle.js'; // Importar Función Directa
 import { startAltenarPrematchAdaptiveScheduler } from './src/services/altenarPrematchScheduler.js';
+import { runArbitrageDiagnosticsInventory } from './src/services/arbitrageService.js';
 import fs from 'fs';
 import { spawn } from 'child_process';
 import path from 'path';
@@ -30,6 +31,11 @@ const backgroundWorkersEnabled = process.env.DISABLE_BACKGROUND_WORKERS !== 'tru
 const liveScannerEnabled = process.env.DISABLE_LIVE_SCANNER !== 'true';
 const prematchSchedulerEnabled = process.env.DISABLE_PREMATCH_SCHEDULER !== 'true';
 const pinnacleIngestCronEnabled = process.env.DISABLE_PINNACLE_INGEST_CRON !== 'true';
+const arbitrageDiagnosticsInventoryEnabled = process.env.ARBITRAGE_DIAGNOSTICS_INVENTORY_ENABLED !== 'false';
+const arbitrageDiagnosticsInventoryIntervalMs = Math.max(
+  15000,
+  Number(process.env.ARBITRAGE_DIAGNOSTICS_INVENTORY_INTERVAL_MS || 60000)
+);
 const monitorDashboardEnabled = process.env.DISABLE_MONITOR_DASHBOARD !== 'true';
 const pinnacleGatewayAutostart = process.env.PINNACLE_GATEWAY_AUTOSTART === 'true';
 const PINNACLE_TRIGGER_FILE = path.resolve('data', 'pinnacle_stale.trigger');
@@ -121,6 +127,30 @@ if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
 // 2. Programar intervalo (2 Horas = 7200000 ms)
 if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
   setInterval(runPinnacleIngest, 2 * 60 * 60 * 1000);
+}
+
+// --- INVENTARIO PERIODICO: DIAGNOSTICOS DE ARBITRAJE ---
+const runArbitrageInventory = async () => {
+  try {
+    const result = await runArbitrageDiagnosticsInventory({ tag: 'scheduler-cron' });
+    const diag = result?.diagnostics || {};
+    console.log(
+      `📒 [ARB_DIAG] snapshot count=${Number(result?.count || 0)} ` +
+      `eligible=${Number(diag?.eligiblePinnacleRows || 0)} ` +
+      `unlinked=${Number(diag?.skippedUnlinked || 0)} ` +
+      `missingOdds=${Number(diag?.skippedMissingOdds || 0)} ` +
+      `riskFiltered=${Number(diag?.filteredByRisk || 0)}`
+    );
+  } catch (err) {
+    console.error(`❌ Error en inventario de arbitraje: ${err.message}`);
+  }
+};
+
+if (backgroundWorkersEnabled && arbitrageDiagnosticsInventoryEnabled) {
+  setTimeout(runArbitrageInventory, 9000);
+  setInterval(runArbitrageInventory, arbitrageDiagnosticsInventoryIntervalMs);
+} else if (backgroundWorkersEnabled && !arbitrageDiagnosticsInventoryEnabled) {
+  console.log('⏸️ Inventario de diagnosticos de arbitraje desactivado (ARBITRAGE_DIAGNOSTICS_INVENTORY_ENABLED=false).');
 }
 
 // --- TAREA PROGRAMADA: PODA DE CACHES (anti-saturación db.json) ---

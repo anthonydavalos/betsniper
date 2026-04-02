@@ -8,7 +8,11 @@ import {
   setAutoPlacementProvider
 } from '../services/scannerService.js';
 import { scanPrematchOpportunities } from '../services/prematchScannerService.js';
-import { getArbitragePreview1x2 } from '../services/arbitrageService.js';
+import {
+  getArbitragePreview1x2,
+  getArbitrageDiagnosticsReport,
+  runArbitrageDiagnosticsInventory
+} from '../services/arbitrageService.js';
 import db from '../db/database.js';
 
 const router = express.Router();
@@ -253,6 +257,62 @@ router.get('/arbitrage/preview', async (req, res) => {
       success: false,
       mode: 'preview-only',
       error: error?.message || 'No se pudo generar preview de arbitraje.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/diagnostics
+// Historial persistido + resumen estadistico de rechazos/snapshots de arbitraje.
+router.get('/arbitrage/diagnostics', async (req, res) => {
+  try {
+    const limitRaw = Number(req.query?.limit);
+    const triggerRaw = String(req.query?.trigger || 'all').trim().toLowerCase();
+    const windowMinutesRaw = Number(req.query?.windowMinutes);
+
+    const payload = await getArbitrageDiagnosticsReport({
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      trigger: triggerRaw || 'all',
+      windowMinutes: Number.isFinite(windowMinutesRaw) ? windowMinutesRaw : undefined
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo consultar diagnosticos de arbitraje.'
+    });
+  }
+});
+
+// POST /api/opportunities/arbitrage/diagnostics/inventory
+// Ejecuta un inventario inmediato del snapshot de arbitraje para auditoria.
+router.post('/arbitrage/diagnostics/inventory', async (req, res) => {
+  try {
+    const bankrollRaw = Number(req.body?.bankroll);
+    const limitRaw = Number(req.body?.limit);
+    const minRoiPercentRaw = Number(req.body?.minRoiPercent);
+    const minProfitAbsRaw = Number(req.body?.minProfitAbs);
+    const tag = String(req.body?.tag || 'manual-api').trim() || 'manual-api';
+
+    const payload = await runArbitrageDiagnosticsInventory({
+      bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      minRoiPercent: Number.isFinite(minRoiPercentRaw) ? minRoiPercentRaw : null,
+      minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : null,
+      tag
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo ejecutar inventario de arbitraje.'
     });
   }
 });

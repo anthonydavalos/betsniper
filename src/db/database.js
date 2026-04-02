@@ -36,6 +36,12 @@ const defaultData = {
   pinnacle: {
     pendingTickets: [],
     history: []
+  },
+  // DIAGNOSTICOS DE ARBITRAJE (auditoria de snapshots y rechazos)
+  arbitrageDiagnostics: {
+    history: [],
+    lastInventoryAt: null,
+    lastSummary: null
   }
 };
 
@@ -160,6 +166,22 @@ export const initDB = async () => {
   if (!db.data.pinnacle) { db.data.pinnacle = { pendingTickets: [], history: [] }; modified = true; }
   if (!db.data.pinnacle.pendingTickets) { db.data.pinnacle.pendingTickets = []; modified = true; }
   if (!db.data.pinnacle.history) { db.data.pinnacle.history = []; modified = true; }
+  if (!db.data.arbitrageDiagnostics) {
+    db.data.arbitrageDiagnostics = { history: [], lastInventoryAt: null, lastSummary: null };
+    modified = true;
+  }
+  if (!Array.isArray(db.data.arbitrageDiagnostics.history)) {
+    db.data.arbitrageDiagnostics.history = [];
+    modified = true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(db.data.arbitrageDiagnostics, 'lastInventoryAt')) {
+    db.data.arbitrageDiagnostics.lastInventoryAt = null;
+    modified = true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(db.data.arbitrageDiagnostics, 'lastSummary')) {
+    db.data.arbitrageDiagnostics.lastSummary = null;
+    modified = true;
+  }
   
   // Solo escribir si hubo cambios estructurales (evita trigger nodemon loop)
   if (modified) {
