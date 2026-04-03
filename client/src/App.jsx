@@ -2172,6 +2172,31 @@ function App() {
 
         const arcadiaLeg = dualPlan.arcadia;
         const altenarLeg = dualPlan.altenar;
+        const arcadiaPick = normalizePick(arcadiaLeg?.opportunity || {});
+        const arcadiaEventId = String(arcadiaLeg?.opportunity?.eventId || '').trim();
+        const existingArcadiaExposure = (Array.isArray(portfolio?.activeBets) ? portfolio.activeBets : []).find((bet) => {
+            if (!bet || typeof bet !== 'object') return false;
+            const provider = String(bet?.placementProvider || bet?.provider || '').trim().toLowerCase();
+            if (provider !== 'pinnacle') return false;
+
+            const betEventId = String(bet?.eventId || '').trim();
+            if (!betEventId || !arcadiaEventId || betEventId !== arcadiaEventId) return false;
+
+            const betPick = String(bet?.pick || normalizePick(bet) || '').trim().toLowerCase();
+            return Boolean(arcadiaPick && betPick === arcadiaPick);
+        }) || null;
+
+        if (existingArcadiaExposure) {
+            const providerBetIdTxt = String(existingArcadiaExposure?.providerBetId || '').trim() || 'n/a';
+            alert(
+                '⚠️ Ejecución dual bloqueada para evitar duplicado Arcadia.\n\n' +
+                `Ya existe exposición abierta en Arcadia para este pick (${arcadiaPick || 'n/a'}).\n` +
+                `ticket local: ${existingArcadiaExposure?.id || 'n/a'} | providerBetId: ${providerBetIdTxt}\n\n` +
+                'Acción: primero cubrir/cerrar esa exposición y luego volver a evaluar arbitraje.'
+            );
+            return;
+        }
+
         const confirmMsg =
             'Ejecución dual secuencial (Arcadia → Altenar)\n\n' +
             `Partido: ${op?.match || '-'}\n` +

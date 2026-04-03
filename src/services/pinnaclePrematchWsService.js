@@ -26,6 +26,7 @@ const DEFAULT_PREMATCH_PREFETCH_HOURS = 6;
 const DEFAULT_PREMATCH_OVERLAP_MINUTES = 30;
 const RECONNECT_BASE_MS = 3000;
 const RECONNECT_MAX_MS = 60000;
+const MISSING_TOPICS_RECOVERY_INTERVAL_MS = 30 * 1000;
 
 const EXCLUDED_MATCH_TERMS = [
     'corners',
@@ -135,6 +136,7 @@ class PinnaclePrematchWsService {
         this.cachedSessionKey = null;
         this.cachedMqttUsername = null;
         this.cachedMqttTokenBase = null;
+        this.lastLeaguesRecoveryAttemptAt = 0;
 
         this.discoveryIntervalMs = parsePositive(
             process.env.PINNACLE_PREMATCH_WS_DISCOVERY_INTERVAL_MS,
@@ -830,6 +832,12 @@ class PinnaclePrematchWsService {
 
         if ((now - this.lastSaveAt) > this.saveIntervalMs) {
             this.savePrematchSnapshot('health-tick');
+        }
+
+        const missingTopicsState = this.wsConnected && (this.targetLeagueIds.size === 0 || this.subscribedTopics.size === 0);
+        if (missingTopicsState && (now - this.lastLeaguesRecoveryAttemptAt) > MISSING_TOPICS_RECOVERY_INTERVAL_MS) {
+            this.lastLeaguesRecoveryAttemptAt = now;
+            await this.refreshLeagues();
         }
 
         if (this.wsConnected && this.subscribedTopics.size === 0 && this.targetLeagueIds.size > 0) {
