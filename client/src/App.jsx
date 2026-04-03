@@ -820,6 +820,19 @@ function App() {
         lastSignalTrigger: null,
         error: null
     });
+    const [prematchWsHealth, setPrematchWsHealth] = useState({
+        fetchedAt: null,
+        success: false,
+        enabled: true,
+        mode: 'idle',
+        wsConnected: false,
+        wsStale: false,
+        lastUsefulWsFrameAt: null,
+        lastPollingSyncAt: null,
+        lastFallbackReason: null,
+        counts: { fixtures: 0, subscribedTopics: 0 },
+        error: null
+    });
     const [arbitrageExecutingKeys, setArbitrageExecutingKeys] = useState(new Set());
     const [arbitrageRiskProfileKey, setArbitrageRiskProfileKey] = useState('conservative');
     const [arbitrageRiskConfig, setArbitrageRiskConfig] = useState(() => ({
@@ -892,11 +905,13 @@ function App() {
     const prematchFetchInFlightRef = useRef(false);
     const arbitrageFetchInFlightRef = useRef(false);
     const arbitrageHealthFetchInFlightRef = useRef(false);
+    const prematchWsHealthFetchInFlightRef = useRef(false);
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
     const lastPrematchFetchAtRef = useRef(0);
     const lastArbitrageFetchAtRef = useRef(0);
     const lastArbitrageHealthFetchAtRef = useRef(0);
+    const lastPrematchWsHealthFetchAtRef = useRef(0);
     const lastPlacementProviderFetchAtRef = useRef(0);
     const lastPinnacleAccountFetchAtRef = useRef(0);
     const pinnacleBalanceFetchInFlightRef = useRef(false);
@@ -915,6 +930,7 @@ function App() {
 
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
+    const PREMATCH_WS_HEALTH_POLL_MS = 30000;
     const ARBITRAGE_POLL_MS = 30000;
     const ARBITRAGE_HEALTH_POLL_MS = 180000;
     const ARBITRAGE_PREVIEW_LIMIT = 80;
@@ -1573,6 +1589,45 @@ function App() {
             console.warn('⚠️ Prematch fetch falló. Se mantiene snapshot previo.', err?.message || err);
         } finally {
             prematchFetchInFlightRef.current = false;
+        }
+    };
+
+    const fetchPrematchWsHealth = async ({ force = false } = {}) => {
+        if (prematchWsHealthFetchInFlightRef.current) return;
+
+        const nowMs = Date.now();
+        if (!force && (nowMs - lastPrematchWsHealthFetchAtRef.current) < PREMATCH_WS_HEALTH_POLL_MS - 500) return;
+
+        prematchWsHealthFetchInFlightRef.current = true;
+        try {
+            const res = await axios.get('/api/pinnacle/prematch-ws-health', { timeout: 10000 });
+            setPrematchWsHealth({
+                fetchedAt: new Date().toISOString(),
+                success: Boolean(res?.data?.success),
+                enabled: res?.data?.enabled !== false,
+                mode: String(res?.data?.mode || 'idle'),
+                wsConnected: Boolean(res?.data?.wsConnected),
+                wsStale: Boolean(res?.data?.wsStale),
+                lastUsefulWsFrameAt: res?.data?.lastUsefulWsFrameAt || null,
+                lastPollingSyncAt: res?.data?.lastPollingSyncAt || null,
+                lastFallbackReason: res?.data?.lastFallbackReason || null,
+                counts: {
+                    fixtures: Number(res?.data?.counts?.fixtures || 0),
+                    subscribedTopics: Number(res?.data?.counts?.subscribedTopics || 0)
+                },
+                error: null
+            });
+            lastPrematchWsHealthFetchAtRef.current = Date.now();
+        } catch (error) {
+            const message = error?.message || 'No se pudo consultar salud de prematch WS';
+            setPrematchWsHealth((prev) => ({
+                ...prev,
+                fetchedAt: new Date().toISOString(),
+                error: message
+            }));
+            console.warn('⚠️ Prematch WS health fetch falló.', message);
+        } finally {
+            prematchWsHealthFetchInFlightRef.current = false;
         }
     };
 
@@ -2454,6 +2509,7 @@ function App() {
         await fetchData();
         if (isUnmounted) return;
         fetchPrematchData();
+        fetchPrematchWsHealth({ force: true });
         fetchArbitrageData({ force: true });
         fetchArbitrageHealth24h({ force: true });
     };
@@ -2466,6 +2522,7 @@ function App() {
 
     const prematchInterval = setInterval(() => {
         fetchPrematchData();
+        fetchPrematchWsHealth();
         fetchArbitrageData();
         fetchArbitrageHealth24h();
     }, PREMATCH_POLL_MS);
@@ -4012,6 +4069,49 @@ function App() {
             className: 'border-slate-600/60 bg-slate-800/70 text-slate-300'
         };
     })();
+    const prematchWsBadge = (() => {
+        if (prematchWsHealth?.error) {
+            return {
+                className: 'border-amber-500/40 bg-amber-500/15 text-amber-200',
+                label: `Prematch WS health no disponible: ${prematchWsHealth.error}`
+            };
+        }
+
+        if (prematchWsHealth?.enabled === false) {
+            return {
+                className: 'border-slate-600/60 bg-slate-800/70 text-slate-300',
+                label: 'Prematch WS deshabilitado por entorno (DISABLE_PINNACLE_PREMATCH_WS=true).'
+            };
+        }
+
+        const wsConnected = Boolean(prematchWsHealth?.wsConnected);
+        const wsStale = Boolean(prematchWsHealth?.wsStale);
+        const fallbackReason = prematchWsHealth?.lastFallbackReason;
+        const lastFrameLabel = prematchWsHealth?.lastUsefulWsFrameAt
+            ? formatElapsedSinceIso(prematchWsHealth.lastUsefulWsFrameAt)
+            : 'sin frame útil';
+
+        if (wsConnected && !wsStale) {
+            return {
+                className: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200',
+                label: `Prematch WS conectado · último frame ${lastFrameLabel}.`
+            };
+        }
+
+        if (prematchWsHealth?.lastPollingSyncAt) {
+            const reasonTxt = fallbackReason ? ` · fallback=${fallbackReason}` : '';
+            return {
+                className: 'border-amber-500/40 bg-amber-500/15 text-amber-200',
+                label: `Prematch en modo fallback polling${reasonTxt} · último sync ${formatElapsedSinceIso(prematchWsHealth.lastPollingSyncAt)}.`
+            };
+        }
+
+        return {
+            className: 'border-red-500/40 bg-red-500/15 text-red-200',
+            label: 'Prematch WS sin señal y sin fallback confirmado todavía.'
+        };
+    })();
+    const prematchWsSnapshotMeta = `Fixtures: ${Number(prematchWsHealth?.counts?.fixtures || 0)} | Topics: ${Number(prematchWsHealth?.counts?.subscribedTopics || 0)} | Estado: ${String(prematchWsHealth?.mode || 'idle')}`;
     const finishedRowsForDate = getFinishedDataForSelectedDate();
     const finishedTabCount = finishedRowsForDate.length;
     const finishedProviderCounts = finishedRowsForDate.reduce((acc, row) => {
@@ -4780,8 +4880,15 @@ function App() {
                     </div>
                 ) : (
                 /* TABLA ESTÁNDAR */
-                <div className="overflow-x-auto">
-                    <table className="w-full text-left text-xs">
+                <>
+                    {activeTab === 'ALL' && (
+                        <div className={`mx-3 mt-3 rounded-lg border px-3 py-2 text-[10px] ${prematchWsBadge.className}`}>
+                            <div className="font-semibold">{prematchWsBadge.label}</div>
+                            <div className="mt-1 text-[10px] opacity-90 font-mono">{prematchWsSnapshotMeta}</div>
+                        </div>
+                    )}
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
                         <thead>
                             <tr className="bg-slate-900 text-slate-400 uppercase tracking-wider">
                                 <th className="p-3 w-32">Status / Hora</th>
@@ -5493,8 +5600,9 @@ function App() {
                                 </tr>
                             </tfoot>
                         )}
-                    </table>
-                </div>
+                        </table>
+                    </div>
+                </>
                 )}
             </section>
         </div>

@@ -22,6 +22,7 @@ await initDB();
 import { startBackgroundScanner } from './src/services/scannerService.js';
 import { ingestPinnaclePrematch } from './scripts/ingest-pinnacle.js'; // Importar Función Directa
 import { startAltenarPrematchAdaptiveScheduler } from './src/services/altenarPrematchScheduler.js';
+import { startPinnaclePrematchWsService, stopPinnaclePrematchWsService } from './src/services/pinnaclePrematchWsService.js';
 import { runArbitrageDiagnosticsInventory } from './src/services/arbitrageService.js';
 import fs from 'fs';
 import { spawn } from 'child_process';
@@ -31,6 +32,7 @@ const backgroundWorkersEnabled = process.env.DISABLE_BACKGROUND_WORKERS !== 'tru
 const liveScannerEnabled = process.env.DISABLE_LIVE_SCANNER !== 'true';
 const prematchSchedulerEnabled = process.env.DISABLE_PREMATCH_SCHEDULER !== 'true';
 const pinnacleIngestCronEnabled = process.env.DISABLE_PINNACLE_INGEST_CRON !== 'true';
+const pinnaclePrematchWsEnabled = process.env.DISABLE_PINNACLE_PREMATCH_WS !== 'true';
 const arbitrageDiagnosticsInventoryEnabled = process.env.ARBITRAGE_DIAGNOSTICS_INVENTORY_ENABLED !== 'false';
 const arbitrageDiagnosticsInventoryIntervalMs = Math.max(
   15000,
@@ -91,6 +93,14 @@ if (backgroundWorkersEnabled) {
     startAltenarPrematchAdaptiveScheduler();
   } else {
     console.log('⏸️ Prematch scheduler desactivado (DISABLE_PREMATCH_SCHEDULER=true).');
+  }
+
+  if (pinnaclePrematchWsEnabled) {
+    startPinnaclePrematchWsService().catch((error) => {
+      console.error(`❌ Error iniciando Pinnacle Prematch WS: ${error.message}`);
+    });
+  } else {
+    console.log('⏸️ Pinnacle Prematch WS desactivado (DISABLE_PINNACLE_PREMATCH_WS=true).');
   }
 } else {
   console.log('⏸️ Workers de fondo desactivados (DISABLE_BACKGROUND_WORKERS=true).');
@@ -220,3 +230,14 @@ app.listen(PORT, () => {
   console.log(`\n🚀 Servidor BetSniper V3 corriendo en http://localhost:${PORT}`);
   console.log(`📝 Modo: ${process.env.NODE_ENV || 'development'}`);
 });
+
+const shutdownPrematchWs = () => {
+  try {
+    stopPinnaclePrematchWsService();
+  } catch (_) {
+    // noop
+  }
+};
+
+process.on('SIGINT', shutdownPrematchWs);
+process.on('SIGTERM', shutdownPrematchWs);

@@ -12,6 +12,7 @@ import {
   confirmPinnacleRealPlacement,
   confirmPinnacleRealPlacementFast
 } from '../services/pinnacleSemiAutoService.js';
+import { getPinnaclePrematchWsHealth } from '../services/pinnaclePrematchWsService.js';
 
 const router = express.Router();
 
@@ -105,6 +106,16 @@ router.get('/capture/latest', async (_req, res) => {
   try {
     const data = await getLatestPinnacleCapture();
     res.json({ success: true, ...data });
+  } catch (error) {
+    sendPinnacleError(res, error, 500);
+  }
+});
+
+// GET /api/pinnacle/prematch-ws-health
+router.get('/prematch-ws-health', async (_req, res) => {
+  try {
+    const health = getPinnaclePrematchWsHealth();
+    res.json({ success: true, ...health });
   } catch (error) {
     sendPinnacleError(res, error, 500);
   }

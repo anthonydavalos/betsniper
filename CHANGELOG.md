@@ -7,6 +7,61 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.29] -- 2026-04-03 -- Sprint: Prematch WS Arcadia + Health Endpoint + Banner UI
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Ingesta prematch de Pinnacle por WebSocket MQTT (Arcadia)
+- **`src/services/pinnaclePrematchWsService.js`**:
+  - Nuevo servicio dedicado para ingesta prematch de alta frecuencia sobre `wss://api.arcadia.pinnacle.com/ws` (subprotocolo MQTT).
+  - Descubrimiento de ligas activas y suscripción dinámica por topics prematch (`reg/spc`).
+  - Normalización de fixtures/markets y persistencia en `data/pinnacle_prematch.json`.
+  - Fallback resiliente por polling Arcadia + degradación secundaria desde `db.upcomingMatches` cuando el polling retorna vacío.
+  - Export de salud operacional (`getPinnaclePrematchWsHealth`) para observabilidad externa.
+
+#### Endpoint de diagnóstico prematch WS
+- **`src/routes/pinnacle.js`**:
+  - Nuevo endpoint `GET /api/pinnacle/prematch-ws-health`.
+  - Expone estado de transporte y degradación:
+    - `mode` (`ws-live`, `fallback-polling`, `connecting`, `disabled`, `idle`)
+    - `wsConnected` / `wsStale`
+    - últimos timestamps (`lastUsefulWsFrameAt`, `lastPollingSyncAt`)
+    - contadores de cobertura (`fixtures`, `subscribedTopics`, etc.).
+
+### 🔄 Changed
+
+#### Arranque/stop de worker prematch WS en backend
+- **`server.js`**:
+  - Integración de lifecycle (`startPinnaclePrematchWsService` / `stopPinnaclePrematchWsService`).
+  - Nueva bandera de control por entorno: `DISABLE_PINNACLE_PREMATCH_WS=true/false`.
+  - Hook de cierre limpio en `SIGINT`/`SIGTERM`.
+
+#### Observabilidad en frontend (pestaña Prematch)
+- **`client/src/App.jsx`**:
+  - Polling dedicado de health (`/api/pinnacle/prematch-ws-health`) sincronizado con el ciclo prematch.
+  - Banner operacional en la vista Prematch con estado legible para operación:
+    - conectado por WS,
+    - fallback polling activo (con `reason`),
+    - deshabilitado por entorno,
+    - error de consulta de health.
+  - Métricas rápidas visibles: `fixtures`, `topics`, `mode`.
+
+### 📦 Dependencies
+
+- **`package.json` / `package-lock.json`**:
+  - Se agrega dependencia `mqtt@^5.15.1` para transporte WS Arcadia prematch.
+
+### 🧪 Validated
+
+- Smoke de endpoint health:
+  - `GET /api/pinnacle/prematch-ws-health` responde `200` con `mode=ws-live`, `wsConnected=true`, `wsStale=false`.
+- Validación estática sin errores en archivos modificados del feature:
+  - `src/services/pinnaclePrematchWsService.js`
+  - `src/routes/pinnacle.js`
+  - `client/src/App.jsx`
+
 ## [v3.4.28] -- 2026-04-02 -- Mini Note: Indicador de Estado Arbitraje
 
 > Rama: `master`
