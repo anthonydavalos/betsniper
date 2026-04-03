@@ -68,6 +68,17 @@ const reconcileMirroredBetWithRequested = ({ mirroredBet, requestedPayload, prov
 
   const providerRequestId = providerBody?.requestId || requestedPayload?.requestId || null;
   const providerStatus = String(providerBody?.status || '').toUpperCase() || null;
+  const providerBetId = (providerBody?.id !== null && providerBody?.id !== undefined && providerBody?.id !== '')
+    ? providerBody.id
+    : null;
+  const acceptedOddRaw = Number(providerBody?.price);
+  const acceptedOdd = Number.isFinite(acceptedOddRaw) && acceptedOddRaw > 1
+    ? Number(acceptedOddRaw)
+    : requestedOdd;
+  const acceptedStakeRaw = Number(providerBody?.stake);
+  const acceptedStake = Number.isFinite(acceptedStakeRaw) && acceptedStakeRaw > 0
+    ? Number(acceptedStakeRaw)
+    : requestedStake;
 
   const applyPatch = (bet = {}) => {
     const patched = {
@@ -76,6 +87,7 @@ const reconcileMirroredBetWithRequested = ({ mirroredBet, requestedPayload, prov
       price: requestedOdd || bet.price,
       stake: requestedStake || bet.stake,
       kellyStake: requestedStake || bet.kellyStake || bet.stake,
+      providerBetId: providerBetId ?? bet.providerBetId ?? null,
       providerRequestId,
       providerStatus,
       provider: 'pinnacle',
@@ -83,11 +95,15 @@ const reconcileMirroredBetWithRequested = ({ mirroredBet, requestedPayload, prov
       integration: 'pinnacle',
       providerRequestedStake: requestedStake || bet.providerRequestedStake || null,
       providerRequestedOdd: requestedOdd || bet.providerRequestedOdd || null,
+      acceptedOdd: acceptedOdd || bet.acceptedOdd || null,
+      acceptedStake: acceptedStake || bet.acceptedStake || null,
       providerAcceptedAt: nowIso()
     };
 
-    if (Number.isFinite(Number(patched.stake)) && Number.isFinite(Number(patched.odd))) {
-      patched.potentialReturn = Number((Number(patched.stake) * Number(patched.odd)).toFixed(2));
+    const returnStake = Number.isFinite(Number(acceptedStake)) ? Number(acceptedStake) : Number(patched.stake);
+    const returnOdd = Number.isFinite(Number(acceptedOdd)) ? Number(acceptedOdd) : Number(patched.odd);
+    if (Number.isFinite(returnStake) && Number.isFinite(returnOdd)) {
+      patched.potentialReturn = Number((returnStake * returnOdd).toFixed(2));
     }
 
     return patched;
@@ -1703,6 +1719,11 @@ export const confirmPinnacleRealPlacement = async (ticketId) => {
   const response = await arcadiaRequest('POST', draft.endpoint, { data: draft.payload });
   const providerBody = response.data || {};
   const providerStatus = String(providerBody?.status || '').toUpperCase();
+  const acceptedMeta = {
+    providerBetId: (providerBody?.id !== null && providerBody?.id !== undefined && providerBody?.id !== '') ? providerBody.id : null,
+    acceptedOdd: Number.isFinite(Number(providerBody?.price)) && Number(providerBody?.price) > 1 ? Number(providerBody.price) : null,
+    acceptedStake: Number.isFinite(Number(providerBody?.stake)) && Number(providerBody?.stake) > 0 ? Number(providerBody.stake) : null
+  };
 
   if (providerStatus.includes('REJECT')) {
     ticket.status = 'REAL_REJECTED';
@@ -1750,6 +1771,14 @@ export const confirmPinnacleRealPlacement = async (ticketId) => {
     endpoint: draft.endpoint,
     requestId: draft.payload?.requestId || null,
     requested: draft.payload,
+    accepted: {
+      providerBetId: acceptedMeta.providerBetId,
+      acceptedOdd: acceptedMeta.acceptedOdd,
+      acceptedStake: acceptedMeta.acceptedStake,
+      potentialReturn: (Number.isFinite(acceptedMeta.acceptedOdd) && Number.isFinite(acceptedMeta.acceptedStake))
+        ? Number((acceptedMeta.acceptedStake * acceptedMeta.acceptedOdd).toFixed(2))
+        : null
+    },
     response: providerBody
   };
   if (mirroredBet?.id) ticket.portfolioBetId = mirroredBet.id;
