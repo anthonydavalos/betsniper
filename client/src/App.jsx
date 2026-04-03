@@ -3934,6 +3934,13 @@ function App() {
             (Array.isArray(row?.selections) && row.selections.length > 0)
         );
 
+        const getProviderRequestId = (row = {}) => String(
+            row?.providerRequestId ||
+            row?.realPlacement?.requestId ||
+            row?.realPlacement?.response?.requestId ||
+            ''
+        ).trim();
+
         if (isSimulatedDisplayMode) {
             const simHistoryData = portfolioHistoryRows
                 .filter((h) => {
@@ -3995,6 +4002,20 @@ function App() {
                 .filter(Boolean)
         );
 
+        const portfolioRemoteProviderIds = new Set(
+            portfolioHistoryRows
+                .filter((row) => String(row?.source || '').trim().toLowerCase() === 'remote')
+                .map((row) => String(row?.providerBetId || '').trim())
+                .filter(Boolean)
+        );
+
+        const portfolioRemoteRequestIds = new Set(
+            portfolioHistoryRows
+                .filter((row) => String(row?.source || '').trim().toLowerCase() === 'remote')
+                .map((row) => getProviderRequestId(row))
+                .filter(Boolean)
+        );
+
         const realHistoryFromPortfolio = portfolioHistoryRows
             .filter((h) => {
                 if (!h || typeof h !== 'object') return false;
@@ -4006,6 +4027,15 @@ function App() {
 
                 const providerId = String(h?.providerBetId || '').trim();
                 if (providerId && openProviderBetIds.has(providerId)) return false;
+
+                // Si existe snapshot remoto para el mismo ticket, ocultar la fila local legacy.
+                const source = String(h?.source || '').trim().toLowerCase();
+                const requestId = getProviderRequestId(h);
+                if (source !== 'remote') {
+                    if (providerId && portfolioRemoteProviderIds.has(providerId)) return false;
+                    if (requestId && portfolioRemoteRequestIds.has(requestId)) return false;
+                }
+
                 return true;
             })
             .map((h) => ({
