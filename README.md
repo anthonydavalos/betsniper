@@ -57,6 +57,26 @@ This project demonstrates real-world techniques used in:
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-04-03 (v3.4.29)
+
+- Nuevo canal prematch por WS Arcadia (MQTT) con fallback automático a polling y degradación desde `db.upcomingMatches` para evitar feed vacío.
+- Nuevo endpoint de observabilidad operativa:
+  - `GET /api/pinnacle/prematch-ws-health`
+  - devuelve `mode`, `wsConnected`, `wsStale`, timestamps clave y cobertura (`fixtures`, `subscribedTopics`).
+- La pestaña Prematch del frontend muestra un banner de estado en tiempo real:
+  - `WS conectado`,
+  - `fallback polling` (con reason),
+  - `deshabilitado por entorno`,
+  - o `health no disponible`.
+- Nueva bandera de control granular para workers:
+  - `DISABLE_PINNACLE_PREMATCH_WS=true/false`.
+
+Smoke recomendado:
+
+```bash
+curl -sS http://localhost:3000/api/pinnacle/prematch-ws-health
+```
+
 ### Actualización 2026-04-01 (v3.4.24)
 
 - **Fase 1 (Semi-Auto por pata en ARBITRAGE):**
@@ -789,6 +809,7 @@ DISABLE_BACKGROUND_WORKERS=false
 DISABLE_LIVE_SCANNER=false
 DISABLE_PREMATCH_SCHEDULER=false
 DISABLE_PINNACLE_INGEST_CRON=false
+DISABLE_PINNACLE_PREMATCH_WS=false
 DISABLE_MONITOR_DASHBOARD=false
 
 # Live tuning
@@ -812,6 +833,17 @@ PREMATCH_PINNACLE_CACHE_TTL_MS=15000
 PREMATCH_WINDOW_PRIMARY_HOURS=6
 PREMATCH_WINDOW_PREFETCH_HOURS=6
 PREMATCH_WINDOW_OVERLAP_MINUTES=30
+
+# Prematch WS Arcadia (MQTT)
+PINNACLE_PREMATCH_WS_DISCOVERY_INTERVAL_MS=600000
+PINNACLE_PREMATCH_WS_SAVE_INTERVAL_MS=15000
+PINNACLE_PREMATCH_WS_HEALTH_CHECK_INTERVAL_MS=12000
+PINNACLE_PREMATCH_WS_STALE_MS=70000
+PINNACLE_PREMATCH_WS_FALLBACK_POLL_INTERVAL_MS=45000
+PINNACLE_PREMATCH_WS_SAFETY_POLL_INTERVAL_MS=360000
+PINNACLE_PREMATCH_WS_LEAGUE_LIMIT=120
+PINNACLE_PREMATCH_WS_INCLUDE_REG_TOPICS=true
+PINNACLE_PREMATCH_WS_INCLUDE_SPC_TOPICS=true
 ```
 > Pon `true` solo para depurar el servidor Express sin que los scanners consuman CPU.
 
@@ -1465,6 +1497,29 @@ El servidor expone los siguientes endpoints REST:
 **`POST /api/opportunities/discard`**
 - **Body:** `{ "eventId": 123456 }`
 - **Descripción:** Añade evento a blacklist (no volverá a mostrarse).
+
+---
+
+### **Pinnacle / Arcadia**
+
+**`GET /api/pinnacle/prematch-ws-health`**
+- **Descripción:** Estado operativo del canal prematch por WS Arcadia.
+- **Uso:** Diagnóstico rápido de conectividad y fallback desde backend/frontend.
+- **Respuesta (resumen):**
+```json
+{
+  "success": true,
+  "mode": "ws-live",
+  "wsConnected": true,
+  "wsStale": false,
+  "lastUsefulWsFrameAt": "2026-04-03T19:52:04.043Z",
+  "lastPollingSyncAt": "2026-04-03T19:48:33.756Z",
+  "counts": {
+    "fixtures": 198,
+    "subscribedTopics": 240
+  }
+}
+```
 
 ---
 
