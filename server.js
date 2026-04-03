@@ -226,18 +226,45 @@ app.get('/api/health', (req, res) => {
 });
 
 // Iniciar Servidor
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`\n🚀 Servidor BetSniper V3 corriendo en http://localhost:${PORT}`);
   console.log(`📝 Modo: ${process.env.NODE_ENV || 'development'}`);
 });
 
-const shutdownPrematchWs = () => {
+let shuttingDown = false;
+
+const shutdownPrematchWs = (signal = 'SIGTERM') => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`\n🛑 Señal ${signal} recibida. Cerrando BetSniper...`);
+
   try {
     stopPinnaclePrematchWsService();
   } catch (_) {
     // noop
   }
+
+  if (isGatewayAlive()) {
+    try {
+      pinnacleGatewayProcess.kill('SIGTERM');
+    } catch (_) {
+      // noop
+    }
+  }
+
+  const hardExitTimer = setTimeout(() => {
+    console.warn('⚠️ Cierre forzado tras timeout de 5s.');
+    process.exit(1);
+  }, 5000);
+  hardExitTimer.unref();
+
+  server.close(() => {
+    clearTimeout(hardExitTimer);
+    console.log('✅ Servidor HTTP cerrado.');
+    process.exit(0);
+  });
 };
 
-process.on('SIGINT', shutdownPrematchWs);
-process.on('SIGTERM', shutdownPrematchWs);
+process.on('SIGINT', () => shutdownPrematchWs('SIGINT'));
+process.on('SIGTERM', () => shutdownPrematchWs('SIGTERM'));

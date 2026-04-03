@@ -834,6 +834,7 @@ function App() {
         error: null
     });
     const [arbitrageExecutingKeys, setArbitrageExecutingKeys] = useState(new Set());
+    const [arbitrageDualPreflightByKey, setArbitrageDualPreflightByKey] = useState({});
     const [arbitrageRiskProfileKey, setArbitrageRiskProfileKey] = useState('conservative');
     const [arbitrageRiskConfig, setArbitrageRiskConfig] = useState(() => ({
         ...ARBITRAGE_RISK_PROFILE_PRESETS.conservative.config
@@ -2021,6 +2022,29 @@ function App() {
 
     const getArbitrageExecutionKey = (op = {}, idx = 0) => `${String(op?.type || 'ARB')}_${String(op?.eventId || idx)}_${idx}`;
 
+    const setArbitrageDualPreflightAudit = (executionKey, payload = {}) => {
+        if (!executionKey) return;
+
+        const toFiniteOrNull = (value) => {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : null;
+        };
+
+        setArbitrageDualPreflightByKey((prev) => ({
+            ...prev,
+            [executionKey]: {
+                updatedAt: new Date().toISOString(),
+                status: String(payload?.status || 'info').trim().toLowerCase(),
+                reason: payload?.reason ? String(payload.reason) : null,
+                message: payload?.message ? String(payload.message) : null,
+                baseRoi: toFiniteOrNull(payload?.baseRoi),
+                baseProfit: toFiniteOrNull(payload?.baseProfit),
+                liveRoi: toFiniteOrNull(payload?.liveRoi),
+                liveProfit: toFiniteOrNull(payload?.liveProfit)
+            }
+        }));
+    };
+
     const findOpenArcadiaExposureForOpportunity = (opportunity = {}) => {
         const expectedPick = String(normalizePick(opportunity || {}) || '').trim().toLowerCase();
         const expectedEventId = String(opportunity?.eventId || '').trim();
@@ -2294,6 +2318,8 @@ function App() {
 
     const handleExecuteArbitrageDual = async ({ op = {}, legs = [], idx = 0 } = {}) => {
         const executionKey = getArbitrageExecutionKey(op, idx);
+        const baseRoi = Number(op?.plan?.roiPercent || 0);
+        const baseProfit = Number(op?.plan?.expectedProfit || 0);
         if (arbitrageExecutingKeysRef.current.has(executionKey)) return;
 
         const dualPlan = buildDualExecutionPlan(op, legs);
@@ -2332,6 +2358,16 @@ function App() {
 
         try {
             const preflight = await runArbitrageDualPreflight({ baseOpportunity: op });
+            setArbitrageDualPreflightAudit(executionKey, {
+                status: preflight?.ok ? 'ok' : 'blocked',
+                reason: preflight?.reason || null,
+                message: preflight?.message || (preflight?.ok ? 'Pre-flight validado con snapshot actualizado.' : null),
+                baseRoi,
+                baseProfit,
+                liveRoi: preflight?.liveRoi ?? preflight?.refreshedOpportunity?.plan?.roiPercent,
+                liveProfit: preflight?.liveProfit ?? preflight?.refreshedOpportunity?.plan?.expectedProfit
+            });
+
             if (!preflight?.ok) {
                 const reasonCode = preflight?.reason ? ` [${preflight.reason}]` : '';
                 alert(
@@ -2400,6 +2436,15 @@ function App() {
             );
             await fetchData({ forceBookyRefresh: true });
         } catch (error) {
+            setArbitrageDualPreflightAudit(executionKey, {
+                status: 'error',
+                reason: 'runtime-error',
+                message: error?.message || 'Error desconocido durante ejecución dual.',
+                baseRoi,
+                baseProfit,
+                liveRoi: null,
+                liveProfit: null
+            });
             alert(`❌ Fallo inesperado en ejecución dual: ${error?.message || 'Error desconocido.'}`);
             await fetchData({ forceBookyRefresh: true });
         } finally {
@@ -5034,6 +5079,7 @@ function App() {
                                     const dualPlan = buildDualExecutionPlan(op, legs);
                                     const dualRunning = arbitrageExecutingKeys.has(executionKey);
                                     const dualBlockedByLiquidity = Boolean(dualPlan?.canExecute) && !liquidityGuard.canFund;
+                                    const dualPreflightAudit = arbitrageDualPreflightByKey[executionKey] || null;
                                     const dualReasonText = (() => {
                                         if (dualBlockedByLiquidity) {
                                             return 'Bloqueado por liquidez: el split recomendado excede saldo disponible por provider.';
@@ -5138,6 +5184,23 @@ function App() {
                                                     {dualBlockedByLiquidity && (
                                                         <div className="mt-1 text-[10px] text-red-300 font-mono">
                                                             {`Requerido Altenar: S/. ${Number(liquidityGuard.altenarRequired || 0).toFixed(2)} vs disponible: ${liquidityGuard.bookyCurrency} ${Number(liquidityGuard.bookyAvailable || 0).toFixed(2)} | Requerido Arcadia: S/. ${Number(liquidityGuard.arcadiaRequired || 0).toFixed(2)} vs disponible: ${liquidityGuard.pinnacleCurrency} ${Number(liquidityGuard.pinnacleAvailable || 0).toFixed(2)}`}
+                                                        </div>
+                                                    )}
+                                                    {dualPreflightAudit && (
+                                                        <div className={`mt-1 rounded border p-1.5 text-[10px] ${dualPreflightAudit.status === 'ok'
+                                                            ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-100'
+                                                            : dualPreflightAudit.status === 'error'
+                                                                ? 'border-red-500/35 bg-red-500/10 text-red-100'
+                                                                : 'border-amber-500/35 bg-amber-500/10 text-amber-100'}`}>
+                                                            <div className="font-bold uppercase tracking-wide">
+                                                                {`Pre-flight ${String(dualPreflightAudit.status || 'info').toUpperCase()}${dualPreflightAudit.reason ? ` · ${dualPreflightAudit.reason}` : ''}`}
+                                                            </div>
+                                                            <div className="font-mono text-[10px]">
+                                                                {`ROI ${Number(dualPreflightAudit.baseRoi || 0).toFixed(3)}% -> ${dualPreflightAudit.liveRoi == null ? 'n/a' : `${Number(dualPreflightAudit.liveRoi).toFixed(3)}%`} | Profit S/. ${Number(dualPreflightAudit.baseProfit || 0).toFixed(2)} -> ${dualPreflightAudit.liveProfit == null ? 'n/a' : Number(dualPreflightAudit.liveProfit).toFixed(2)}`}
+                                                            </div>
+                                                            <div>
+                                                                {`Hora: ${formatTimeSafe(dualPreflightAudit.updatedAt)}${dualPreflightAudit.message ? ` | ${dualPreflightAudit.message}` : ''}`}
+                                                            </div>
                                                         </div>
                                                     )}
                                                 </div>
