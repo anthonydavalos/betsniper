@@ -809,6 +809,7 @@ DISABLE_BACKGROUND_WORKERS=false
 DISABLE_LIVE_SCANNER=false
 DISABLE_PREMATCH_SCHEDULER=false
 DISABLE_PINNACLE_INGEST_CRON=false
+PINNACLE_INGEST_CRON_INTERVAL_MS=7200000
 DISABLE_PINNACLE_PREMATCH_WS=false
 DISABLE_MONITOR_DASHBOARD=false
 
@@ -1109,7 +1110,7 @@ npm run dev
 
 **¿Qué hace?**
 - Expone API en `http://localhost:3000`
-- Ejecuta ingesta automática de Pinnacle/Altenar cada 2 horas
+- Ejecuta ingesta automática de Pinnacle/Altenar en intervalo configurable (`PINNACLE_INGEST_CRON_INTERVAL_MS`, default 2h)
 - Scanner de oportunidades Live en bucle (polling adaptativo según actividad)
 - Monitoreo de apuestas activas y liquidación automática
 

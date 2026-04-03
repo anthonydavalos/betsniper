@@ -32,6 +32,11 @@ const backgroundWorkersEnabled = process.env.DISABLE_BACKGROUND_WORKERS !== 'tru
 const liveScannerEnabled = process.env.DISABLE_LIVE_SCANNER !== 'true';
 const prematchSchedulerEnabled = process.env.DISABLE_PREMATCH_SCHEDULER !== 'true';
 const pinnacleIngestCronEnabled = process.env.DISABLE_PINNACLE_INGEST_CRON !== 'true';
+const pinnacleIngestCronIntervalMs = (() => {
+  const parsed = Number(process.env.PINNACLE_INGEST_CRON_INTERVAL_MS);
+  if (Number.isFinite(parsed) && parsed >= 60000) return parsed;
+  return 2 * 60 * 60 * 1000;
+})();
 const pinnaclePrematchWsEnabled = process.env.DISABLE_PINNACLE_PREMATCH_WS !== 'true';
 const arbitrageDiagnosticsInventoryEnabled = process.env.ARBITRAGE_DIAGNOSTICS_INVENTORY_ENABLED !== 'false';
 const arbitrageDiagnosticsInventoryIntervalMs = Math.max(
@@ -117,7 +122,7 @@ if (backgroundWorkersEnabled && pinnacleGatewayAutostart) {
 }
 
 // --- TAREA PROGRAMADA: INGESTA AUTOMÁTICA PINNACLE ---
-// Se ejecuta al iniciar y luego cada 2 hORAS para mantener DB fresca
+// Se ejecuta al iniciar y luego en intervalo configurable para mantener DB fresca
 const runPinnacleIngest = async () => {
     console.log("⏰ [CRON] Ejecutando Ingesta Automática de Pinnacle...");
     try {
@@ -134,9 +139,9 @@ if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
   console.log('⏸️ Ingesta automática de Pinnacle desactivada (DISABLE_PINNACLE_INGEST_CRON=true).');
 }
 
-// 2. Programar intervalo (2 Horas = 7200000 ms)
+// 2. Programar intervalo configurable via env (PINNACLE_INGEST_CRON_INTERVAL_MS)
 if (backgroundWorkersEnabled && pinnacleIngestCronEnabled) {
-  setInterval(runPinnacleIngest, 2 * 60 * 60 * 1000);
+  setInterval(runPinnacleIngest, pinnacleIngestCronIntervalMs);
 }
 
 // --- INVENTARIO PERIODICO: DIAGNOSTICOS DE ARBITRAJE ---
