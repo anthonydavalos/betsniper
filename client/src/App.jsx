@@ -906,6 +906,9 @@ function App() {
     const arbitrageFetchInFlightRef = useRef(false);
     const arbitrageHealthFetchInFlightRef = useRef(false);
     const prematchWsHealthFetchInFlightRef = useRef(false);
+    const prematchSseRef = useRef(null);
+    const prematchSseReconnectTimerRef = useRef(null);
+    const lastPrematchSseEventAtRef = useRef(0);
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
     const lastPrematchFetchAtRef = useRef(0);
@@ -931,6 +934,8 @@ function App() {
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
     const PREMATCH_WS_HEALTH_POLL_MS = 30000;
+    const PREMATCH_SSE_RECONNECT_MS = 5000;
+    const PREMATCH_SSE_WATCHDOG_MS = 90000;
     const ARBITRAGE_POLL_MS = 30000;
     const ARBITRAGE_HEALTH_POLL_MS = 180000;
     const ARBITRAGE_PREVIEW_LIMIT = 80;
@@ -1552,6 +1557,24 @@ function App() {
         }
     };
 
+    const sanitizePrematchRows = (rows = []) => {
+        const blockedBetIds = blockedBetIdsRef.current instanceof Set
+            ? blockedBetIdsRef.current
+            : new Set();
+
+        const list = Array.isArray(rows) ? rows : [];
+        return list.filter(op => {
+            if (isLiveOriginOpportunity(op)) return false;
+            if (!hasMinBookyStake(op)) return false;
+
+            const id = getOpportunityId(op);
+            if (localDiscardedIdsRef.current.has(id)) return false;
+            if (localPlacedBetIdsRef.current.has(id)) return false;
+            if (blockedBetIds.has(id)) return false;
+            return true;
+        });
+    };
+
     const fetchPrematchData = async ({ force = false } = {}) => {
         if (prematchFetchInFlightRef.current) return;
 
@@ -1566,21 +1589,7 @@ function App() {
             const prematchRes = await axios.get(prematchUrl, { timeout: 20000 });
 
             if (prematchRes?.data?.data) {
-                const blockedBetIds = blockedBetIdsRef.current instanceof Set
-                    ? blockedBetIdsRef.current
-                    : new Set();
-
-                const cleanOps = prematchRes.data.data.filter(op => {
-                    if (isLiveOriginOpportunity(op)) return false;
-                    if (!hasMinBookyStake(op)) return false;
-
-                    const id = getOpportunityId(op);
-                    if (localDiscardedIdsRef.current.has(id)) return false;
-                    if (localPlacedBetIdsRef.current.has(id)) return false;
-                    if (blockedBetIds.has(id)) return false;
-                    return true;
-                });
-
+                const cleanOps = sanitizePrematchRows(prematchRes.data.data);
                 setPrematchOps(cleanOps);
             }
 
@@ -2521,7 +2530,6 @@ function App() {
     }, CORE_POLL_MS);
 
     const prematchInterval = setInterval(() => {
-        fetchPrematchData();
         fetchPrematchWsHealth();
         fetchArbitrageData();
         fetchArbitrageHealth24h();
@@ -2531,6 +2539,103 @@ function App() {
         isUnmounted = true;
         clearInterval(coreInterval);
         clearInterval(prematchInterval);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const closePrematchSse = () => {
+        const current = prematchSseRef.current;
+        if (current) {
+            try { current.close(); } catch (_) {}
+            prematchSseRef.current = null;
+        }
+    };
+
+    const scheduleReconnect = () => {
+        if (cancelled) return;
+        if (prematchSseReconnectTimerRef.current) return;
+
+        prematchSseReconnectTimerRef.current = setTimeout(() => {
+            prematchSseReconnectTimerRef.current = null;
+            connectPrematchSse();
+        }, PREMATCH_SSE_RECONNECT_MS);
+    };
+
+    const handlePrematchUpdate = (evt) => {
+        try {
+            const payload = JSON.parse(String(evt?.data || '{}'));
+            const rows = sanitizePrematchRows(payload?.data || []);
+            setPrematchOps(rows);
+            lastPrematchSseEventAtRef.current = Date.now();
+            lastPrematchFetchAtRef.current = Date.now();
+            fetchPrematchWsHealth();
+        } catch (error) {
+            console.warn('⚠️ Prematch SSE payload inválido.', error?.message || error);
+        }
+    };
+
+    const connectPrematchSse = () => {
+        if (cancelled) return;
+
+        closePrematchSse();
+        try {
+            const es = new EventSource('/api/opportunities/prematch/stream');
+            prematchSseRef.current = es;
+
+            es.onopen = () => {
+                lastPrematchSseEventAtRef.current = Date.now();
+                fetchPrematchWsHealth();
+            };
+
+            es.addEventListener('prematch-update', handlePrematchUpdate);
+            es.addEventListener('heartbeat', () => {
+                lastPrematchSseEventAtRef.current = Date.now();
+            });
+            es.addEventListener('prematch-error', (evt) => {
+                lastPrematchSseEventAtRef.current = Date.now();
+                try {
+                    const payload = JSON.parse(String(evt?.data || '{}'));
+                    console.warn('⚠️ Prematch SSE reportó error.', payload?.error || 'unknown');
+                } catch (_) {
+                    console.warn('⚠️ Prematch SSE reportó error.');
+                }
+            });
+
+            es.onerror = () => {
+                closePrematchSse();
+                scheduleReconnect();
+            };
+        } catch (error) {
+            console.warn('⚠️ No se pudo iniciar Prematch SSE.', error?.message || error);
+            scheduleReconnect();
+        }
+    };
+
+    connectPrematchSse();
+
+    const watchdog = setInterval(() => {
+        const lastEventAt = Number(lastPrematchSseEventAtRef.current || 0);
+        const stale = !lastEventAt || (Date.now() - lastEventAt) > PREMATCH_SSE_WATCHDOG_MS;
+        if (!stale) return;
+
+        fetchPrematchData({ force: true });
+        fetchPrematchWsHealth({ force: true });
+
+        if (!prematchSseRef.current) {
+            connectPrematchSse();
+        }
+    }, 15000);
+
+    return () => {
+        cancelled = true;
+        clearInterval(watchdog);
+        if (prematchSseReconnectTimerRef.current) {
+            clearTimeout(prematchSseReconnectTimerRef.current);
+            prematchSseReconnectTimerRef.current = null;
+        }
+        closePrematchSse();
     };
   }, []);
 

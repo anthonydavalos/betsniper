@@ -23,6 +23,18 @@ const PREMATCH_CACHE_TTL_MS = Math.max(
     ? Number(process.env.PREMATCH_CACHE_TTL_MS)
     : 20000
 );
+const PREMATCH_STREAM_REFRESH_INTERVAL_MS = Math.max(
+  5000,
+  Number.isFinite(Number(process.env.PREMATCH_STREAM_REFRESH_INTERVAL_MS))
+    ? Number(process.env.PREMATCH_STREAM_REFRESH_INTERVAL_MS)
+    : 12000
+);
+const PREMATCH_STREAM_HEARTBEAT_MS = Math.max(
+  10000,
+  Number.isFinite(Number(process.env.PREMATCH_STREAM_HEARTBEAT_MS))
+    ? Number(process.env.PREMATCH_STREAM_HEARTBEAT_MS)
+    : 20000
+);
 
 let prematchCache = {
   timestamp: null,
@@ -31,6 +43,8 @@ let prematchCache = {
 };
 
 let prematchInFlightPromise = null;
+let prematchStreamTicker = null;
+const prematchStreamClients = new Set();
 
 const runPrematchRefresh = async () => {
   const allOpportunities = await scanPrematchOpportunities();
@@ -110,6 +124,48 @@ function filterIgnoredPrematchRows(rows = []) {
     const opId = getOpportunityId(op);
     return !ignoredIds.has(opId);
   });
+}
+
+function emitPrematchSseEvent(eventName, payload) {
+  const body = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of prematchStreamClients) {
+    try {
+      client.write(body);
+    } catch (_) {
+      // noop
+    }
+  }
+}
+
+function startPrematchStreamTickerIfNeeded() {
+  if (prematchStreamTicker) return;
+
+  prematchStreamTicker = setInterval(async () => {
+    if (prematchStreamClients.size === 0) return;
+
+    try {
+      const latest = await ensurePrematchRefresh({ deferred: false });
+      const filtered = filterIgnoredPrematchRows(latest.data || []);
+      emitPrematchSseEvent('prematch-update', {
+        timestamp: latest.timestamp || new Date().toISOString(),
+        count: filtered.length,
+        data: filtered,
+        source: 'sse-refresh'
+      });
+    } catch (error) {
+      emitPrematchSseEvent('prematch-error', {
+        at: new Date().toISOString(),
+        error: error?.message || 'Error refrescando prematch stream'
+      });
+    }
+  }, PREMATCH_STREAM_REFRESH_INTERVAL_MS);
+}
+
+function stopPrematchStreamTickerIfIdle() {
+  if (prematchStreamClients.size > 0) return;
+  if (!prematchStreamTicker) return;
+  clearInterval(prematchStreamTicker);
+  prematchStreamTicker = null;
 }
 
 // POST /api/opportunities/discard
@@ -233,6 +289,57 @@ router.get('/prematch', async (req, res) => {
     }
     res.status(500).json({ error: error.message });
   }
+});
+
+// GET /api/opportunities/prematch/stream
+// Stream SSE para push de oportunidades prematch (sin polling fijo en frontend).
+router.get('/prematch/stream', async (_req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  prematchStreamClients.add(res);
+  startPrematchStreamTickerIfNeeded();
+
+  const warmRows = filterIgnoredPrematchRows(prematchCache.data || []);
+  res.write(`event: prematch-update\ndata: ${JSON.stringify({
+    timestamp: prematchCache.timestamp || new Date().toISOString(),
+    count: warmRows.length,
+    data: warmRows,
+    source: 'sse-warm'
+  })}\n\n`);
+
+  ensurePrematchRefresh({ deferred: true })
+    .then((latest) => {
+      const filtered = filterIgnoredPrematchRows(latest.data || []);
+      if (!prematchStreamClients.has(res)) return;
+      res.write(`event: prematch-update\ndata: ${JSON.stringify({
+        timestamp: latest.timestamp || new Date().toISOString(),
+        count: filtered.length,
+        data: filtered,
+        source: 'sse-connect-refresh'
+      })}\n\n`);
+    })
+    .catch((error) => {
+      if (!prematchStreamClients.has(res)) return;
+      res.write(`event: prematch-error\ndata: ${JSON.stringify({
+        at: new Date().toISOString(),
+        error: error?.message || 'Error inicializando prematch stream'
+      })}\n\n`);
+    });
+
+  const heartbeat = setInterval(() => {
+    if (!prematchStreamClients.has(res)) return;
+    res.write(`event: heartbeat\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
+  }, PREMATCH_STREAM_HEARTBEAT_MS);
+
+  _req.on('close', () => {
+    clearInterval(heartbeat);
+    prematchStreamClients.delete(res);
+    stopPrematchStreamTickerIfIdle();
+  });
 });
 
 // GET /api/opportunities/arbitrage/preview
