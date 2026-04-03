@@ -2021,6 +2021,138 @@ function App() {
 
     const getArbitrageExecutionKey = (op = {}, idx = 0) => `${String(op?.type || 'ARB')}_${String(op?.eventId || idx)}_${idx}`;
 
+    const findOpenArcadiaExposureForOpportunity = (opportunity = {}) => {
+        const expectedPick = String(normalizePick(opportunity || {}) || '').trim().toLowerCase();
+        const expectedEventId = String(opportunity?.eventId || '').trim();
+        if (!expectedPick || !expectedEventId) return null;
+
+        return (Array.isArray(portfolio?.activeBets) ? portfolio.activeBets : []).find((bet) => {
+            if (!bet || typeof bet !== 'object') return false;
+            const provider = String(bet?.placementProvider || bet?.provider || '').trim().toLowerCase();
+            if (provider !== 'pinnacle') return false;
+
+            const betEventId = String(bet?.eventId || '').trim();
+            if (!betEventId || betEventId !== expectedEventId) return false;
+
+            const betPick = String(bet?.pick || normalizePick(bet) || '').trim().toLowerCase();
+            return betPick === expectedPick;
+        }) || null;
+    };
+
+    const extractArbitrageLegSignature = (opportunity = {}) => {
+        const legs = Array.isArray(opportunity?.legs) ? opportunity.legs : [];
+        const out = [];
+
+        const pushLeg = (marketRaw, selectionRaw) => {
+            const market = String(marketRaw || '').trim().toLowerCase();
+            const selection = String(selectionRaw || '').trim().toUpperCase();
+            if (!market || !selection) return;
+            out.push(`${market}|${selection}`);
+        };
+
+        if (legs.length > 0) {
+            for (const leg of legs) {
+                pushLeg(leg?.market, leg?.selection);
+            }
+        } else {
+            pushLeg('1x2', 'HOME');
+            pushLeg('1x2', 'DRAW');
+            pushLeg('1x2', 'AWAY');
+        }
+
+        return out.sort();
+    };
+
+    const isSameArbitrageOpportunity = (base = {}, candidate = {}) => {
+        const baseEventId = String(base?.eventId || '').trim();
+        const candidateEventId = String(candidate?.eventId || '').trim();
+        if (!baseEventId || !candidateEventId || baseEventId !== candidateEventId) return false;
+
+        const baseType = String(base?.type || '').trim().toUpperCase();
+        const candidateType = String(candidate?.type || '').trim().toUpperCase();
+        if (baseType !== candidateType) return false;
+
+        const baseSig = extractArbitrageLegSignature(base);
+        const candidateSig = extractArbitrageLegSignature(candidate);
+        if (baseSig.length !== candidateSig.length) return false;
+        return baseSig.every((key, idx) => key === candidateSig[idx]);
+    };
+
+    const runArbitrageDualPreflight = async ({ baseOpportunity = null } = {}) => {
+        if (!baseOpportunity || typeof baseOpportunity !== 'object') {
+            return { ok: false, reason: 'missing-base-opportunity', message: 'No se recibió oportunidad base para pre-flight.' };
+        }
+
+        const riskContext = resolveArbitrageStakeContext();
+
+        await fetchPrematchData({ force: true });
+
+        const arbitrageRes = await axios.get('/api/opportunities/arbitrage/preview', {
+            params: {
+                limit: ARBITRAGE_PREVIEW_LIMIT,
+                bankroll: riskContext.stakeBankroll > 0 ? riskContext.stakeBankroll : undefined,
+                minRoiPercent: riskContext.minRoiPercent,
+                minProfitAbs: riskContext.minProfitAbs
+            },
+            timeout: 25000
+        });
+
+        const rows = Array.isArray(arbitrageRes?.data?.data) ? arbitrageRes.data.data : [];
+        const refreshedOpportunity = rows.find((row) => isSameArbitrageOpportunity(baseOpportunity, row)) || null;
+
+        if (!refreshedOpportunity) {
+            return {
+                ok: false,
+                reason: 'missing-after-refresh',
+                message: 'La oportunidad ya no existe en el snapshot actualizado.'
+            };
+        }
+
+        const liveRoi = Number(refreshedOpportunity?.plan?.roiPercent || 0);
+        const liveProfit = Number(refreshedOpportunity?.plan?.expectedProfit || 0);
+        if (!Number.isFinite(liveRoi) || liveRoi < Number(riskContext.minRoiPercent || 0)) {
+            return {
+                ok: false,
+                reason: 'roi-below-threshold',
+                message: `ROI actualizado ${Number.isFinite(liveRoi) ? liveRoi.toFixed(3) : 'n/a'}% < mínimo ${Number(riskContext.minRoiPercent || 0).toFixed(3)}%.`,
+                refreshedOpportunity,
+                riskContext
+            };
+        }
+
+        if (!Number.isFinite(liveProfit) || liveProfit < Number(riskContext.minProfitAbs || 0)) {
+            return {
+                ok: false,
+                reason: 'profit-below-threshold',
+                message: `Profit actualizado S/. ${Number.isFinite(liveProfit) ? liveProfit.toFixed(2) : 'n/a'} < mínimo S/. ${Number(riskContext.minProfitAbs || 0).toFixed(2)}.`,
+                refreshedOpportunity,
+                riskContext
+            };
+        }
+
+        const refreshedLegs = Array.isArray(refreshedOpportunity?.legs) ? refreshedOpportunity.legs : [];
+        const dualPlan = buildDualExecutionPlan(refreshedOpportunity, refreshedLegs);
+        if (!dualPlan?.canExecute) {
+            return {
+                ok: false,
+                reason: dualPlan?.reason || 'dual-plan-invalid',
+                message: 'La oportunidad refrescada ya no tiene patas Arcadia + Altenar ejecutables.',
+                refreshedOpportunity,
+                riskContext
+            };
+        }
+
+        return {
+            ok: true,
+            refreshedOpportunity,
+            refreshedLegs,
+            dualPlan,
+            riskContext,
+            liveRoi,
+            liveProfit
+        };
+    };
+
     const setArbitrageExecutionRunning = (executionKey, running) => {
         const next = new Set(arbitrageExecutingKeysRef.current);
         if (running) next.add(executionKey);
@@ -2173,18 +2305,7 @@ function App() {
         const arcadiaLeg = dualPlan.arcadia;
         const altenarLeg = dualPlan.altenar;
         const arcadiaPick = normalizePick(arcadiaLeg?.opportunity || {});
-        const arcadiaEventId = String(arcadiaLeg?.opportunity?.eventId || '').trim();
-        const existingArcadiaExposure = (Array.isArray(portfolio?.activeBets) ? portfolio.activeBets : []).find((bet) => {
-            if (!bet || typeof bet !== 'object') return false;
-            const provider = String(bet?.placementProvider || bet?.provider || '').trim().toLowerCase();
-            if (provider !== 'pinnacle') return false;
-
-            const betEventId = String(bet?.eventId || '').trim();
-            if (!betEventId || !arcadiaEventId || betEventId !== arcadiaEventId) return false;
-
-            const betPick = String(bet?.pick || normalizePick(bet) || '').trim().toLowerCase();
-            return Boolean(arcadiaPick && betPick === arcadiaPick);
-        }) || null;
+        const existingArcadiaExposure = findOpenArcadiaExposureForOpportunity(arcadiaLeg?.opportunity || null);
 
         if (existingArcadiaExposure) {
             const providerBetIdTxt = String(existingArcadiaExposure?.providerBetId || '').trim() || 'n/a';
@@ -2210,9 +2331,38 @@ function App() {
         setArbitrageExecutionRunning(executionKey, true);
 
         try {
+            const preflight = await runArbitrageDualPreflight({ baseOpportunity: op });
+            if (!preflight?.ok) {
+                const reasonCode = preflight?.reason ? ` [${preflight.reason}]` : '';
+                alert(
+                    `⛔ Pre-flight dual abortado${reasonCode}\n\n` +
+                    `${preflight?.message || 'La oportunidad ya no cumple umbrales de ejecución.'}`
+                );
+                await fetchData({ forceBookyRefresh: true });
+                return;
+            }
+
+            const refreshedArcadiaLeg = preflight?.dualPlan?.arcadia;
+            const refreshedAltenarLeg = preflight?.dualPlan?.altenar;
+            if (!refreshedArcadiaLeg?.opportunity || !refreshedAltenarLeg?.opportunity) {
+                alert('⛔ Pre-flight dual abortado: plan refrescado inválido para ejecutar Arcadia + Altenar.');
+                await fetchData({ forceBookyRefresh: true });
+                return;
+            }
+
+            const existingAfterPreflight = findOpenArcadiaExposureForOpportunity(refreshedArcadiaLeg.opportunity);
+            if (existingAfterPreflight) {
+                const providerBetIdTxt = String(existingAfterPreflight?.providerBetId || '').trim() || 'n/a';
+                alert(
+                    '⚠️ Ejecución dual bloqueada tras pre-flight para evitar duplicado Arcadia.\n\n' +
+                    `ticket local: ${existingAfterPreflight?.id || 'n/a'} | providerBetId: ${providerBetIdTxt}`
+                );
+                return;
+            }
+
             const arcadiaResult = await runProviderRealPlacement({
                 provider: 'pinnacle',
-                opportunity: arcadiaLeg.opportunity,
+                opportunity: refreshedArcadiaLeg.opportunity,
                 confirmMode: 'confirm-fast'
             });
 
@@ -2225,7 +2375,7 @@ function App() {
 
             const altenarResult = await runProviderRealPlacement({
                 provider: 'booky',
-                opportunity: altenarLeg.opportunity,
+                opportunity: refreshedAltenarLeg.opportunity,
                 confirmMode: 'confirm-fast'
             });
 
