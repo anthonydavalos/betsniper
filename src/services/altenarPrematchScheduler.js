@@ -3,21 +3,90 @@ import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../con
 import db, { initDB } from '../db/database.js';
 import { ingestAltenarPrematch } from '../../scripts/ingest-altenar.js';
 
+const toPositiveInt = (value, fallback, min = 1) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    const rounded = Math.floor(parsed);
+    if (!Number.isFinite(rounded) || rounded < min) return fallback;
+    return rounded;
+};
+
+const toBoolean = (value, fallback = false) => {
+    if (value === undefined || value === null || value === '') return fallback;
+    const normalized = String(value).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+};
+
 const DISCOVERY_BASE_MS = 12 * 60 * 1000;
 const DISCOVERY_JITTER_MS = 3 * 60 * 1000;
-const LOOP_TICK_MS = 20000;
-const MAX_CONCURRENCY = 3;
-const MAX_EVENTS_PER_TICK = 6;
+const LOOP_TICK_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_LOOP_TICK_MS, 20000, 3000);
+const MAX_CONCURRENCY_BASE = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_MAX_CONCURRENCY, 3, 1);
+const MAX_EVENTS_PER_TICK_BASE = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_MAX_EVENTS_PER_TICK, 6, 1);
+const BURST_ENABLED = toBoolean(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_ENABLED, true);
+const MAX_CONCURRENCY_BURST = Math.max(
+    MAX_CONCURRENCY_BASE,
+    toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_MAX_CONCURRENCY, 6, 1)
+);
+const MAX_EVENTS_PER_TICK_BURST = Math.max(
+    MAX_EVENTS_PER_TICK_BASE,
+    toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_MAX_EVENTS_PER_TICK, 14, 1)
+);
+const BURST_WINDOW_MINUTES = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_WINDOW_MINUTES, 120, 10);
+const BURST_STALE_THRESHOLD_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_STALE_THRESHOLD_MS, 6 * 60 * 1000, 60000);
+const BURST_MIN_LINKED_STALE = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_MIN_LINKED_STALE, 8, 1);
+const CAPACITY_LOG_INTERVAL_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_CAPACITY_LOG_INTERVAL_MS, 60000, 5000);
+const DETAIL_CANDIDATE_PAST_GRACE_MS = 10 * 60 * 1000;
+const DETAIL_CANDIDATE_FUTURE_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 let schedulerStarted = false;
 let schedulerTimer = null;
 let isDetailRefreshRunning = false;
 let isDiscoveryRunning = false;
 let nextDiscoveryAt = 0;
+let lastCapacityLogAt = 0;
 
 const eventState = new Map();
 
 const nowMs = () => Date.now();
+
+const resolveSchedulerCapacity = ({ altenarEvents = [], linkedSet = new Set() } = {}) => {
+    const current = nowMs();
+    const burstWindowEnd = current + (BURST_WINDOW_MINUTES * 60 * 1000);
+
+    let linkedNearWindow = 0;
+    let linkedNearWindowStale = 0;
+
+    for (const event of altenarEvents) {
+        const id = String(event?.id || '').trim();
+        if (!id || !linkedSet.has(id)) continue;
+
+        const startTs = new Date(event?.startDate || 0).getTime();
+        if (!Number.isFinite(startTs)) continue;
+        if (startTs < (current - DETAIL_CANDIDATE_PAST_GRACE_MS) || startTs > burstWindowEnd) continue;
+
+        linkedNearWindow += 1;
+        const updatedTs = new Date(event?.lastUpdated || 0).getTime();
+        const isStale = !Number.isFinite(updatedTs) || (current - updatedTs) > BURST_STALE_THRESHOLD_MS;
+        if (isStale) linkedNearWindowStale += 1;
+    }
+
+    const shouldBurst = BURST_ENABLED && linkedNearWindowStale >= BURST_MIN_LINKED_STALE;
+
+    return {
+        shouldBurst,
+        maxConcurrency: shouldBurst ? MAX_CONCURRENCY_BURST : MAX_CONCURRENCY_BASE,
+        maxEventsPerTick: shouldBurst ? MAX_EVENTS_PER_TICK_BURST : MAX_EVENTS_PER_TICK_BASE,
+        metrics: {
+            linkedNearWindow,
+            linkedNearWindowStale,
+            burstWindowMinutes: BURST_WINDOW_MINUTES,
+            staleThresholdMs: BURST_STALE_THRESHOLD_MS,
+            staleMinLinkedEvents: BURST_MIN_LINKED_STALE
+        }
+    };
+};
 
 const flattenOddIds = (market) => {
     if (!market) return [];
@@ -203,7 +272,79 @@ const extractOddsFromDetails = (details, eventName = '') => {
     return safeOdds;
 };
 
-const buildCandidates = (altenarEvents, linkedSet) => {
+export const refreshAltenarEventDetailsNow = async ({ eventId } = {}) => {
+    const normalizedId = String(eventId || '').trim();
+    if (!normalizedId) {
+        return {
+            success: false,
+            code: 'MISSING_EVENT_ID',
+            message: 'eventId es obligatorio para refrescar Altenar.'
+        };
+    }
+
+    await initDB();
+    await db.read();
+
+    const rows = Array.isArray(db.data?.altenarUpcoming) ? db.data.altenarUpcoming : [];
+    const idx = rows.findIndex((row) => String(row?.id || '').trim() === normalizedId);
+    if (idx < 0) {
+        return {
+            success: false,
+            code: 'EVENT_NOT_FOUND',
+            message: `No existe evento Altenar ${normalizedId} en cache local.`
+        };
+    }
+
+    const target = rows[idx];
+
+    try {
+        const { data } = await altenarClient.get(
+            '/GetEventDetails',
+            getAltenarPublicRequestConfig({ eventId: target.id, _: Date.now() })
+        );
+
+        const extracted = extractOddsFromDetails(data, target.name);
+        const previousHash = JSON.stringify(target?.odds || {});
+        const nextHash = JSON.stringify(extracted || {});
+        const changed = previousHash !== nextHash;
+        const updatedAt = new Date().toISOString();
+
+        target.odds = extracted;
+        target.lastUpdated = updatedAt;
+        rows[idx] = target;
+        db.data.altenarUpcoming = rows;
+        db.data.altenarLastUpdate = updatedAt;
+        await db.write();
+
+        const startTs = new Date(target?.startDate || 0).getTime();
+        const minutesToStart = Number.isFinite(startTs)
+            ? Math.max(0, (startTs - nowMs()) / 60000)
+            : 360;
+        eventState.set(normalizedId, {
+            failCount: 0,
+            lastHash: nextHash,
+            nextDueAt: nowMs() + getDetailIntervalMs(minutesToStart)
+        });
+
+        return {
+            success: true,
+            code: 'REFRESH_OK',
+            eventId: normalizedId,
+            changed,
+            updatedAt
+        };
+    } catch (error) {
+        maybeAutoRenewWidgetToken(error, `altenarPrematchScheduler.onDemand:${normalizedId}`);
+        return {
+            success: false,
+            code: 'GET_EVENT_DETAILS_FAILED',
+            eventId: normalizedId,
+            message: error?.message || 'Fallo refrescando GetEventDetails en Altenar.'
+        };
+    }
+};
+
+const buildCandidates = (altenarEvents, linkedSet, maxEventsPerTick = MAX_EVENTS_PER_TICK_BASE) => {
     const current = nowMs();
 
     return altenarEvents
@@ -211,8 +352,8 @@ const buildCandidates = (altenarEvents, linkedSet) => {
             if (!ev?.id || !ev?.startDate) return false;
             const ts = new Date(ev.startDate).getTime();
             if (!Number.isFinite(ts)) return false;
-            if (ts < current - 10 * 60 * 1000) return false;
-            if (ts > current + 12 * 60 * 60 * 1000) return false;
+            if (ts < current - DETAIL_CANDIDATE_PAST_GRACE_MS) return false;
+            if (ts > current + DETAIL_CANDIDATE_FUTURE_WINDOW_MS) return false;
             return true;
         })
         .map(ev => {
@@ -236,7 +377,7 @@ const buildCandidates = (altenarEvents, linkedSet) => {
             if (a.minutesToStart !== b.minutesToStart) return a.minutesToStart - b.minutesToStart;
             return a.dueAt - b.dueAt;
         })
-        .slice(0, MAX_EVENTS_PER_TICK);
+        .slice(0, Math.max(1, Number(maxEventsPerTick || MAX_EVENTS_PER_TICK_BASE)));
 };
 
 const runWithConcurrency = async (items, worker, concurrency = 4) => {
@@ -292,7 +433,19 @@ const refreshDueEventDetails = async () => {
                 .map(m => String(m.altenarId))
         );
 
-        const candidates = buildCandidates(altenarEvents, linkedSet);
+        const capacity = resolveSchedulerCapacity({ altenarEvents, linkedSet });
+
+        const mustLogCapacity = capacity.shouldBurst || (nowMs() - lastCapacityLogAt) >= CAPACITY_LOG_INTERVAL_MS;
+        if (mustLogCapacity) {
+            const mode = capacity.shouldBurst ? 'BURST' : 'BASE';
+            console.log(
+                `🧠 [Altenar Scheduler] Capacity=${mode} | conc=${capacity.maxConcurrency} | batch=${capacity.maxEventsPerTick} | ` +
+                `linked<=${capacity.metrics.burstWindowMinutes}m: ${capacity.metrics.linkedNearWindow} | stale: ${capacity.metrics.linkedNearWindowStale}`
+            );
+            lastCapacityLogAt = nowMs();
+        }
+
+        const candidates = buildCandidates(altenarEvents, linkedSet, capacity.maxEventsPerTick);
         if (candidates.length === 0) return;
 
         const byId = new Map(altenarEvents.map(ev => [String(ev.id), ev]));
@@ -339,7 +492,7 @@ const refreshDueEventDetails = async () => {
                 });
                 return null;
             }
-        }, MAX_CONCURRENCY);
+        }, capacity.maxConcurrency);
 
         for (const update of updates) {
             if (!update) continue;
@@ -357,7 +510,10 @@ const refreshDueEventDetails = async () => {
         }
 
         if (requestCount > 0) {
-            console.log(`📈 [Altenar Scheduler] Details refreshed: ${requestCount} req, ${changedCount} cambios.`);
+            console.log(
+                `📈 [Altenar Scheduler] Details refreshed: ${requestCount} req, ${changedCount} cambios ` +
+                `(conc=${capacity.maxConcurrency}, batch=${capacity.maxEventsPerTick}, burst=${capacity.shouldBurst ? 'on' : 'off'}).`
+            );
         }
     } catch (error) {
         console.error(`❌ [Altenar Scheduler] Detail refresh error: ${error.message}`);
@@ -383,6 +539,10 @@ export const startAltenarPrematchAdaptiveScheduler = () => {
     nextDiscoveryAt = 0;
 
     console.log('🧠 Altenar Prematch Scheduler Adaptativo iniciado (cola + prioridad temporal).');
+    console.log(
+        `⚙️ [Altenar Scheduler] Config | tick=${LOOP_TICK_MS}ms | base(conc=${MAX_CONCURRENCY_BASE},batch=${MAX_EVENTS_PER_TICK_BASE}) ` +
+        `| burst=${BURST_ENABLED ? 'on' : 'off'}(conc=${MAX_CONCURRENCY_BURST},batch=${MAX_EVENTS_PER_TICK_BURST})`
+    );
     schedulerLoop();
 };
 

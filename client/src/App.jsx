@@ -1991,8 +1991,40 @@ function App() {
             .sort((a, b) => Number(b?.stake || 0) - Number(a?.stake || 0))[0] || null;
     };
 
+    const buildArbitrageFallbackLegs1x2 = (op = {}) => {
+        return [
+            {
+                market: '1x2',
+                selection: 'Home',
+                provider: op?.odds?.best?.home?.provider,
+                odd: op?.odds?.best?.home?.odd
+            },
+            {
+                market: '1x2',
+                selection: 'Draw',
+                provider: op?.odds?.best?.draw?.provider,
+                odd: op?.odds?.best?.draw?.odd
+            },
+            {
+                market: '1x2',
+                selection: 'Away',
+                provider: op?.odds?.best?.away?.provider,
+                odd: op?.odds?.best?.away?.odd
+            }
+        ].filter((leg) => Number.isFinite(Number(leg?.odd)) && Number(leg?.odd) > 1);
+    };
+
     const buildDualExecutionPlan = (op = {}, legs = []) => {
-        const normalizedLegs = Array.isArray(legs) ? legs : [];
+        const providedLegs = Array.isArray(legs) ? legs : [];
+        const normalizedLegs = providedLegs.length > 0 ? providedLegs : buildArbitrageFallbackLegs1x2(op);
+
+        const hasArcadiaLegDeclared = normalizedLegs.some((leg) => normalizeArbitrageProviderBucket(leg?.provider || '') === 'arcadia');
+        const hasAltenarLegDeclared = normalizedLegs.some((leg) => normalizeArbitrageProviderBucket(leg?.provider || '') === 'altenar');
+        const hasArcadiaUnsupportedMarket = normalizedLegs.some((leg) => {
+            const bucket = normalizeArbitrageProviderBucket(leg?.provider || '');
+            const market = String(leg?.market || '').trim();
+            return bucket === 'arcadia' && market !== '1x2';
+        });
 
         const arcadiaCandidates = normalizedLegs
             .map((leg, legIdx) => {
@@ -2024,9 +2056,18 @@ function App() {
         const altenar = pickMaxStakeLeg(altenarCandidates);
 
         if (!arcadia || !altenar) {
+            let reason = 'requires-arcadia-and-altenar-legs';
+            if (hasArcadiaUnsupportedMarket && !arcadia) {
+                reason = 'arcadia-market-unsupported';
+            } else if (hasArcadiaLegDeclared && !hasAltenarLegDeclared) {
+                reason = 'missing-altenar-leg';
+            } else if (hasAltenarLegDeclared && !hasArcadiaLegDeclared) {
+                reason = 'missing-arcadia-leg';
+            }
+
             return {
                 canExecute: false,
-                reason: 'requires-arcadia-and-altenar-legs',
+                reason,
                 arcadia: arcadia || null,
                 altenar: altenar || null
             };
@@ -2151,15 +2192,33 @@ function App() {
 
         await fetchPrematchData({ force: true });
 
+        const refreshAltenarEventId = String(baseOpportunity?.eventId || '').trim();
+        const preflightParams = {
+            limit: ARBITRAGE_PREVIEW_LIMIT,
+            bankroll: riskContext.stakeBankroll > 0 ? riskContext.stakeBankroll : undefined,
+            minRoiPercent: riskContext.minRoiPercent,
+            minProfitAbs: riskContext.minProfitAbs,
+            ...(refreshAltenarEventId
+                ? {
+                    refreshAltenarNow: 1,
+                    refreshAltenarEventId
+                }
+                : {})
+        };
+
         const arbitrageRes = await axios.get('/api/opportunities/arbitrage/preview', {
-            params: {
-                limit: ARBITRAGE_PREVIEW_LIMIT,
-                bankroll: riskContext.stakeBankroll > 0 ? riskContext.stakeBankroll : undefined,
-                minRoiPercent: riskContext.minRoiPercent,
-                minProfitAbs: riskContext.minProfitAbs
-            },
+            params: preflightParams,
             timeout: 25000
         });
+
+        const altenarOnDemandRefresh = arbitrageRes?.data?.onDemandRefresh?.altenarEvent || null;
+        if (refreshAltenarEventId && (!altenarOnDemandRefresh || altenarOnDemandRefresh?.success !== true)) {
+            return {
+                ok: false,
+                reason: 'altenar-refresh-failed',
+                message: `No se pudo refrescar cuota Altenar en tiempo real antes de ejecutar (${altenarOnDemandRefresh?.message || 'sin detalle'}).`
+            };
+        }
 
         const rows = Array.isArray(arbitrageRes?.data?.data) ? arbitrageRes.data.data : [];
         const refreshedOpportunity = rows.find((row) => isSameArbitrageOpportunity(baseOpportunity, row)) || null;
@@ -2197,10 +2256,13 @@ function App() {
         const refreshedLegs = Array.isArray(refreshedOpportunity?.legs) ? refreshedOpportunity.legs : [];
         const dualPlan = buildDualExecutionPlan(refreshedOpportunity, refreshedLegs);
         if (!dualPlan?.canExecute) {
+            const unsupportedArcadiaMsg = 'La pata Arcadia refrescada usa un mercado no soportado en dual (actualmente solo 1x2 en Arcadia).';
             return {
                 ok: false,
                 reason: dualPlan?.reason || 'dual-plan-invalid',
-                message: 'La oportunidad refrescada ya no tiene patas Arcadia + Altenar ejecutables.',
+                message: dualPlan?.reason === 'arcadia-market-unsupported'
+                    ? unsupportedArcadiaMsg
+                    : 'La oportunidad refrescada ya no tiene patas Arcadia + Altenar ejecutables.',
                 refreshedOpportunity,
                 riskContext
             };
@@ -2436,6 +2498,82 @@ function App() {
                     `ticket local: ${existingAfterPreflight?.id || 'n/a'} | providerBetId: ${providerBetIdTxt}`
                 );
                 return;
+            }
+
+            const refreshedProviderSplit = buildArbitrageProviderSplit(
+                preflight?.refreshedOpportunity || op,
+                preflight?.refreshedLegs || []
+            );
+            const refreshedLiquidityGuard = resolveArbitrageLiquidityGuard({ providerSplit: refreshedProviderSplit });
+            if (!refreshedLiquidityGuard?.canFund) {
+                setArbitrageDualPreflightAudit(executionKey, {
+                    status: 'blocked',
+                    reason: 'liquidity-insufficient-after-preflight',
+                    message: 'Saldo insuficiente por provider según split refrescado. Se aborta antes de Arcadia para evitar hedge.',
+                    baseRoi,
+                    baseProfit,
+                    liveRoi: preflight?.liveRoi ?? null,
+                    liveProfit: preflight?.liveProfit ?? null
+                });
+
+                alert(
+                    '⛔ Ejecución dual abortada por liquidez (snapshot refrescado)\n\n' +
+                    `Requerido Altenar: S/. ${Number(refreshedLiquidityGuard?.altenarRequired || 0).toFixed(2)} vs disponible: ${refreshedLiquidityGuard?.bookyCurrency} ${Number(refreshedLiquidityGuard?.bookyAvailable || 0).toFixed(2)}\n` +
+                    `Requerido Arcadia: S/. ${Number(refreshedLiquidityGuard?.arcadiaRequired || 0).toFixed(2)} vs disponible: ${refreshedLiquidityGuard?.pinnacleCurrency} ${Number(refreshedLiquidityGuard?.pinnacleAvailable || 0).toFixed(2)}`
+                );
+                await refreshArbitrageWithPrematch();
+                await fetchData({ forceBookyRefresh: true });
+                return;
+            }
+
+            try {
+                const tokenRes = await axios.get('/api/booky/token-health', { timeout: 5000 });
+                if (tokenRes?.data?.success) {
+                    const latestToken = tokenRes.data.token || null;
+                    setTokenHealth(latestToken);
+
+                    const remainingMinutes = (() => {
+                        const expMs = new Date(latestToken?.expIso || 0).getTime();
+                        if (Number.isFinite(expMs) && expMs > 0) {
+                            return Number(((expMs - Date.now()) / 60000).toFixed(2));
+                        }
+                        const fallback = Number(latestToken?.remainingMinutes);
+                        return Number.isFinite(fallback) ? fallback : NaN;
+                    })();
+
+                    const minRequiredMinutes = Number(latestToken?.minRequiredMinutes || 2);
+                    const tokenReady = Boolean(
+                        latestToken?.exists &&
+                        latestToken?.jwtValid &&
+                        latestToken?.authenticated &&
+                        !latestToken?.expired &&
+                        Number.isFinite(remainingMinutes) &&
+                        remainingMinutes >= minRequiredMinutes
+                    );
+
+                    if (!tokenReady) {
+                        setArbitrageDualPreflightAudit(executionKey, {
+                            status: 'blocked',
+                            reason: 'booky-token-not-ready',
+                            message: `Token Altenar no apto (remaining=${Number.isFinite(remainingMinutes) ? remainingMinutes.toFixed(2) : 'n/a'} min, mínimo=${Number(minRequiredMinutes || 0).toFixed(2)}).`,
+                            baseRoi,
+                            baseProfit,
+                            liveRoi: preflight?.liveRoi ?? null,
+                            liveProfit: preflight?.liveProfit ?? null
+                        });
+
+                        alert(
+                            '⛔ Ejecución dual abortada antes de Arcadia\n\n' +
+                            `Token Altenar no apto. Remaining: ${Number.isFinite(remainingMinutes) ? remainingMinutes.toFixed(2) : 'n/a'} min | mínimo requerido: ${Number(minRequiredMinutes || 0).toFixed(2)} min.\n` +
+                            `Acción: renueva token y reintenta para evitar HEDGE_REQUIRED.`
+                        );
+                        await refreshArbitrageWithPrematch();
+                        await fetchData({ forceBookyRefresh: true });
+                        return;
+                    }
+                }
+            } catch (_) {
+                // Si token-health falla, no bloquear ciegamente: seguirá validando en backend al confirmar Booky.
             }
 
             const arcadiaResult = await runProviderRealPlacement({
@@ -5162,6 +5300,9 @@ function App() {
                                         if (dualPlan?.reason === 'match-started') {
                                             return 'No ejecutable en dual: el partido ya inició (prematch expirado).';
                                         }
+                                        if (dualPlan?.reason === 'arcadia-market-unsupported') {
+                                            return 'No ejecutable en dual: Arcadia en esta fase solo soporta 1x2 (no Double Chance).';
+                                        }
                                         return 'No ejecutable en dual: requiere pata Arcadia + pata Altenar válidas';
                                     })();
 
@@ -5513,6 +5654,26 @@ function App() {
                                             ? (op?.price || op?.odd || 0)
                                             : (betData?.price || betData?.odd || op?.price || op?.odd || 0)
                                     );
+                                    const displayProviderRaw = String(
+                                        executionStatus === 'PENDING'
+                                            ? (op?.placementProvider || op?.provider || '')
+                                            : (betData?.placementProvider || betData?.provider || op?.placementProvider || op?.provider || '')
+                                    ).trim();
+                                    const displayProviderBucket = normalizeArbitrageProviderBucket(displayProviderRaw);
+                                    const altDisplayOdd = (displayProviderBucket === 'altenar' && Number.isFinite(displayOdd) && displayOdd > 1)
+                                        ? displayOdd
+                                        : null;
+                                    const pinDisplayOdd = (() => {
+                                        if (displayProviderBucket === 'arcadia' && Number.isFinite(displayOdd) && displayOdd > 1) {
+                                            return displayOdd;
+                                        }
+                                        if (Number.isFinite(effectivePinnaclePrice) && effectivePinnaclePrice > 1) {
+                                            return effectivePinnaclePrice;
+                                        }
+                                        return null;
+                                    })();
+                                    const showTrendOnAlt = Boolean(isLive && executionStatus === 'PENDING' && displayProviderBucket === 'altenar');
+                                    const showTrendOnPin = Boolean(isLive && executionStatus === 'PENDING' && displayProviderBucket === 'arcadia');
                                     const acceptedOdd = Number(betData?.price || betData?.odd || op?.price || op?.odd || 0);
                                     const candidateOdd = Number(liveCandidate?.price || liveCandidate?.odd || 0);
                                     const candidateEv = Number(liveCandidate?.ev);
@@ -5715,61 +5876,36 @@ function App() {
                                         </td>
                                         <td className="p-3 text-center">
                                             <div className="flex flex-col gap-1.5 items-center justify-center">
-                                                {/* 1. PINNACLE (Azul - Referencia Live Sharp) */}
-                                                <div className="flex flex-col items-center min-h-[2.5em] justify-center relative gap-1">
-                                                    
-                                                    {/* SOLO MOSTRAR SI HAY CUOTA LIVE DE PINNACLE */}
-                                                    {(effectivePinnaclePrice && effectivePinnaclePrice > 1) ? (
-                                                        <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-blue-500/10 border border-blue-500/20 w-fit relative overflow-visible shadow-[0_0_10px_rgba(59,130,246,0.05)]" title="Pinnacle (Cuota en Vivo - Snapshot)">
-                                                            <span className="text-[9px] font-bold text-blue-400 tracking-tighter">PIN</span>
-                                                            <span className="font-mono font-bold text-sm text-blue-300 leading-none">{effectivePinnaclePrice.toFixed(2)}</span>
-                                                            
-                                                            {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) - Modificado para parpadear igual que Altenar */}
-                                                            {(executionStatus === 'PENDING' && op.trend === 'UP') ? (
-                                                                <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
-                                                                    ▲
-                                                                </span>
-                                                            ) : (executionStatus === 'PENDING' && op.trend === 'DOWN') ? (
-                                                                <span className="absolute -top-1 -right-1 text-red-500 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
-                                                                    ▼
-                                                                </span>
-                                                            ) : (
-                                                                // Si no hay tendencia, mostramos el punto rojo parpadeante (LIVE STANDARD)
-                                                                <span className="absolute -top-1 -right-1 flex h-2 w-2 z-50">
-                                                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                                                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500 border border-slate-900 shadow-sm" title="Live Market Source"></span>
-                                                                </span>
-                                                            )}
-                                                        </div>
-                                                    ) : (
-                                                        // Si no hay cuota live, mostrar placeholder "OFF" discreto para mantener alineación
-                                                        <div className="px-2 py-1 rounded bg-slate-800/30 border border-slate-700/30 min-w-15 flex justify-center opacity-50">
-                                                            <span className="text-[8px] text-slate-600 font-bold">PIN OFF</span>
-                                                        </div>
+                                                {/* 1. ALTENAR */}
+                                                <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 w-fit relative shadow-[0_0_10px_rgba(16,185,129,0.05)]" title="Cuota Altenar/Booky">
+                                                    <span className="text-[9px] font-bold text-emerald-600/80 tracking-tighter">ALT</span>
+                                                    <span className="font-mono font-bold text-sm text-emerald-400 leading-none flex items-center gap-0.5">
+                                                        {Number.isFinite(altDisplayOdd) ? altDisplayOdd.toFixed(2) : 'OFF'}
+                                                    </span>
+                                                    {showTrendOnAlt && (
+                                                        op.trend === 'UP' ? (
+                                                            <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">▲</span>
+                                                        ) : op.trend === 'DOWN' ? (
+                                                            <span className="absolute -top-1 -right-1 text-red-500 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">▼</span>
+                                                        ) : (
+                                                            <span className="absolute -top-1 -right-1 flex h-2 w-2 z-50">
+                                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                                                <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500 border border-slate-900 shadow-sm"></span>
+                                                            </span>
+                                                        )
                                                     )}
                                                 </div>
 
-                                                {/* 2. ALTENAR (Color Distinto - Target Bookie API) */}
-                                                <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 w-fit relative shadow-[0_0_10px_rgba(16,185,129,0.05)]" title="Altenar API (DoradoBet, Atlantic City, etc.)">
-                                                    <span className="text-[9px] font-bold text-emerald-600/80 tracking-tighter">ALT</span>
-                                                    <span className="font-mono font-bold text-sm text-emerald-400 leading-none flex items-center gap-0.5">
-                                                        {displayOdd.toFixed(2)}
-                                                    </span>
-                                                    
-                                                    {/* INDICADORES LIVE O TENDENCIA (MISMA POSICIÓN) */}
-                                                    {isLive && executionStatus === 'PENDING' && (
+                                                {/* 2. PINNACLE */}
+                                                <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-blue-500/10 border border-blue-500/20 w-fit relative overflow-visible shadow-[0_0_10px_rgba(59,130,246,0.05)]" title="Cuota Pinnacle/Arcadia">
+                                                    <span className="text-[9px] font-bold text-blue-400 tracking-tighter">PIN</span>
+                                                    <span className="font-mono font-bold text-sm text-blue-300 leading-none">{Number.isFinite(pinDisplayOdd) ? pinDisplayOdd.toFixed(2) : 'OFF'}</span>
+                                                    {showTrendOnPin && (
                                                         op.trend === 'UP' ? (
-                                                            // Flecha Arriba (Verde) - Sin círculo
-                                                            <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
-                                                                ▲
-                                                            </span>
+                                                            <span className="absolute -top-1 -right-1 text-emerald-400 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">▲</span>
                                                         ) : op.trend === 'DOWN' ? (
-                                                            // Flecha Abajo (Roja) - Sin círculo
-                                                            <span className="absolute -top-1 -right-1 text-red-500 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">
-                                                                ▼
-                                                            </span>
+                                                            <span className="absolute -top-1 -right-1 text-red-500 text-[8px] z-50 drop-shadow-sm font-bold animate-pulse leading-none">▼</span>
                                                         ) : (
-                                                            // Si no hay tendencia, mostramos el punto rojo standard (ESTILO PINNACLE)
                                                             <span className="absolute -top-1 -right-1 flex h-2 w-2 z-50">
                                                                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
                                                                 <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500 border border-slate-900 shadow-sm"></span>
