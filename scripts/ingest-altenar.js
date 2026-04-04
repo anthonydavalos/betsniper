@@ -1,6 +1,6 @@
 import altenarClient from '../src/config/axiosClient.js';
 import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../src/config/altenarPublicConfig.js';
-import db, { initDB } from '../src/db/database.js';
+import db, { initDB, writeDBWithRetry } from '../src/db/database.js';
 
 import { fileURLToPath } from 'url';
 
@@ -194,7 +194,7 @@ export const ingestAltenarPrematch = async (force = false) => {
     db.data.altenarUpcoming = finalEventList;
     db.data.lastUpdate = new Date().toISOString(); // Master update
     db.data.altenarLastUpdate = new Date().toISOString(); // Específico
-    await db.write();
+    await writeDBWithRetry();
 
     console.log('✅ INGESTA ALTENAR COMPLETADA.');
 
