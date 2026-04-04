@@ -2414,6 +2414,7 @@ function App() {
                     `⛔ Pre-flight dual abortado${reasonCode}\n\n` +
                     `${preflight?.message || 'La oportunidad ya no cumple umbrales de ejecución.'}`
                 );
+                await refreshArbitrageWithPrematch();
                 await fetchData({ forceBookyRefresh: true });
                 return;
             }
@@ -2422,6 +2423,7 @@ function App() {
             const refreshedAltenarLeg = preflight?.dualPlan?.altenar;
             if (!refreshedArcadiaLeg?.opportunity || !refreshedAltenarLeg?.opportunity) {
                 alert('⛔ Pre-flight dual abortado: plan refrescado inválido para ejecutar Arcadia + Altenar.');
+                await refreshArbitrageWithPrematch();
                 await fetchData({ forceBookyRefresh: true });
                 return;
             }
