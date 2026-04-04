@@ -130,6 +130,17 @@ const ARBITRAGE_HEALTH_ALERT_HOURS = (() => {
     return Number.isFinite(raw) && raw > 0 ? raw : 6;
 })();
 
+const ALERT_MASTER_GAIN = (() => {
+    const raw = Number(import.meta?.env?.VITE_ALERT_MASTER_GAIN);
+    if (Number.isFinite(raw) && raw > 0) return Math.min(4, raw);
+    return 2.2;
+})();
+
+const ALERT_SCANDALOUS_MODE = (() => {
+    const raw = String(import.meta?.env?.VITE_ALERT_SCANDALOUS_MODE || 'true').trim().toLowerCase();
+    return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
+})();
+
 const normalizeFinishedProviderFilter = (value = 'ALL') => {
     const normalized = String(value || '').trim().toUpperCase();
     return FINISHED_PROVIDER_FILTER_ALLOWED.includes(normalized) ? normalized : 'ALL';
@@ -748,20 +759,37 @@ function playAlert(kind = 'DEFAULT') {
     if (!AudioContext) return;
     
     const ctx = new AudioContext();
+    if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+    }
+
+        // Cadena de salida con compresión + ganancia master para mejorar loudness percibido.
+        const masterGain = ctx.createGain();
+        const compressor = ctx.createDynamicsCompressor();
+
+        masterGain.gain.setValueAtTime(ALERT_MASTER_GAIN, ctx.currentTime);
+        compressor.threshold.setValueAtTime(-22, ctx.currentTime);
+        compressor.knee.setValueAtTime(26, ctx.currentTime);
+        compressor.ratio.setValueAtTime(10, ctx.currentTime);
+        compressor.attack.setValueAtTime(0.003, ctx.currentTime);
+        compressor.release.setValueAtTime(0.18, ctx.currentTime);
+
+        masterGain.connect(compressor);
+        compressor.connect(ctx.destination);
 
         const playTone = ({
             start,
             duration,
             fromFreq,
             toFreq,
-            volume = 0.08,
+            volume = 0.14,
             type = 'sine'
         }) => {
             const osc = ctx.createOscillator();
             const gain = ctx.createGain();
 
             osc.connect(gain);
-            gain.connect(ctx.destination);
+            gain.connect(masterGain);
 
             osc.type = type;
             osc.frequency.setValueAtTime(fromFreq, ctx.currentTime + start);
@@ -777,17 +805,29 @@ function playAlert(kind = 'DEFAULT') {
 
         // Sonido estándar para LIVE_VALUE
         if (kind === 'SNIPE') {
-            // Sonido más distintivo para LIVE_SNIPE (doble ping rápido y más agudo)
-            playTone({ start: 0, duration: 0.14, fromFreq: 780, toFreq: 1180, volume: 0.11, type: 'triangle' });
-            playTone({ start: 0.18, duration: 0.16, fromFreq: 980, toFreq: 1480, volume: 0.1, type: 'triangle' });
+            if (ALERT_SCANDALOUS_MODE) {
+                // Perfil agresivo: patrón tipo alarma para oportunidades LIVE_SNIPE.
+                playTone({ start: 0.00, duration: 0.12, fromFreq: 900, toFreq: 1420, volume: 0.22, type: 'square' });
+                playTone({ start: 0.16, duration: 0.12, fromFreq: 1020, toFreq: 1600, volume: 0.22, type: 'square' });
+                playTone({ start: 0.34, duration: 0.16, fromFreq: 760, toFreq: 520, volume: 0.2, type: 'sawtooth' });
+                playTone({ start: 0.56, duration: 0.18, fromFreq: 1180, toFreq: 1700, volume: 0.2, type: 'square' });
+            } else {
+                playTone({ start: 0, duration: 0.14, fromFreq: 780, toFreq: 1180, volume: 0.15, type: 'triangle' });
+                playTone({ start: 0.18, duration: 0.16, fromFreq: 980, toFreq: 1480, volume: 0.14, type: 'triangle' });
+            }
         } else {
-            playTone({ start: 0, duration: 0.45, fromFreq: 500, toFreq: 1000, volume: 0.08, type: 'sine' });
+            if (ALERT_SCANDALOUS_MODE) {
+                playTone({ start: 0.00, duration: 0.20, fromFreq: 620, toFreq: 980, volume: 0.18, type: 'triangle' });
+                playTone({ start: 0.24, duration: 0.22, fromFreq: 740, toFreq: 1180, volume: 0.16, type: 'triangle' });
+            } else {
+                playTone({ start: 0, duration: 0.45, fromFreq: 500, toFreq: 1000, volume: 0.12, type: 'sine' });
+            }
         }
 
         // Cerrar contexto para evitar fugas
         setTimeout(() => {
             try { ctx.close(); } catch (_) {}
-        }, 900);
+        }, 1300);
   } catch (e) {
     console.error("Audio play failed", e);
   }
