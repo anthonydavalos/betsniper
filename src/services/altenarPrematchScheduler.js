@@ -1,6 +1,6 @@
 import altenarClient from '../config/axiosClient.js';
 import { getAltenarPublicRequestConfig, maybeAutoRenewWidgetToken } from '../config/altenarPublicConfig.js';
-import db, { initDB } from '../db/database.js';
+import db, { initDB, writeDBWithRetry } from '../db/database.js';
 import { ingestAltenarPrematch } from '../../scripts/ingest-altenar.js';
 
 const toPositiveInt = (value, fallback, min = 1) => {
@@ -314,7 +314,7 @@ export const refreshAltenarEventDetailsNow = async ({ eventId } = {}) => {
         rows[idx] = target;
         db.data.altenarUpcoming = rows;
         db.data.altenarLastUpdate = updatedAt;
-        await db.write();
+        await writeDBWithRetry();
 
         const startTs = new Date(target?.startDate || 0).getTime();
         const minutesToStart = Number.isFinite(startTs)
@@ -506,7 +506,7 @@ const refreshDueEventDetails = async () => {
         if (changedCount > 0) {
             db.data.altenarUpcoming = Array.from(byId.values()).sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
             db.data.altenarLastUpdate = new Date().toISOString();
-            await db.write();
+            await writeDBWithRetry();
         }
 
         if (requestCount > 0) {

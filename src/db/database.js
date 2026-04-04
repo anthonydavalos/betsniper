@@ -1,11 +1,13 @@
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import path from 'path';
+import { promises as fs } from 'fs';
 import { fileURLToPath } from 'url';
 
 // Configuración de rutas para ES Modules
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(__dirname, '../../db.json');
+const dbTmpPath = path.join(path.dirname(dbPath), `.${path.basename(dbPath)}.tmp`);
 
 // Estructura por defecto de la Base de Datos
 const defaultData = {
@@ -48,6 +50,7 @@ const defaultData = {
 // Inicialización de LowDB
 const adapter = new JSONFile(dbPath);
 const db = new Low(adapter, defaultData);
+const rawDbWrite = db.write.bind(db);
 let writeQueue = Promise.resolve();
 
 const wait = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
@@ -70,22 +73,55 @@ const isRetryableWriteError = (error) => {
 const runWriteWithRetry = async ({ maxAttempts = 8, baseDelayMs = 120 } = {}) => {
   let lastError = null;
 
+  const directWriteFallback = async ({ attempts = 3, delayMs = 180 } = {}) => {
+    let directLastError = null;
+    for (let i = 1; i <= attempts; i += 1) {
+      try {
+        const payload = JSON.stringify(db.data ?? defaultData, null, 2);
+        await fs.writeFile(dbPath, `${payload}\n`, 'utf8');
+        return { ok: true, mode: 'direct-write-fallback', attempt: i };
+      } catch (error) {
+        directLastError = error;
+        if (!isRetryableWriteError(error) || i === attempts) {
+          break;
+        }
+        const jitter = Math.floor(Math.random() * 70);
+        await wait(delayMs * i + jitter);
+      }
+    }
+    if (directLastError) throw directLastError;
+    throw lastError || new Error('Direct DB write fallback failed');
+  };
+
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      await db.write();
-      return { ok: true, attempt };
+      await rawDbWrite();
+      return { ok: true, mode: 'lowdb-rename', attempt };
     } catch (error) {
       lastError = error;
       if (!isRetryableWriteError(error) || attempt === maxAttempts) {
-        throw error;
+        break;
       }
+
+      // Limpieza defensiva del tmp de lowdb para reducir bloqueos residuales en Windows.
+      await fs.unlink(dbTmpPath).catch(() => {});
+
       const jitter = Math.floor(Math.random() * 80);
       await wait(baseDelayMs * attempt + jitter);
     }
   }
 
+  if (lastError && isRetryableWriteError(lastError)) {
+    const fallback = await directWriteFallback();
+    console.warn(
+      `⚠️ [DB] lowdb rename persistió con error (${lastError.code || 'n/a'}). ` +
+      `Aplicado fallback de escritura directa en intento ${fallback.attempt}.`
+    );
+    return fallback;
+  }
+
   if (lastError) throw lastError;
-  return { ok: false, attempt: maxAttempts };
+  return { ok: false, mode: 'unknown', attempt: maxAttempts };
 };
 
 export const writeDBWithRetry = async ({ maxAttempts = 8, baseDelayMs = 120 } = {}) => {
@@ -93,6 +129,11 @@ export const writeDBWithRetry = async ({ maxAttempts = 8, baseDelayMs = 120 } = 
   // Mantener cola viva aunque falle un write previo.
   writeQueue = op.catch(() => {});
   return op;
+};
+
+// Garantiza que TODO db.write() en el proyecto use cola + retry + fallback.
+db.write = async () => {
+  await writeDBWithRetry();
 };
 
 export const pruneStaleEventCaches = async ({

@@ -5710,7 +5710,7 @@ function App() {
                                                        <Clock className="w-3 h-3" />
                                                        {/* Live Timer - Prioridad a liveTime (actualizado en tiempo real) */}
                                                         {(() => {
-                                                            const rawClock = op.liveTime || effectivePinnacleInfo?.time || op.time || '';
+                                                            const rawClock = op.liveTime || betData?.liveTime || effectivePinnacleInfo?.time || op.time || '';
                                                             if (hasLiveClockSignal(rawClock)) return rawClock;
 
                                                             const normalizedMinutes = Number.isFinite(minutesElapsed)
@@ -5721,7 +5721,11 @@ function App() {
                                                     </span>
                                                     {/* SCORE con Prioridad a lastKnownScore (actualizado en tiempo real) */}
                                                     <span className="font-mono font-bold text-white text-xs pl-0.5">
-                                                        {op.lastKnownScore || effectivePinnacleInfo?.score || (Array.isArray(op.score) ? op.score.join(' - ') : op.score || '0 - 0')}
+                                                        {resolveBestScoreText(
+                                                            betData,
+                                                            op,
+                                                            { score: effectivePinnacleInfo?.score }
+                                                        ) || '0 - 0'}
                                                     </span>
                                                     <span className="text-[9px] text-slate-500 leading-tight" title="Hora de Inicio">
                                                         {formatTimeSafe(eventStartIso || op.matchDate || op.date)}

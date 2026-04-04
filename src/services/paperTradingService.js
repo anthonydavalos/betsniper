@@ -36,6 +36,29 @@ const parseLineFromText = (value = '') => {
     return Number.isFinite(n) ? n : NaN;
 };
 
+const normalizeTeamToken = (value = '') => String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\b(fc|sc|ac|cf|as|club)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const buildMatchKeys = (home = '', away = '') => {
+    const h = normalizeTeamToken(home);
+    const a = normalizeTeamToken(away);
+    if (!h || !a) return [];
+    if (h === a) return [`${h} vs ${a}`];
+    return [`${h} vs ${a}`, `${a} vs ${h}`];
+};
+
+const buildMatchKeysFromMatch = (match = '') => {
+    const parts = String(match || '').split(/\s+vs\.?\s+/i);
+    if (parts.length < 2) return [];
+    return buildMatchKeys(parts[0], parts[1]);
+};
+
 const isOverPick = (pick = '') => {
     const p = String(pick || '').toLowerCase();
     return p === 'over' || p.startsWith('over_');
@@ -253,19 +276,44 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
 
     // Mapa rápido para buscar eventos live por ID (o nombre como fallback)
     const liveMap = new Map();
+    const liveMapByNormalizedName = new Map();
     liveEvents.forEach(e => {
         liveMap.set(e.id, e);
         liveMap.set(e.name, e); // Fallback por nombre
+
+        const home = e?.homeName || e?.home || (String(e?.name || '').split(/\s+vs\.?\s+/i)[0] || '');
+        const away = e?.awayName || e?.away || (String(e?.name || '').split(/\s+vs\.?\s+/i)[1] || '');
+        const keys = buildMatchKeys(home, away);
+        keys.forEach((key) => {
+            if (!liveMapByNormalizedName.has(key)) {
+                liveMapByNormalizedName.set(key, e);
+            }
+        });
     });
     
     // [NEW] Mapa Rápido Pinnacle Live (ID -> Data)
     const pinLiveMap = new Map();
     const pinLiveByName = new Map();
+    const pinLiveByNormalizedName = new Map();
     
     if (Array.isArray(pinnacleLiveFeed)) {
         pinnacleLiveFeed.forEach(p => {
              pinLiveMap.set(String(p.id), p);
              if (p.match) pinLiveByName.set(p.match, p); 
+
+             const keysFromMatch = buildMatchKeysFromMatch(p.match || '');
+             keysFromMatch.forEach((key) => {
+                if (!pinLiveByNormalizedName.has(key)) {
+                    pinLiveByNormalizedName.set(key, p);
+                }
+             });
+
+             const keysFromTeams = buildMatchKeys(p.home || '', p.away || '');
+             keysFromTeams.forEach((key) => {
+                if (!pinLiveByNormalizedName.has(key)) {
+                    pinLiveByNormalizedName.set(key, p);
+                }
+             });
         });
     }
 
@@ -303,7 +351,19 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
         }
 
         // Intentar encontrar por ID primero, luego por Nombre
-        let liveEvent = bet.eventId ? liveMap.get(bet.eventId) : liveMap.get(bet.match);
+        let liveEvent = bet.eventId ? liveMap.get(bet.eventId) : null;
+        if (!liveEvent && bet.match) {
+            liveEvent = liveMap.get(bet.match) || null;
+        }
+        if (!liveEvent && bet.match) {
+            const betKeys = buildMatchKeysFromMatch(bet.match);
+            for (const key of betKeys) {
+                if (liveMapByNormalizedName.has(key)) {
+                    liveEvent = liveMapByNormalizedName.get(key);
+                    break;
+                }
+            }
+        }
 
         // Validar si el evento, aunque presente en el feed, ya indicó final (FT/Ended)
         let isFinishedInFeed = false;
@@ -328,6 +388,16 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             // 2. Try by Name Matching if ID missing
             else if (pinLiveByName.has(bet.match)) {
                  pinData = pinLiveByName.get(bet.match);
+              }
+              // 3. Try by Normalized Team Keys (handles prematch->live matchupId rollover)
+              else {
+                  const betKeys = buildMatchKeysFromMatch(bet.match || '');
+                  for (const key of betKeys) {
+                     if (pinLiveByNormalizedName.has(key)) {
+                        pinData = pinLiveByNormalizedName.get(key);
+                        break;
+                     }
+                  }
             }
 
             // --- DATA EXTRACTION ---
