@@ -7,6 +7,58 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.30] -- 2026-04-04 -- Sprint: Altenar On-Demand Refresh + Adaptive Scheduler Capacity
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Refresh Altenar on-demand por evento (GetEventDetails)
+- **`src/services/altenarPrematchScheduler.js`**:
+  - Nuevo helper exportado `refreshAltenarEventDetailsNow({ eventId })`.
+  - Refresca un evento puntual en `altenarUpcoming` contra `GetEventDetails`, persiste `odds` + `lastUpdated` y devuelve diagnóstico (`REFRESH_OK`, `EVENT_NOT_FOUND`, `GET_EVENT_DETAILS_FAILED`).
+  - Reutiliza `maybeAutoRenewWidgetToken` ante `401/403` para continuidad operativa.
+
+#### Preview de arbitraje con refresh dirigido Altenar
+- **`src/routes/opportunities.js`**:
+  - `GET /api/opportunities/arbitrage/preview` ahora soporta query params:
+    - `refreshAltenarNow=1`
+    - `refreshAltenarEventId=<id>`
+  - Si se solicita, ejecuta refresh on-demand antes de recalcular preview.
+  - La respuesta agrega `onDemandRefresh.altenarEvent` para trazabilidad de resultado.
+
+### 🔄 Changed
+
+#### Pre-flight dual: Altenar obligatorio en tiempo real antes de Arcadia
+- **`client/src/App.jsx`**:
+  - `runArbitrageDualPreflight()` ahora pide preview con refresh dirigido al `eventId` Altenar de la oportunidad base.
+  - Si el refresh on-demand falla, se bloquea ejecución dual con `reason=altenar-refresh-failed` antes de disparar la primera pata.
+
+#### Hardening anti-stale en arbitraje prematch
+- **`src/services/arbitrageService.js`**:
+  - Se excluyen oportunidades donde `altenarUpcoming.lastUpdated` supere `ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS`.
+  - Nuevo diagnóstico `skippedStaleAltenar` y exposición de `altenarMaxOddAgeMs` en payload de diagnósticos.
+
+#### Scheduler Altenar con capacidad adaptativa (base + burst)
+- **`src/services/altenarPrematchScheduler.js`**:
+  - Capacidad base parametrizada por `.env` (loop tick, concurrencia, batch por tick).
+  - Nuevo modo burst automático cuando hay backlog stale en eventos vinculados dentro de ventana cercana al inicio.
+  - Logging operativo de capacidad (`BASE`/`BURST`) y métricas de stale vinculadas para tuning en producción.
+
+#### Configuración operativa expandida
+- **`.env.example`**:
+  - Nuevas variables del scheduler adaptativo Altenar (`ALTENAR_PREMATCH_SCHEDULER_*`).
+  - Nueva variable de frescura de arbitraje `ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS`.
+
+### 🧪 Validated
+
+- Build frontend exitoso: `npm --prefix client run build`.
+- Validación estática sin errores en archivos modificados:
+  - `src/services/altenarPrematchScheduler.js`
+  - `src/routes/opportunities.js`
+  - `client/src/App.jsx`
+  - `src/services/arbitrageService.js`
+
 ## [v3.4.29] -- 2026-04-03 -- Sprint: Prematch WS Arcadia + Health Endpoint + Banner UI
 
 > Rama: `master`

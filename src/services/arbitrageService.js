@@ -15,6 +15,10 @@ const ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES = Math.max(
   10,
   Math.floor(Number(process.env.ARBITRAGE_DIAG_SUMMARY_WINDOW_MINUTES || 180))
 );
+const ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS = Math.max(
+  60000,
+  Math.floor(Number(process.env.ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS || 900000))
+);
 const DC_OPPOSITE_COMBOS = [
   {
     code: '1X_PLUS_AWAY',
@@ -367,6 +371,7 @@ const buildRejectionBreakdown = (diagnostics = {}) => {
     startedAt: Number(diagnostics?.skippedByStartedAt || 0),
     invalidDate: Number(diagnostics?.skippedByInvalidDate || 0),
     unlinked: Number(diagnostics?.skippedUnlinked || 0),
+    staleAltenar: Number(diagnostics?.skippedStaleAltenar || 0),
     orientation: Number(diagnostics?.skippedOrientation || 0),
     missingOdds1x2: Number(diagnostics?.skippedMissingOdds1x2 || 0),
     missingOddsDcOpposite: Number(diagnostics?.skippedMissingOddsDcOpposite || 0),
@@ -551,6 +556,7 @@ export const getArbitragePreview1x2 = async ({
 
   const opportunities = [];
   let skippedUnlinked = 0;
+  let skippedStaleAltenar = 0;
   let skippedOrientation = 0;
   let skippedMissingOdds1x2 = 0;
   let skippedMissingOddsDcOpposite = 0;
@@ -567,6 +573,13 @@ export const getArbitragePreview1x2 = async ({
     const alt = altenarById.get(String(altenarId));
     if (!alt) {
       skippedUnlinked += 1;
+      continue;
+    }
+
+    const altLastUpdatedMs = new Date(alt?.lastUpdated || 0).getTime();
+    const altAgeMs = nowMs - altLastUpdatedMs;
+    if (!Number.isFinite(altLastUpdatedMs) || altAgeMs > ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS) {
+      skippedStaleAltenar += 1;
       continue;
     }
 
@@ -754,12 +767,14 @@ export const getArbitragePreview1x2 = async ({
       startCutoffIso: new Date(startCutoffMs).toISOString(),
       startGraceMinutes: ARBITRAGE_PREMATCH_START_GRACE_MINUTES,
       skippedUnlinked,
+      skippedStaleAltenar,
       skippedOrientation,
       skippedMissingOdds: skippedMissingOdds1x2 + skippedMissingOddsDcOpposite,
       skippedMissingOdds1x2,
       skippedMissingOddsDcOpposite,
       filteredByRisk,
       riskThresholds,
+      altenarMaxOddAgeMs: ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS,
       generatedByType: {
         surebet1x2: generated1x2,
         surebetDcOpposite: generatedDcOpposite

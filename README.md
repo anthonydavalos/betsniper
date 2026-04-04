@@ -57,6 +57,24 @@ This project demonstrates real-world techniques used in:
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-04-04 (v3.4.30)
+
+- **Pre-flight dual con refresh Altenar on-demand (anti-hedge por cuota stale):**
+  - Antes de ejecutar `Arcadia -> Altenar`, el pre-flight fuerza `GetEventDetails` del evento Altenar objetivo.
+  - Si el refresh falla o el evento desaparece, la ejecución dual se bloquea con reason explícito (`altenar-refresh-failed`) antes de disparar Arcadia.
+- **Preview de arbitraje con refresh dirigido por evento:**
+  - `GET /api/opportunities/arbitrage/preview` ahora acepta:
+    - `refreshAltenarNow=1`
+    - `refreshAltenarEventId=<altenarEventId>`
+  - Respuesta incluye bloque `onDemandRefresh.altenarEvent` para trazabilidad de éxito/fallo del refresh en tiempo real.
+- **Hardening anti-stale en motor de arbitraje:**
+  - Se excluyen oportunidades cuando `altenarUpcoming.lastUpdated` supera `ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS`.
+  - Se añade diagnóstico `skippedStaleAltenar` para auditoría operativa.
+- **Scheduler Altenar con capacidad adaptativa (base + burst):**
+  - Se parametrizan `concurrency` y `batch` por `.env`.
+  - Activación automática de burst cuando hay backlog stale en eventos vinculados y cercanos al inicio.
+  - Logs de capacidad por ciclo para observabilidad (`BASE`/`BURST`, métricas stale vinculadas).
+
 ### Actualización 2026-04-03 (v3.4.29)
 
 - Nuevo canal prematch por WS Arcadia (MQTT) con fallback automático a polling y degradación desde `db.upcomingMatches` para evitar feed vacío.
@@ -1499,6 +1517,30 @@ El servidor expone los siguientes endpoints REST:
 - **Body:** `{ "eventId": 123456 }`
 - **Descripción:** Añade evento a blacklist (no volverá a mostrarse).
 
+**`GET /api/opportunities/arbitrage/preview`**
+- **Descripción:** Preview de arbitraje prematch (1x2 + DC/opuesto), sin ejecutar apuestas.
+- **Query opcional de refresh dirigido Altenar:**
+  - `refreshAltenarNow=1`
+  - `refreshAltenarEventId=<altenarEventId>`
+- **Uso recomendado:** pre-flight dual para validar cuota Altenar en tiempo real justo antes de ejecutar.
+- **Respuesta (extracto):**
+```json
+{
+  "success": true,
+  "count": 12,
+  "data": [],
+  "onDemandRefresh": {
+    "altenarEvent": {
+      "success": true,
+      "code": "REFRESH_OK",
+      "eventId": "14874449",
+      "changed": true,
+      "updatedAt": "2026-04-04T12:05:31.114Z"
+    }
+  }
+}
+```
+
 ---
 
 ### **Pinnacle / Arcadia**
@@ -1684,6 +1726,22 @@ ALTENAR_SPORT_ID=0
 
 # Rendimiento de endpoint prematch (opcional)
 # PREMATCH_CACHE_TTL_MS=20000
+# PREMATCH_STREAM_REFRESH_INTERVAL_MS=12000
+
+# Arbitraje: excluir Altenar stale (opcional)
+# ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS=900000
+
+# Scheduler adaptativo Altenar (base + burst)
+# ALTENAR_PREMATCH_SCHEDULER_LOOP_TICK_MS=20000
+# ALTENAR_PREMATCH_SCHEDULER_MAX_CONCURRENCY=3
+# ALTENAR_PREMATCH_SCHEDULER_MAX_EVENTS_PER_TICK=6
+# ALTENAR_PREMATCH_SCHEDULER_BURST_ENABLED=true
+# ALTENAR_PREMATCH_SCHEDULER_BURST_MAX_CONCURRENCY=6
+# ALTENAR_PREMATCH_SCHEDULER_BURST_MAX_EVENTS_PER_TICK=14
+# ALTENAR_PREMATCH_SCHEDULER_BURST_WINDOW_MINUTES=120
+# ALTENAR_PREMATCH_SCHEDULER_BURST_STALE_THRESHOLD_MS=360000
+# ALTENAR_PREMATCH_SCHEDULER_BURST_MIN_LINKED_STALE=8
+# ALTENAR_PREMATCH_SCHEDULER_CAPACITY_LOG_INTERVAL_MS=60000
 ```
 
 #### Modo de Alta Carga (Sabadazo)

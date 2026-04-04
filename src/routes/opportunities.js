@@ -13,6 +13,7 @@ import {
   getArbitrageDiagnosticsReport,
   runArbitrageDiagnosticsInventory
 } from '../services/arbitrageService.js';
+import { refreshAltenarEventDetailsNow } from '../services/altenarPrematchScheduler.js';
 import db from '../db/database.js';
 
 const router = express.Router();
@@ -350,6 +351,13 @@ router.get('/arbitrage/preview', async (req, res) => {
     const limitRaw = Number(req.query?.limit);
     const minRoiPercentRaw = Number(req.query?.minRoiPercent);
     const minProfitAbsRaw = Number(req.query?.minProfitAbs);
+    const refreshAltenarNow = ['1', 'true', 'yes'].includes(String(req.query?.refreshAltenarNow || '').trim().toLowerCase());
+    const refreshAltenarEventId = String(req.query?.refreshAltenarEventId || '').trim();
+
+    let onDemandRefresh = null;
+    if (refreshAltenarNow && refreshAltenarEventId) {
+      onDemandRefresh = await refreshAltenarEventDetailsNow({ eventId: refreshAltenarEventId });
+    }
 
     const payload = await getArbitragePreview1x2({
       bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
@@ -357,6 +365,12 @@ router.get('/arbitrage/preview', async (req, res) => {
       minRoiPercent: Number.isFinite(minRoiPercentRaw) ? minRoiPercentRaw : undefined,
       minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : undefined
     });
+
+    if (onDemandRefresh) {
+      payload.onDemandRefresh = {
+        altenarEvent: onDemandRefresh
+      };
+    }
 
     res.json(payload);
   } catch (error) {
