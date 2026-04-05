@@ -37,6 +37,11 @@ const BURST_WINDOW_MINUTES = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULE
 const BURST_STALE_THRESHOLD_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_STALE_THRESHOLD_MS, 6 * 60 * 1000, 60000);
 const BURST_MIN_LINKED_STALE = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_MIN_LINKED_STALE, 8, 1);
 const CAPACITY_LOG_INTERVAL_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_CAPACITY_LOG_INTERVAL_MS, 60000, 5000);
+const LINKED_REFRESH_MAX_INTERVAL_MS = toPositiveInt(
+    process.env.ALTENAR_PREMATCH_SCHEDULER_LINKED_MAX_INTERVAL_MS,
+    120000,
+    30000
+);
 const DETAIL_CANDIDATE_PAST_GRACE_MS = 10 * 60 * 1000;
 const DETAIL_CANDIDATE_FUTURE_WINDOW_MS = 12 * 60 * 60 * 1000;
 
@@ -119,11 +124,19 @@ const extractEventSides = (eventName = '') => {
     return { homeName, awayName };
 };
 
-const getDetailIntervalMs = (minutesToStart) => {
-    if (minutesToStart <= 30) return 30 * 1000;
-    if (minutesToStart <= 120) return 90 * 1000;
-    if (minutesToStart <= 360) return 5 * 60 * 1000;
-    return 10 * 60 * 1000;
+const getDetailIntervalMs = (minutesToStart, isLinked = false) => {
+    let intervalMs = 10 * 60 * 1000;
+    if (minutesToStart <= 30) intervalMs = 30 * 1000;
+    else if (minutesToStart <= 120) intervalMs = 90 * 1000;
+    else if (minutesToStart <= 360) intervalMs = 5 * 60 * 1000;
+
+    // Para eventos linkeados (insumo directo de arbitraje), capamos el intervalo
+    // para que el filtro de stale no descarte cuotas válidas por falta de heartbeat.
+    if (isLinked) {
+        intervalMs = Math.min(intervalMs, LINKED_REFRESH_MAX_INTERVAL_MS);
+    }
+
+    return intervalMs;
 };
 
 const getPriorityScore = (event, linkedSet) => {
@@ -286,6 +299,11 @@ export const refreshAltenarEventDetailsNow = async ({ eventId } = {}) => {
     await db.read();
 
     const rows = Array.isArray(db.data?.altenarUpcoming) ? db.data.altenarUpcoming : [];
+    const linkedSet = new Set(
+        (db.data.upcomingMatches || [])
+            .filter(m => m?.altenarId)
+            .map(m => String(m.altenarId))
+    );
     const idx = rows.findIndex((row) => String(row?.id || '').trim() === normalizedId);
     if (idx < 0) {
         return {
@@ -320,10 +338,11 @@ export const refreshAltenarEventDetailsNow = async ({ eventId } = {}) => {
         const minutesToStart = Number.isFinite(startTs)
             ? Math.max(0, (startTs - nowMs()) / 60000)
             : 360;
+        const isLinked = linkedSet.has(normalizedId);
         eventState.set(normalizedId, {
             failCount: 0,
             lastHash: nextHash,
-            nextDueAt: nowMs() + getDetailIntervalMs(minutesToStart)
+            nextDueAt: nowMs() + getDetailIntervalMs(minutesToStart, isLinked)
         });
 
         return {
@@ -359,11 +378,13 @@ const buildCandidates = (altenarEvents, linkedSet, maxEventsPerTick = MAX_EVENTS
         .map(ev => {
             const ts = new Date(ev.startDate).getTime();
             const minutesToStart = Math.max(0, (ts - current) / 60000);
-            const intervalMs = getDetailIntervalMs(minutesToStart);
+            const isLinked = linkedSet.has(String(ev.id));
+            const intervalMs = getDetailIntervalMs(minutesToStart, isLinked);
             const state = eventState.get(String(ev.id)) || {};
             const dueAt = state.nextDueAt || 0;
             return {
                 event: ev,
+                isLinked,
                 intervalMs,
                 minutesToStart,
                 priority: getPriorityScore(ev, linkedSet),
@@ -449,10 +470,11 @@ const refreshDueEventDetails = async () => {
         if (candidates.length === 0) return;
 
         const byId = new Map(altenarEvents.map(ev => [String(ev.id), ev]));
+        let refreshedCount = 0;
         let changedCount = 0;
         let requestCount = 0;
 
-        const updates = await runWithConcurrency(candidates, async ({ event, intervalMs }) => {
+        const updates = await runWithConcurrency(candidates, async ({ event, intervalMs, isLinked }) => {
             const id = String(event.id);
             const state = eventState.get(id) || { failCount: 0, lastHash: '' };
 
@@ -474,17 +496,17 @@ const refreshDueEventDetails = async () => {
                     nextDueAt: nowMs() + intervalMs * backoffFactor
                 });
 
-                if (!changed) return null;
-
                 return {
                     id,
+                    changed,
                     odds: extracted,
                     lastUpdated: new Date().toISOString()
                 };
             } catch (error) {
                 maybeAutoRenewWidgetToken(error, `altenarPrematchScheduler.GetEventDetails:${event.id}`);
                 const failCount = (state.failCount || 0) + 1;
-                const backoffMs = Math.min(15 * 60 * 1000, intervalMs * Math.pow(2, failCount));
+                const baseIntervalMs = getDetailIntervalMs(120, isLinked);
+                const backoffMs = Math.min(15 * 60 * 1000, baseIntervalMs * Math.pow(2, failCount));
                 eventState.set(id, {
                     failCount,
                     lastHash: state.lastHash || '',
@@ -500,10 +522,13 @@ const refreshDueEventDetails = async () => {
             if (!target) continue;
             target.odds = update.odds;
             target.lastUpdated = update.lastUpdated;
-            changedCount += 1;
+            refreshedCount += 1;
+            if (update.changed) changedCount += 1;
         }
 
-        if (changedCount > 0) {
+        // Persistimos también cuando no hubo cambio de cuota para mantener heartbeat
+        // y evitar stale falso en arbitraje por snapshots estáticos.
+        if (refreshedCount > 0) {
             db.data.altenarUpcoming = Array.from(byId.values()).sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
             db.data.altenarLastUpdate = new Date().toISOString();
             await writeDBWithRetry();
@@ -511,7 +536,7 @@ const refreshDueEventDetails = async () => {
 
         if (requestCount > 0) {
             console.log(
-                `📈 [Altenar Scheduler] Details refreshed: ${requestCount} req, ${changedCount} cambios ` +
+                `📈 [Altenar Scheduler] Details refreshed: ${requestCount} req, ${refreshedCount} heartbeat, ${changedCount} cambios ` +
                 `(conc=${capacity.maxConcurrency}, batch=${capacity.maxEventsPerTick}, burst=${capacity.shouldBurst ? 'on' : 'off'}).`
             );
         }
