@@ -844,6 +844,39 @@ LIVE_VALUE_STABILITY_MIN_AGE_MS=4000
 LIVE_GLOBAL_STABILITY_ENABLED=true
 LIVE_GLOBAL_STABILITY_MIN_HITS=2
 
+# ACity polling-first (default recomendado)
+ACITY_SOCKET_ENABLED=false
+ACITY_SOCKET_URL=wss://api.casinoatlanticcity.com/api/notifications/?EIO=4&transport=websocket
+ACITY_SOCKET_COMPANY=ACP
+ACITY_SOCKET_LOGIN_EVENT=server
+ACITY_SOCKET_LOGIN_TYPE=login
+ACITY_SOCKET_SESSION=
+ACITY_HAYWIRE_SUBSCRIBE_ENABLED=false
+ACITY_HAYWIRE_TOPICS_EVENT=haywire/topics
+ACITY_HAYWIRE_SPORT_ID=66
+ACITY_HAYWIRE_LIVE_MODE=live_delay
+ACITY_HAYWIRE_PAYLOAD_MODES=type,action,bare
+ACITY_HAYWIRE_TOPICS=
+ACITY_HAYWIRE_MQTT_ENABLED=false
+ACITY_HAYWIRE_MQTT_URLS=
+ACITY_HAYWIRE_MQTT_USERNAME=
+ACITY_HAYWIRE_MQTT_PASSWORD_MODE=auto
+ACITY_HAYWIRE_MQTT_API_KEY=
+ACITY_HAYWIRE_MQTT_CONNECT_TIMEOUT_MS=12000
+ACITY_HAYWIRE_MQTT_MAX_ATTEMPTS=48
+LIVE_SOCKET_REQUOTE_ENABLED=false
+LIVE_SOCKET_REQUOTE_MAX_PER_CYCLE=8
+LIVE_SOCKET_DIRTY_MAX_AGE_MS=90000
+LIVE_SOCKET_REQUOTE_ALLOWED_FAMILIES=match_result,totals,double_chance
+PREMATCH_SOCKET_REFRESH_ENABLED=false
+PREMATCH_SOCKET_REFRESH_MAX_PER_CYCLE=3
+LIVE_HYBRID_SELECTIVE_ENABLED=false
+LIVE_HYBRID_REQUIRE_WSAPI_DISABLED=true
+LIVE_HYBRID_SOCKET_COLD_MIN_RAW_MESSAGES=12
+LIVE_HYBRID_FULL_SCAN_EVERY_N_CYCLES=6
+LIVE_HYBRID_SELECTIVE_MAX_PER_CYCLE=8
+LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES=match_result,totals,double_chance
+
 # Recalculo prematch en caliente al apostar
 PREMATCH_REFRESH_RECALCULATE_PINNACLE=true
 PREMATCH_PINNACLE_CACHE_TTL_MS=15000
@@ -869,6 +902,18 @@ PINNACLE_PREMATCH_WS_INCLUDE_SPC_TOPICS=true
 > `LIVE_SNIPE_REQUIRE_PINNACLE_LIVE=true` mantiene modo estricto (solo entra si hay cuota live PIN). Si estás en día de feed incompleto, puedes bajarlo temporalmente a `false`.
 
 > `LIVE_VALUE_REQUIRE_SCORE_SYNC=true` + `LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF=0` exige marcador idéntico Altenar/Pinnacle. Para no quedarte sin señales, usa `LIVE_VALUE_SCORE_SYNC_MAX_GOAL_DIFF=1` o desactiva la guard con `LIVE_VALUE_REQUIRE_SCORE_SYNC=false`.
+
+> Recomendación operativa actual para ACity: usar `polling-first` (socket/haywire en `false`) hasta validar deltas reales en tu tenant.
+
+> Para `ACITY_SOCKET_SESSION`: puedes dejarlo vacío y ejecutar `npm run analyze:acity:live`; el backend intentará extraer la sesión del archivo `data/booky/acity-live-socket-analysis.latest.json`.
+
+> Para `haywire/topics`: tras `authOk` se envían suscripciones de odds automáticamente. Puedes ajustar evento, formatos de payload y topics con `ACITY_HAYWIRE_*`.
+
+> La vía `ACITY_HAYWIRE_MQTT_*` abre una segunda conexión directa MQTT (haywire) para recibir deltas de cuotas sin depender solo de notifications. Si no defines `ACITY_HAYWIRE_MQTT_URLS`, el servicio deriva hosts desde capturas runtime (`requests` + `storage`) y prueba múltiples rutas MQTT.
+
+> Recomendación para forcing en producción: define `ACITY_HAYWIRE_MQTT_URLS` con host real de notificaciones observado en runtime (ej. `api-comunicaciones-web.acity.com.pe`) y `ACITY_HAYWIRE_MQTT_USERNAME` con el user detectado (`/api/notificaciones/{user}`).
+
+> Si `wsapiSocketsEnabled=[]` (tenant sin sockets wsapi), activa `LIVE_HYBRID_SELECTIVE_*`: el scanner alterna full scan cada N ciclos y, entre medias, hace requote selectivo de 1x2/totales/DC para reducir polling masivo sin perder latencia.
 
 > `PREMATCH_REFRESH_RECALCULATE_PINNACLE=true` fuerza recálculo de `realProb` prematch justo antes de confirmar/apostar, consultando el feed de Pinnacle. El frontend mostrará el delta instantáneo de cuota/EV/stake/probabilidad en el modal de confirmación.
 
