@@ -57,6 +57,22 @@ This project demonstrates real-world techniques used in:
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-04-05 (v3.4.31)
+
+- **Validación anti-stale extendida (burn-in 60m):**
+  - Se ejecutó corrida `t0..t60` con evidencia por muestras y por historial persistido.
+  - Resultado: criterio cumplido (`p95 skippedStaleAltenar < 10`) en ambas lecturas.
+  - Se agregó guía operativa de ejecución/lectura en `docs/ops/arbitrage-stale-burnin.md`.
+- **UI de riesgo arbitraje con recálculo automático:**
+  - Al cambiar `stakeMode`, `stakeFixedAmount`, caps o umbrales, la preview se refresca automáticamente con debounce.
+  - Objetivo: evitar desalineación visual entre “Stake final ticket” y “Split Recomendado”.
+- **Ajuste de defaults en `.env.example` (scheduler linked anti-stale):**
+  - `ALTENAR_PREMATCH_SCHEDULER_LINKED_MAX_INTERVAL_MS=90000`
+  - `ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_THRESHOLD_MS=120000`
+  - `ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_MAX_EVENTS_PER_TICK=16`
+- **Aliases dinámicos (mantenimiento rutinario):**
+  - Se actualizaron entradas en `src/utils/dynamicAliases.json` para mantener precisión de matching.
+
 ### Actualización 2026-04-04 (v3.4.30)
 
 - **Pre-flight dual con refresh Altenar on-demand (anti-hedge por cuota stale):**
