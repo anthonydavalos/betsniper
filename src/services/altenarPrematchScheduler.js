@@ -37,6 +37,14 @@ const BURST_WINDOW_MINUTES = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULE
 const BURST_STALE_THRESHOLD_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_STALE_THRESHOLD_MS, 6 * 60 * 1000, 60000);
 const BURST_MIN_LINKED_STALE = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_BURST_MIN_LINKED_STALE, 8, 1);
 const CAPACITY_LOG_INTERVAL_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_CAPACITY_LOG_INTERVAL_MS, 60000, 5000);
+const STALE_SWEEP_ENABLED = toBoolean(process.env.ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_ENABLED, true);
+const STALE_SWEEP_WINDOW_MINUTES = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_WINDOW_MINUTES, 120, 30);
+const STALE_SWEEP_THRESHOLD_MS = toPositiveInt(process.env.ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_THRESHOLD_MS, 150000, 30000);
+const STALE_SWEEP_MAX_EVENTS_PER_TICK = toPositiveInt(
+    process.env.ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_MAX_EVENTS_PER_TICK,
+    Math.max(2, Math.floor(MAX_EVENTS_PER_TICK_BASE / 2)),
+    1
+);
 const LINKED_REFRESH_MAX_INTERVAL_MS = toPositiveInt(
     process.env.ALTENAR_PREMATCH_SCHEDULER_LINKED_MAX_INTERVAL_MS,
     120000,
@@ -365,8 +373,10 @@ export const refreshAltenarEventDetailsNow = async ({ eventId } = {}) => {
 
 const buildCandidates = (altenarEvents, linkedSet, maxEventsPerTick = MAX_EVENTS_PER_TICK_BASE) => {
     const current = nowMs();
+    const maxItems = Math.max(1, Number(maxEventsPerTick || MAX_EVENTS_PER_TICK_BASE));
+    const staleSweepLimit = Math.min(maxItems, STALE_SWEEP_MAX_EVENTS_PER_TICK);
 
-    return altenarEvents
+    const candidates = altenarEvents
         .filter(ev => {
             if (!ev?.id || !ev?.startDate) return false;
             const ts = new Date(ev.startDate).getTime();
@@ -382,23 +392,71 @@ const buildCandidates = (altenarEvents, linkedSet, maxEventsPerTick = MAX_EVENTS
             const intervalMs = getDetailIntervalMs(minutesToStart, isLinked);
             const state = eventState.get(String(ev.id)) || {};
             const dueAt = state.nextDueAt || 0;
+            const due = dueAt <= current;
+
+            const updatedTs = new Date(ev?.lastUpdated || 0).getTime();
+            const ageMs = Number.isFinite(updatedTs)
+                ? Math.max(0, current - updatedTs)
+                : Number.POSITIVE_INFINITY;
+            const isNearLinkedWindow = isLinked && minutesToStart <= STALE_SWEEP_WINDOW_MINUTES;
+            const staleByAge = isNearLinkedWindow && ageMs >= STALE_SWEEP_THRESHOLD_MS;
+
             return {
                 event: ev,
                 isLinked,
                 intervalMs,
                 minutesToStart,
                 priority: getPriorityScore(ev, linkedSet),
-                due: dueAt <= current,
-                dueAt
+                due,
+                dueAt,
+                ageMs,
+                staleByAge,
+                staleForce: STALE_SWEEP_ENABLED && staleByAge && !due
             };
-        })
+        });
+
+    const staleSweepCandidates = STALE_SWEEP_ENABLED
+        ? candidates
+            .filter(item => item.staleByAge)
+            .sort((a, b) => {
+                if (b.ageMs !== a.ageMs) return b.ageMs - a.ageMs;
+                if (a.minutesToStart !== b.minutesToStart) return a.minutesToStart - b.minutesToStart;
+                return b.priority - a.priority;
+            })
+            .slice(0, staleSweepLimit)
+        : [];
+
+    const dueCandidates = candidates
         .filter(item => item.due)
         .sort((a, b) => {
             if (b.priority !== a.priority) return b.priority - a.priority;
+            if (b.staleByAge !== a.staleByAge) return (b.staleByAge ? 1 : 0) - (a.staleByAge ? 1 : 0);
+            if (b.ageMs !== a.ageMs) return b.ageMs - a.ageMs;
             if (a.minutesToStart !== b.minutesToStart) return a.minutesToStart - b.minutesToStart;
             return a.dueAt - b.dueAt;
-        })
-        .slice(0, Math.max(1, Number(maxEventsPerTick || MAX_EVENTS_PER_TICK_BASE)));
+        });
+
+    const selected = [];
+    const selectedIds = new Set();
+
+    const pushUnique = (item) => {
+        const id = String(item?.event?.id || '').trim();
+        if (!id || selectedIds.has(id)) return;
+        selectedIds.add(id);
+        selected.push(item);
+    };
+
+    for (const item of staleSweepCandidates) {
+        if (selected.length >= maxItems) break;
+        pushUnique(item);
+    }
+
+    for (const item of dueCandidates) {
+        if (selected.length >= maxItems) break;
+        pushUnique(item);
+    }
+
+    return selected;
 };
 
 const runWithConcurrency = async (items, worker, concurrency = 4) => {
@@ -468,6 +526,7 @@ const refreshDueEventDetails = async () => {
 
         const candidates = buildCandidates(altenarEvents, linkedSet, capacity.maxEventsPerTick);
         if (candidates.length === 0) return;
+        const forcedSweepCount = candidates.filter(item => item?.staleForce).length;
 
         const byId = new Map(altenarEvents.map(ev => [String(ev.id), ev]));
         let refreshedCount = 0;
@@ -537,7 +596,8 @@ const refreshDueEventDetails = async () => {
         if (requestCount > 0) {
             console.log(
                 `📈 [Altenar Scheduler] Details refreshed: ${requestCount} req, ${refreshedCount} heartbeat, ${changedCount} cambios ` +
-                `(conc=${capacity.maxConcurrency}, batch=${capacity.maxEventsPerTick}, burst=${capacity.shouldBurst ? 'on' : 'off'}).`
+                `(conc=${capacity.maxConcurrency}, batch=${capacity.maxEventsPerTick}, burst=${capacity.shouldBurst ? 'on' : 'off'}, ` +
+                `sweep=${forcedSweepCount}/${STALE_SWEEP_ENABLED ? STALE_SWEEP_MAX_EVENTS_PER_TICK : 0}).`
             );
         }
     } catch (error) {
@@ -566,7 +626,8 @@ export const startAltenarPrematchAdaptiveScheduler = () => {
     console.log('🧠 Altenar Prematch Scheduler Adaptativo iniciado (cola + prioridad temporal).');
     console.log(
         `⚙️ [Altenar Scheduler] Config | tick=${LOOP_TICK_MS}ms | base(conc=${MAX_CONCURRENCY_BASE},batch=${MAX_EVENTS_PER_TICK_BASE}) ` +
-        `| burst=${BURST_ENABLED ? 'on' : 'off'}(conc=${MAX_CONCURRENCY_BURST},batch=${MAX_EVENTS_PER_TICK_BURST})`
+        `| burst=${BURST_ENABLED ? 'on' : 'off'}(conc=${MAX_CONCURRENCY_BURST},batch=${MAX_EVENTS_PER_TICK_BURST}) ` +
+        `| sweep=${STALE_SWEEP_ENABLED ? 'on' : 'off'}(threshold=${STALE_SWEEP_THRESHOLD_MS}ms,window=${STALE_SWEEP_WINDOW_MINUTES}m,max=${STALE_SWEEP_MAX_EVENTS_PER_TICK})`
     );
     schedulerLoop();
 };
