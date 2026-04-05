@@ -20,6 +20,7 @@ await initDB();
 // INICIALIZAR BACKGROUND WORKER (SCANNER)
 // Esto arranca el bucle infinito que consulta a Altenar cada ~30s
 import { startBackgroundScanner } from './src/services/scannerService.js';
+import { stopAcityLiveSocketService } from './src/services/acityLiveSocketService.js';
 import { ingestPinnaclePrematch } from './scripts/ingest-pinnacle.js'; // Importar Función Directa
 import { startAltenarPrematchAdaptiveScheduler } from './src/services/altenarPrematchScheduler.js';
 import { startPinnaclePrematchWsService, stopPinnaclePrematchWsService } from './src/services/pinnaclePrematchWsService.js';
@@ -243,6 +244,12 @@ const shutdownPrematchWs = (signal = 'SIGTERM') => {
   shuttingDown = true;
 
   console.log(`\n🛑 Señal ${signal} recibida. Cerrando BetSniper...`);
+
+  try {
+    stopAcityLiveSocketService();
+  } catch (_) {
+    // noop
+  }
 
   try {
     stopPinnaclePrematchWsService();
