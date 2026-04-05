@@ -971,6 +971,7 @@ function App() {
     const lastSilentTokenRenewAttemptAtRef = useRef(0);
     const placementProviderFetchInFlightRef = useRef(false);
     const arbitrageExecutingKeysRef = useRef(new Set());
+    const arbitrageRiskAutoRefreshTimerRef = useRef(null);
 
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
@@ -978,6 +979,7 @@ function App() {
     const PREMATCH_SSE_RECONNECT_MS = 5000;
     const PREMATCH_SSE_WATCHDOG_MS = 90000;
     const ARBITRAGE_POLL_MS = 30000;
+    const ARBITRAGE_RISK_AUTO_REFRESH_DEBOUNCE_MS = 800;
     const ARBITRAGE_HEALTH_POLL_MS = 180000;
     const ARBITRAGE_PREVIEW_LIMIT = 80;
     const ARBITRAGE_HEALTH_WINDOW_MINUTES = 1440;
@@ -1693,12 +1695,30 @@ function App() {
         return parsed;
     };
 
+    const scheduleArbitrageRiskRefresh = (nextConfig = null) => {
+        if (!nextConfig || typeof nextConfig !== 'object') return;
+
+        if (arbitrageRiskAutoRefreshTimerRef.current) {
+            clearTimeout(arbitrageRiskAutoRefreshTimerRef.current);
+            arbitrageRiskAutoRefreshTimerRef.current = null;
+        }
+
+        arbitrageRiskAutoRefreshTimerRef.current = setTimeout(() => {
+            arbitrageRiskAutoRefreshTimerRef.current = null;
+            void refreshArbitrageWithPrematch({ riskConfigOverride: nextConfig });
+        }, ARBITRAGE_RISK_AUTO_REFRESH_DEBOUNCE_MS);
+    };
+
     const updateArbitrageRiskField = (field, value) => {
         setArbitrageRiskProfileKey('custom');
-        setArbitrageRiskConfig((prev) => ({
-            ...prev,
-            [field]: value
-        }));
+        setArbitrageRiskConfig((prev) => {
+            const next = {
+                ...prev,
+                [field]: value
+            };
+            scheduleArbitrageRiskRefresh(next);
+            return next;
+        });
     };
 
     const resolveArbitrageStakeContext = (configOverride = null) => {
@@ -2937,6 +2957,10 @@ function App() {
 
     return () => {
         isUnmounted = true;
+        if (arbitrageRiskAutoRefreshTimerRef.current) {
+            clearTimeout(arbitrageRiskAutoRefreshTimerRef.current);
+            arbitrageRiskAutoRefreshTimerRef.current = null;
+        }
         clearInterval(coreInterval);
         clearInterval(prematchInterval);
     };

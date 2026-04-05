@@ -7,6 +7,49 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.31] -- 2026-04-05 -- Sprint: Burn-in Stale 60m + Risk Auto-Refresh UI
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Guía operativa de burn-in y lectura de percentiles
+- **`docs/ops/arbitrage-stale-burnin.md`**:
+  - Procedimiento de burn-in anti-stale (60m) para arbitraje prematch.
+  - Definición operativa de `p95` y criterio de aceptación (`p95 < 10`).
+  - Checklist de interpretación para `fromSamples` vs `fromHistory`.
+
+#### Script de validación extendida (60m)
+- **`scripts/tmp-burnin-60m-final-check.mjs`**:
+  - Muestreo periódico de inventario de diagnósticos (`t0..t60`).
+  - Resumen consolidado con percentiles y artefacto JSON de salida en `data/`.
+
+### 🔄 Changed
+
+#### UI de riesgo arbitraje con refresco automático al editar stake/umbrales
+- **`client/src/App.jsx`**:
+  - Se agrega debounce de refresh para recalcular preview al cambiar campos de riesgo.
+  - Se evita snapshot desfasado entre stake mostrado y split recomendado.
+  - Limpieza explícita del timer en unmount.
+
+#### Defaults operativos del scheduler anti-stale
+- **`.env.example`**:
+  - `ALTENAR_PREMATCH_SCHEDULER_LINKED_MAX_INTERVAL_MS`: `120000` -> `90000`.
+  - `ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_THRESHOLD_MS`: `150000` -> `120000`.
+  - `ALTENAR_PREMATCH_SCHEDULER_STALE_SWEEP_MAX_EVENTS_PER_TICK`: `4` -> `16`.
+
+#### Mantenimiento rutinario de aliases
+- **`src/utils/dynamicAliases.json`**:
+  - Ajustes de aliases para mejorar matching en casos de naming variantes.
+
+### 🧪 Validated
+
+- Frontend Vite levantando sin error de parseo en `App.jsx`.
+- Burn-in de 60 minutos finalizado con objetivo cumplido:
+  - `fromSamples.stale.p95 = 1`
+  - `fromHistory.stale.p95 = 0`
+  - criterio `p95 < 10` aprobado en ambas vistas.
+
 ## [v3.4.30] -- 2026-04-04 -- Sprint: Altenar On-Demand Refresh + Adaptive Scheduler Capacity
 
 > Rama: `master`
