@@ -6,6 +6,13 @@ import { scanLiveOpportunities as performTurnaroundScan, getLiveSnipeScanDiagnos
 import { placeAutoBet, updateActiveBetsWithLiveData } from './paperTradingService.js';
 import { prepareSemiAutoTicket, confirmSemiAutoTicket, confirmRealPlacementFast } from './bookySemiAutoService.js';
 import { fetchBookyBalance } from './bookyAccountService.js';
+import { refreshOpportunity } from './oddsService.js';
+import {
+    startAcityLiveSocketService,
+    consumeAcitySocketDirtySignals,
+    getAcityLiveSocketDiagnostics
+} from './acityLiveSocketService.js';
+import { refreshAltenarEventDetailsNow } from './altenarPrematchScheduler.js';
 import {
     preparePinnacleSemiAutoTicket,
     confirmPinnacleSemiAutoTicket,
@@ -54,6 +61,37 @@ const parsePlacementProvider = (rawValue, fallback = 'booky') => {
     return fallback;
 };
 
+const SOCKET_MARKET_FAMILY_ALIAS = {
+    '1x2': 'match_result',
+    match_result: 'match_result',
+    'match-result': 'match_result',
+    moneyline: 'match_result',
+    winner: 'match_result',
+    totals: 'totals',
+    total: 'totals',
+    over_under: 'totals',
+    overunder: 'totals',
+    ou: 'totals',
+    dc: 'double_chance',
+    double_chance: 'double_chance',
+    'double-chance': 'double_chance',
+    doublechance: 'double_chance',
+    unknown: 'unknown'
+};
+
+const parseAllowedSocketFamilies = (rawValue, fallback = ['match_result', 'totals', 'double_chance']) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return [...fallback];
+    }
+
+    const parsed = String(rawValue)
+        .split(',')
+        .map((v) => SOCKET_MARKET_FAMILY_ALIAS[String(v || '').trim().toLowerCase()] || null)
+        .filter(Boolean);
+
+    return parsed.length > 0 ? Array.from(new Set(parsed)) : [...fallback];
+};
+
 // =====================================================================
 // SERVICE: LIVE SCANNER "THE SNIPER" (Background Worker)
 // Estrategia: "La Volteada" (Favorito Pre-match perdiendo por 1 gol)
@@ -97,6 +135,26 @@ let runtimeAutoPlacementProvider = parsePlacementProvider(process.env.AUTO_PLACE
 const LIVE_DIAG_MAX_ENTRIES = parsePositiveIntOr(process.env.LIVE_DIAG_MAX_ENTRIES, 1000);
 const LIVE_DIAG_PERSIST_FILE = parseBooleanFromEnv(process.env.LIVE_DIAG_PERSIST_FILE, true);
 const LIVE_DIAG_FILE = path.resolve('data', 'live_opportunity_decisions.jsonl');
+const LIVE_SOCKET_REQUOTE_ENABLED = parseBooleanFromEnv(process.env.LIVE_SOCKET_REQUOTE_ENABLED, true);
+const LIVE_SOCKET_REQUOTE_MAX_PER_CYCLE = parsePositiveIntOr(process.env.LIVE_SOCKET_REQUOTE_MAX_PER_CYCLE, 8);
+const LIVE_SOCKET_DIRTY_MAX_AGE_MS = parsePositiveIntOr(process.env.LIVE_SOCKET_DIRTY_MAX_AGE_MS, 90000);
+const LIVE_SOCKET_REQUOTE_ALLOWED_FAMILIES = parseAllowedSocketFamilies(
+    process.env.LIVE_SOCKET_REQUOTE_ALLOWED_FAMILIES,
+    ['match_result', 'totals', 'double_chance']
+);
+const LIVE_SOCKET_REQUOTE_ALLOWED_FAMILIES_SET = new Set(LIVE_SOCKET_REQUOTE_ALLOWED_FAMILIES);
+const PREMATCH_SOCKET_REFRESH_ENABLED = parseBooleanFromEnv(process.env.PREMATCH_SOCKET_REFRESH_ENABLED, true);
+const PREMATCH_SOCKET_REFRESH_MAX_PER_CYCLE = parsePositiveIntOr(process.env.PREMATCH_SOCKET_REFRESH_MAX_PER_CYCLE, 3);
+const LIVE_HYBRID_SELECTIVE_ENABLED = parseBooleanFromEnv(process.env.LIVE_HYBRID_SELECTIVE_ENABLED, true);
+const LIVE_HYBRID_REQUIRE_WSAPI_DISABLED = parseBooleanFromEnv(process.env.LIVE_HYBRID_REQUIRE_WSAPI_DISABLED, true);
+const LIVE_HYBRID_SOCKET_COLD_MIN_RAW_MESSAGES = parsePositiveIntOr(process.env.LIVE_HYBRID_SOCKET_COLD_MIN_RAW_MESSAGES, 20);
+const LIVE_HYBRID_FULL_SCAN_EVERY_N_CYCLES = parsePositiveIntOr(process.env.LIVE_HYBRID_FULL_SCAN_EVERY_N_CYCLES, 4);
+const LIVE_HYBRID_SELECTIVE_MAX_PER_CYCLE = parsePositiveIntOr(process.env.LIVE_HYBRID_SELECTIVE_MAX_PER_CYCLE, 5);
+const LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES = parseAllowedSocketFamilies(
+    process.env.LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES,
+    ['match_result', 'totals', 'double_chance']
+);
+const LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES_SET = new Set(LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES);
 
 const autoSnipeInFlight = new Set();
 const autoSnipeLastAttemptAt = new Map();
@@ -114,7 +172,21 @@ let lastLivePipelineStats = {
     stableCount: 0,
     finalCount: 0,
     activeLiveBets: 0,
-    pollMode: 'idle'
+    pollMode: 'idle',
+    socketDirtyConsumed: 0,
+    socketDirtyLiveConsumed: 0,
+    socketDirtyPrematchConsumed: 0,
+    socketRequotesAttempted: 0,
+    socketRequotesApplied: 0,
+    socketPrematchRefreshAttempted: 0,
+    socketPrematchRefreshApplied: 0,
+    socketPrematchRefreshChanged: 0,
+    hybridSelectiveCycle: 0,
+    hybridSkippedFullScan: 0,
+    hybridRequotesAttempted: 0,
+    hybridRequotesApplied: 0,
+    hybridReason: null,
+    wsapiSocketsEnabledCount: null
 };
 
 const appendLiveDecisionLog = (entry = {}) => {
@@ -586,6 +658,405 @@ const filterStableLiveQuotes = (ops = []) => {
     return stable;
 };
 
+const normalizeSocketText = (value = '') => String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+const normalizeSocketFamily = (family) => {
+    const key = String(family || '').trim().toLowerCase();
+    return SOCKET_MARKET_FAMILY_ALIAS[key] || 'unknown';
+};
+
+const normalizeSocketScopes = (scopes = []) => {
+    const out = new Set();
+    for (const scope of Array.isArray(scopes) ? scopes : []) {
+        const key = String(scope || '').trim().toLowerCase();
+        if (key === 'live' || key === 'prematch' || key === 'unknown') {
+            out.add(key);
+        }
+    }
+    if (out.size === 0) out.add('unknown');
+    return out;
+};
+
+const mapOpportunityMarketFamily = (op = {}) => {
+    const text = normalizeSocketText([
+        op?.market,
+        op?.selection,
+        op?.action,
+        op?.pick,
+        op?.type,
+        op?.strategy
+    ].filter(Boolean).join(' '));
+
+    const compact = text.replace(/[^a-z0-9]+/g, '');
+    const hasOverUnderToken = /\b(over|under)\b/.test(text) || /\bo\/u\b/.test(text) || /\bu\/o\b/.test(text);
+
+    if (
+        text.includes('double chance') ||
+        text.includes('doble oportunidad') ||
+        compact.includes('1x') ||
+        compact.includes('x2') ||
+        compact.includes('12')
+    ) {
+        return 'double_chance';
+    }
+
+    if (
+        text.includes('total') ||
+        hasOverUnderToken ||
+        text.includes('mas') ||
+        text.includes('menos')
+    ) {
+        return 'totals';
+    }
+
+    if (
+        text.includes('1x2') ||
+        text.includes('resultado') ||
+        text.includes('match winner') ||
+        text.includes('match result') ||
+        text.includes('moneyline') ||
+        text.includes('local') ||
+        text.includes('visita') ||
+        text.includes('empate') ||
+        text.includes('home') ||
+        text.includes('away') ||
+        text.includes('draw')
+    ) {
+        return 'match_result';
+    }
+
+    return 'unknown';
+};
+
+const buildDirtySignalMapByScope = (dirtySignals = [], scope = 'live') => {
+    const out = new Map();
+
+    for (const signal of Array.isArray(dirtySignals) ? dirtySignals : []) {
+        const eventId = String(signal?.eventId || '').trim();
+        if (!eventId) continue;
+
+        const scopes = normalizeSocketScopes(signal?.scopes || []);
+        if (!scopes.has(scope) && !scopes.has('unknown')) continue;
+
+        const families = new Set(
+            (Array.isArray(signal?.families) ? signal.families : ['unknown'])
+                .map((family) => normalizeSocketFamily(family))
+                .filter(Boolean)
+        );
+        if (families.size === 0) families.add('unknown');
+
+        const prev = out.get(eventId);
+        if (!prev) {
+            out.set(eventId, {
+                families,
+                scopes,
+                eventNames: new Set(Array.isArray(signal?.eventNames) ? signal.eventNames : [])
+            });
+            continue;
+        }
+
+        for (const family of families) prev.families.add(family);
+        for (const s of scopes) prev.scopes.add(s);
+        for (const eventName of Array.isArray(signal?.eventNames) ? signal.eventNames : []) {
+            prev.eventNames.add(eventName);
+        }
+    }
+
+    return out;
+};
+
+const familyMatchesSignal = (opFamily = 'unknown', signalFamilies = new Set()) => {
+    if (!signalFamilies || signalFamilies.size === 0) return true;
+    if (signalFamilies.has('unknown')) return true;
+    if (opFamily === 'unknown') return true;
+    return signalFamilies.has(opFamily);
+};
+
+const applySocketDrivenRequotes = async (ops = [], dirtySignals = []) => {
+    if (!LIVE_SOCKET_REQUOTE_ENABLED) {
+        return {
+            ops,
+            attempted: 0,
+            applied: 0,
+            skipped: 0
+        };
+    }
+
+    if (!Array.isArray(ops) || ops.length === 0) {
+        return {
+            ops: Array.isArray(ops) ? ops : [],
+            attempted: 0,
+            applied: 0,
+            skipped: 0
+        };
+    }
+
+    const dirtySignalMap = buildDirtySignalMapByScope(dirtySignals, 'live');
+    if (dirtySignalMap.size === 0) {
+        return {
+            ops,
+            attempted: 0,
+            applied: 0,
+            skipped: 0
+        };
+    }
+
+    const updatedOps = [...ops];
+    const byEventQuota = new Map();
+    let attempted = 0;
+    let applied = 0;
+    let skipped = 0;
+
+    for (let idx = 0; idx < updatedOps.length; idx += 1) {
+        if (attempted >= LIVE_SOCKET_REQUOTE_MAX_PER_CYCLE) break;
+
+        const op = updatedOps[idx];
+        const eventId = String(op?.eventId || op?.id || '').trim();
+        if (!eventId || !dirtySignalMap.has(eventId)) continue;
+
+        const signal = dirtySignalMap.get(eventId);
+        const opFamily = mapOpportunityMarketFamily(op);
+
+        if (!LIVE_SOCKET_REQUOTE_ALLOWED_FAMILIES_SET.has(opFamily) && opFamily !== 'unknown') {
+            continue;
+        }
+
+        if (!familyMatchesSignal(opFamily, signal?.families)) {
+            skipped += 1;
+            continue;
+        }
+
+        const perEventCount = Number(byEventQuota.get(eventId) || 0);
+        if (perEventCount >= 2) {
+            skipped += 1;
+            continue;
+        }
+
+        byEventQuota.set(eventId, perEventCount + 1);
+        attempted += 1;
+
+        try {
+            const refreshed = await refreshOpportunity(op);
+            if (!refreshed || typeof refreshed !== 'object') {
+                skipped += 1;
+                continue;
+            }
+
+            const beforeOdd = Number(op?.price ?? op?.odd ?? NaN);
+            const afterPrice = Number(refreshed?.price ?? NaN);
+            const merged = { ...op, ...refreshed };
+
+            // LIVE_SNIPE guarda la cuota en "odd"; mantenemos ambas para UI y guardas.
+            if (Number.isFinite(afterPrice) && afterPrice > 1) {
+                merged.price = afterPrice;
+                if (Object.prototype.hasOwnProperty.call(op || {}, 'odd')) {
+                    merged.odd = afterPrice;
+                }
+            }
+
+            const afterOdd = Number(merged?.price ?? merged?.odd ?? NaN);
+            if (Number.isFinite(beforeOdd) && Number.isFinite(afterOdd) && Math.abs(afterOdd - beforeOdd) >= 0.0001) {
+                applied += 1;
+            }
+
+            updatedOps[idx] = merged;
+        } catch (error) {
+            skipped += 1;
+            console.warn(`⚠️ Socket requote falló (${op?.match || eventId}): ${error.message}`);
+        }
+    }
+
+    return {
+        ops: updatedOps,
+        attempted,
+        applied,
+        skipped
+    };
+};
+
+const applySocketDrivenPrematchRefresh = async (dirtySignals = []) => {
+    if (!PREMATCH_SOCKET_REFRESH_ENABLED) {
+        return {
+            attempted: 0,
+            applied: 0,
+            changed: 0,
+            failed: 0
+        };
+    }
+
+    const dirtySignalMap = buildDirtySignalMapByScope(dirtySignals, 'prematch');
+    if (dirtySignalMap.size === 0) {
+        return {
+            attempted: 0,
+            applied: 0,
+            changed: 0,
+            failed: 0
+        };
+    }
+
+    const candidates = Array.from(dirtySignalMap.keys()).slice(0, PREMATCH_SOCKET_REFRESH_MAX_PER_CYCLE);
+    let attempted = 0;
+    let applied = 0;
+    let changed = 0;
+    let failed = 0;
+
+    for (const eventId of candidates) {
+        attempted += 1;
+        try {
+            const result = await refreshAltenarEventDetailsNow({ eventId });
+            if (result?.success) {
+                applied += 1;
+                if (result?.changed) changed += 1;
+            } else {
+                failed += 1;
+            }
+        } catch (_) {
+            failed += 1;
+        }
+    }
+
+    return {
+        attempted,
+        applied,
+        changed,
+        failed
+    };
+};
+
+const decideHybridSelectiveCycle = ({
+    socketDiagnostics,
+    socketDirtyConsumed = 0,
+    cycle = 0,
+    cachedOpsCount = 0
+} = {}) => {
+    if (!LIVE_HYBRID_SELECTIVE_ENABLED) {
+        return { enabled: false, reason: 'hybrid-disabled' };
+    }
+
+    if (socketDirtyConsumed > 0) {
+        return { enabled: false, reason: 'socket-dirty-present' };
+    }
+
+    if (!Number.isFinite(cachedOpsCount) || cachedOpsCount <= 0) {
+        return { enabled: false, reason: 'no-cached-ops' };
+    }
+
+    const stats = socketDiagnostics?.stats || {};
+    const authOk = Number(stats?.authOk || 0);
+    const rawMessages = Number(stats?.rawMessages || 0);
+    const wsapiSocketsEnabled = Array.isArray(socketDiagnostics?.wsapiSocketsEnabled)
+        ? socketDiagnostics.wsapiSocketsEnabled
+        : null;
+    const wsapiDisabled = Array.isArray(wsapiSocketsEnabled) && wsapiSocketsEnabled.length === 0;
+
+    if (authOk <= 0) {
+        return { enabled: false, reason: 'socket-not-authenticated' };
+    }
+
+    if (rawMessages < LIVE_HYBRID_SOCKET_COLD_MIN_RAW_MESSAGES) {
+        return { enabled: false, reason: 'socket-warmup' };
+    }
+
+    if (LIVE_HYBRID_REQUIRE_WSAPI_DISABLED && !wsapiDisabled) {
+        return { enabled: false, reason: wsapiSocketsEnabled ? 'wsapi-enabled' : 'wsapi-unknown' };
+    }
+
+    const fullScanEvery = Math.max(1, LIVE_HYBRID_FULL_SCAN_EVERY_N_CYCLES);
+    if (cycle % fullScanEvery === 0) {
+        return { enabled: false, reason: 'scheduled-full-scan' };
+    }
+
+    return { enabled: true, reason: 'socket-cold-selective' };
+};
+
+const applyHybridSelectiveRequotes = async (ops = []) => {
+    if (!LIVE_HYBRID_SELECTIVE_ENABLED) {
+        return {
+            ops: Array.isArray(ops) ? ops : [],
+            attempted: 0,
+            applied: 0,
+            skipped: 0
+        };
+    }
+
+    if (!Array.isArray(ops) || ops.length === 0) {
+        return {
+            ops: [],
+            attempted: 0,
+            applied: 0,
+            skipped: 0
+        };
+    }
+
+    const updatedOps = [...ops];
+    const byEventQuota = new Map();
+    let attempted = 0;
+    let applied = 0;
+    let skipped = 0;
+
+    for (let idx = 0; idx < updatedOps.length; idx += 1) {
+        if (attempted >= LIVE_HYBRID_SELECTIVE_MAX_PER_CYCLE) break;
+
+        const op = updatedOps[idx];
+        const eventId = String(op?.eventId || op?.id || '').trim();
+        if (!eventId) continue;
+
+        const opFamily = mapOpportunityMarketFamily(op);
+        if (!LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES_SET.has(opFamily)) {
+            continue;
+        }
+
+        const perEventCount = Number(byEventQuota.get(eventId) || 0);
+        if (perEventCount >= 2) {
+            skipped += 1;
+            continue;
+        }
+
+        byEventQuota.set(eventId, perEventCount + 1);
+        attempted += 1;
+
+        try {
+            const refreshed = await refreshOpportunity(op);
+            if (!refreshed || typeof refreshed !== 'object') {
+                skipped += 1;
+                continue;
+            }
+
+            const beforeOdd = Number(op?.price ?? op?.odd ?? NaN);
+            const afterPrice = Number(refreshed?.price ?? NaN);
+            const merged = { ...op, ...refreshed };
+
+            // LIVE_SNIPE mantiene cuota en "odd"; preservamos ambos campos para UI y guardas.
+            if (Number.isFinite(afterPrice) && afterPrice > 1) {
+                merged.price = afterPrice;
+                if (Object.prototype.hasOwnProperty.call(op || {}, 'odd')) {
+                    merged.odd = afterPrice;
+                }
+            }
+
+            const afterOdd = Number(merged?.price ?? merged?.odd ?? NaN);
+            if (Number.isFinite(beforeOdd) && Number.isFinite(afterOdd) && Math.abs(afterOdd - beforeOdd) >= 0.0001) {
+                applied += 1;
+            }
+
+            updatedOps[idx] = merged;
+        } catch (error) {
+            skipped += 1;
+            console.warn(`⚠️ Hybrid requote falló (${op?.match || eventId}): ${error.message}`);
+        }
+    }
+
+    return {
+        ops: updatedOps,
+        attempted,
+        applied,
+        skipped
+    };
+};
+
 export const discardOpportunity = async (opportunityId) => {
     await initDB();
     if (!db.data.blacklist) db.data.blacklist = [];
@@ -615,6 +1086,13 @@ let ticks = 0; // Contador de ciclos
 export const startBackgroundScanner = () => {
     if (isScanning) return;
     isScanning = true;
+
+    const socketBoot = startAcityLiveSocketService();
+    if (socketBoot?.started) {
+        console.log(`🧵 ACity Socket.IO activado para recotización LIVE (reason=${socketBoot.reason || 'enabled'}).`);
+    } else {
+        console.log(`🧵 ACity Socket.IO no activo (reason=${socketBoot?.reason || 'disabled'}).`);
+    }
     
     const loop = async () => {
         let pollMode = 'idle';
@@ -644,73 +1122,81 @@ export const startBackgroundScanner = () => {
             // ---------------------------------------------------------
             // 2. ESCANEAR LIVE (Cada ciclo ~30s)
             // ---------------------------------------------------------
-            
-            // A) Obtener RAW Events (Solo 1 llamada HTTP)
-            const rawEvents = await getLiveOverview();
-            const liveEventCount = Array.isArray(rawEvents) ? rawEvents.length : 0;
 
-            // Contar apuestas activas que siguen en juego para mantener modo rápido
+            const socketDirtySignals = consumeAcitySocketDirtySignals({
+                max: LIVE_SOCKET_REQUOTE_MAX_PER_CYCLE * 3,
+                maxAgeMs: LIVE_SOCKET_DIRTY_MAX_AGE_MS
+            });
+            const socketDirtyConsumed = socketDirtySignals.length;
+            const socketDirtyLiveConsumed = socketDirtySignals.filter((signal) => {
+                const scopes = new Set((signal?.scopes || []).map((s) => String(s || '').toLowerCase()));
+                if (scopes.size === 0) return true;
+                return scopes.has('live') || scopes.has('unknown');
+            }).length;
+            const socketDirtyPrematchConsumed = socketDirtySignals.filter((signal) => {
+                const scopes = new Set((signal?.scopes || []).map((s) => String(s || '').toLowerCase()));
+                if (scopes.size === 0) return true;
+                return scopes.has('prematch') || scopes.has('unknown');
+            }).length;
+            let socketRequotesAttempted = 0;
+            let socketRequotesApplied = 0;
+            let socketPrematchRefreshAttempted = 0;
+            let socketPrematchRefreshApplied = 0;
+            let socketPrematchRefreshChanged = 0;
+
+            if (socketDirtyConsumed > 0) {
+                const prematchRefreshResult = await applySocketDrivenPrematchRefresh(socketDirtySignals);
+                socketPrematchRefreshAttempted = Number(prematchRefreshResult?.attempted || 0);
+                socketPrematchRefreshApplied = Number(prematchRefreshResult?.applied || 0);
+                socketPrematchRefreshChanged = Number(prematchRefreshResult?.changed || 0);
+
+                if (socketPrematchRefreshAttempted > 0) {
+                    console.log(
+                        `   🧵 Socket prematch refresh: dirty=${socketDirtyPrematchConsumed} attempted=${socketPrematchRefreshAttempted} ` +
+                        `applied=${socketPrematchRefreshApplied} changed=${socketPrematchRefreshChanged}`
+                    );
+                }
+            }
+            
+            const socketDiagnostics = getAcityLiveSocketDiagnostics();
+            const wsapiSocketsEnabledCount = Array.isArray(socketDiagnostics?.wsapiSocketsEnabled)
+                ? socketDiagnostics.wsapiSocketsEnabled.length
+                : null;
+
+            let hybridSelectiveCycle = 0;
+            let hybridSkippedFullScan = 0;
+            let hybridRequotesAttempted = 0;
+            let hybridRequotesApplied = 0;
+            let hybridReason = null;
+
+            let ranFullLiveOverview = false;
+            let rawEvents = [];
+            let liveEventCount = 0;
+            let rawOps = [];
+            let dedupCount = 0;
+            let stableCount = 0;
+            let ops = Array.isArray(cachedOpportunities) ? [...cachedOpportunities] : [];
+
+            // Contar apuestas activas que siguen en juego para mantener modo rápido.
             const activeLiveBets = (db.data.portfolio?.activeBets || []).filter(b => {
                 const isLiveOrigin = b.type === 'LIVE_SNIPE' || b.type === 'LIVE_VALUE' || b.type === 'LA_VOLTEADA' || b.isLive;
                 const hasLiveClock = b.liveTime && b.liveTime !== 'Final' && b.liveTime !== 'FT';
                 return isLiveOrigin || hasLiveClock;
             }).length;
 
-            // B) Pasar a lógica de detección (Inyectamos eventos para ahorrar calls)
-            // STRATEGY 1: VALUE BETS (Arbitraje Live)
-            let opsValue = [];
-            try {
-                 opsValue = await performValueScan(rawEvents);
-            } catch (e) {
-                 console.error("⚠️ Error en Value Scan:", e.message);
-            }
-            
-            // STRATEGY 2: TURNAROUNDS ("La Volteada")
-            let opsTurnaround = [];
-            try {
-                 opsTurnaround = await performTurnaroundScan(rawEvents); // Inyectamos eventos
-            } catch (e) {
-                 console.error("⚠️ Error en Turnaround Scan:", e.message);
-            }
-
-            // Combinar Oportunidades
-            let rawOps = [...(opsValue || []), ...(opsTurnaround || [])];
-            
-            // [MOD] Deduplicación estricta para evitar filas repetidas en UI
-            // Filtramos por key única compuesta: EventID + Market + Selection + Line
-            // Preferimos la estrategia "Value" si colisiona con "Turnaround"
-            const uniqueMap = new Map();
-            rawOps.forEach(op => {
-                const key = `${op.eventId}_${op.market}_${op.selection}_${op.line||''}`;
-                if (!uniqueMap.has(key)) {
-                    uniqueMap.set(key, op);
-                } else {
-                    // Si ya existe, nos quedamos con la que tenga mejor EV (o la más reciente)
-                    const existing = uniqueMap.get(key);
-                    if ((op.ev || 0) > (existing.ev || 0)) {
-                        uniqueMap.set(key, op);
-                    }
-                }
+            const hybridDecision = decideHybridSelectiveCycle({
+                socketDiagnostics,
+                socketDirtyConsumed,
+                cycle: ticks,
+                cachedOpsCount: ops.length
             });
-            let ops = Array.from(uniqueMap.values());
-            const dedupCount = ops.length;
 
-            // [ANTI-VOLATILIDAD] Requiere 2 confirmaciones con la misma firma de cuota
-            // antes de exponer oportunidad en UI (aplica a VALUE + TURNAROUND).
-            const preStableCount = ops.length;
-            ops = filterStableLiveQuotes(ops);
-            const stableCount = ops.length;
-            if (preStableCount > 0 && ops.length < preStableCount && ticks % 3 === 0) {
-                console.log(`   🧱 Filtro de estabilidad: ${preStableCount - ops.length} oportunidades en enfriamiento.`);
-            }
-            
-            // FILTRADO ROBUSTO:
-            // 1. Remover eventos que ya eran Oportunidades Pre-Match (Memoria sesión actual)
-            // 2. Remover selecciones específicas que ya tienen apuestas activas (Persistencia DB)
-            if (ops && ops.length > 0) {
-                const initialCount = ops.length;
-                
-                // [FIX] IDs de apuestas activas (usar ID único: eventId + selection)
+            if (hybridDecision.enabled) {
+                hybridSelectiveCycle = 1;
+                hybridSkippedFullScan = 1;
+                hybridReason = hybridDecision.reason;
+
+                const filteredInitialCount = ops.length;
                 const activeBetIds = new Set(
                     (db.data.portfolio.activeBets || []).map(b => {
                         const eventId = String(b.eventId);
@@ -718,36 +1204,135 @@ export const startBackgroundScanner = () => {
                     })
                 );
                 const hiddenIds = new Set(db.data.blacklist || []);
-
-                ops = ops.filter(op => {
-                    const opId = getOpportunityId(op); // ID único para ambos checks
-                    
-                    // 1. Filtrar si ya se apostó ESTA SELECCIÓN ESPECÍFICA
+                ops = ops.filter((op) => {
+                    const opId = getOpportunityId(op);
                     if (activeBetIds.has(opId)) return false;
-                    // 2. Filtrar si se descartó esta selección específica
                     if (hiddenIds.has(opId)) return false;
-                    
                     return true;
                 });
 
-                if (ops.length < initialCount) {
-                    console.log(`   🧹 Ocultando ${initialCount - ops.length} oportunidades LIVE (Repetidas o Ya Apostadas).`);
+                if (ops.length < filteredInitialCount) {
+                    console.log(`   🧹 Hybrid selectivo ocultó ${filteredInitialCount - ops.length} oportunidades ya jugadas/descartadas.`);
                 }
 
-                if ((rawOps.length > 0 || dedupCount > 0) && ticks % 2 === 0) {
-                    console.log(`   📊 Pipeline LIVE: raw=${rawOps.length} dedup=${dedupCount} stable=${stableCount} final=${ops.length}`);
+                const hybridResult = await applyHybridSelectiveRequotes(ops);
+                ops = Array.isArray(hybridResult?.ops) ? hybridResult.ops : ops;
+                hybridRequotesAttempted = Number(hybridResult?.attempted || 0);
+                hybridRequotesApplied = Number(hybridResult?.applied || 0);
+
+                dedupCount = ops.length;
+                stableCount = ops.length;
+
+                if (ticks % 2 === 0) {
+                    console.log(
+                        `   🛰️ Hybrid selectivo: reason=${hybridReason} attempted=${hybridRequotesAttempted} ` +
+                        `applied=${hybridRequotesApplied} cachedOps=${ops.length}`
+                    );
+                }
+            } else {
+                hybridReason = hybridDecision.reason;
+                ranFullLiveOverview = true;
+
+                // A) Obtener RAW Events (Solo 1 llamada HTTP)
+                rawEvents = await getLiveOverview();
+                liveEventCount = Array.isArray(rawEvents) ? rawEvents.length : 0;
+
+                // B) Pasar a lógica de detección (Inyectamos eventos para ahorrar calls)
+                // STRATEGY 1: VALUE BETS (Arbitraje Live)
+                let opsValue = [];
+                try {
+                    opsValue = await performValueScan(rawEvents);
+                } catch (e) {
+                    console.error("⚠️ Error en Value Scan:", e.message);
+                }
+
+                // STRATEGY 2: TURNAROUNDS ("La Volteada")
+                let opsTurnaround = [];
+                try {
+                    opsTurnaround = await performTurnaroundScan(rawEvents); // Inyectamos eventos
+                } catch (e) {
+                    console.error("⚠️ Error en Turnaround Scan:", e.message);
+                }
+
+                // Combinar Oportunidades
+                rawOps = [...(opsValue || []), ...(opsTurnaround || [])];
+
+                // [MOD] Deduplicación estricta para evitar filas repetidas en UI
+                // Filtramos por key única compuesta: EventID + Market + Selection + Line
+                // Preferimos la estrategia "Value" si colisiona con "Turnaround"
+                const uniqueMap = new Map();
+                rawOps.forEach(op => {
+                    const key = `${op.eventId}_${op.market}_${op.selection}_${op.line||''}`;
+                    if (!uniqueMap.has(key)) {
+                        uniqueMap.set(key, op);
+                    } else {
+                        // Si ya existe, nos quedamos con la que tenga mejor EV (o la más reciente)
+                        const existing = uniqueMap.get(key);
+                        if ((op.ev || 0) > (existing.ev || 0)) {
+                            uniqueMap.set(key, op);
+                        }
+                    }
+                });
+                ops = Array.from(uniqueMap.values());
+                dedupCount = ops.length;
+
+                // [ANTI-VOLATILIDAD] Requiere 2 confirmaciones con la misma firma de cuota
+                // antes de exponer oportunidad en UI (aplica a VALUE + TURNAROUND).
+                const preStableCount = ops.length;
+                ops = filterStableLiveQuotes(ops);
+                stableCount = ops.length;
+                if (preStableCount > 0 && ops.length < preStableCount && ticks % 3 === 0) {
+                    console.log(`   🧱 Filtro de estabilidad: ${preStableCount - ops.length} oportunidades en enfriamiento.`);
+                }
+
+                // FILTRADO ROBUSTO:
+                // 1. Remover eventos que ya eran Oportunidades Pre-Match (Memoria sesión actual)
+                // 2. Remover selecciones específicas que ya tienen apuestas activas (Persistencia DB)
+                if (ops && ops.length > 0) {
+                    const initialCount = ops.length;
+
+                    // [FIX] IDs de apuestas activas (usar ID único: eventId + selection)
+                    const activeBetIds = new Set(
+                        (db.data.portfolio.activeBets || []).map(b => {
+                            const eventId = String(b.eventId);
+                            return `${eventId}_${normalizePick(b)}`;
+                        })
+                    );
+                    const hiddenIds = new Set(db.data.blacklist || []);
+
+                    ops = ops.filter(op => {
+                        const opId = getOpportunityId(op); // ID único para ambos checks
+
+                        // 1. Filtrar si ya se apostó ESTA SELECCIÓN ESPECÍFICA
+                        if (activeBetIds.has(opId)) return false;
+                        // 2. Filtrar si se descartó esta selección específica
+                        if (hiddenIds.has(opId)) return false;
+
+                        return true;
+                    });
+
+                    if (ops.length < initialCount) {
+                        console.log(`   🧹 Ocultando ${initialCount - ops.length} oportunidades LIVE (Repetidas o Ya Apostadas).`);
+                    }
+
+                    if ((rawOps.length > 0 || dedupCount > 0) && ticks % 2 === 0) {
+                        console.log(`   📊 Pipeline LIVE: raw=${rawOps.length} dedup=${dedupCount} stable=${stableCount} final=${ops.length}`);
+                    }
+                }
+
+                if (socketDirtyConsumed > 0 && ops.length > 0) {
+                    const requoteResult = await applySocketDrivenRequotes(ops, socketDirtySignals);
+                    ops = Array.isArray(requoteResult?.ops) ? requoteResult.ops : ops;
+                    socketRequotesAttempted = Number(requoteResult?.attempted || 0);
+                    socketRequotesApplied = Number(requoteResult?.applied || 0);
+
+                    if (socketRequotesAttempted > 0) {
+                        console.log(
+                            `   🧵 Socket requote: dirty=${socketDirtyLiveConsumed} attempted=${socketRequotesAttempted} applied=${socketRequotesApplied}`
+                        );
+                    }
                 }
             }
-
-            recordLivePipelineStats({
-                liveEventCount,
-                rawCount: rawOps.length,
-                dedupCount,
-                stableCount,
-                finalCount: ops.length,
-                activeLiveBets,
-                pollMode
-            });
 
             // C) AUTO-TRADING LIVE (Detectar entrada)
             if (ops && ops.length > 0) {
@@ -822,18 +1407,46 @@ export const startBackgroundScanner = () => {
                  if(ticks % 2 === 0) console.log(`   ... Escaneo Live completado. Sin oportunidades (nuevas).`);
             }
 
-              // [AUTO-ADAPTIVO] Mantener modo agresivo solo si hay actividad real
-              // Actividad = eventos live en feed o apuestas activas live u oportunidades detectadas
-              pollMode = (liveEventCount > 0 || activeLiveBets > 0 || (ops && ops.length > 0)) ? 'live-hot' : 'idle';
+              // [AUTO-ADAPTIVO] Mantener modo agresivo solo si hay actividad real.
+              // Si estamos en ciclo híbrido selectivo, reducimos carga de polling masivo.
+              if (hybridSelectiveCycle) {
+                  pollMode = (ops && ops.length > 0) ? 'hybrid-selective' : 'idle';
+              } else {
+                  // Actividad = eventos live en feed o apuestas activas live u oportunidades detectadas
+                  pollMode = (liveEventCount > 0 || activeLiveBets > 0 || (ops && ops.length > 0)) ? 'live-hot' : 'idle';
+              }
+
+                        recordLivePipelineStats({
+                                liveEventCount,
+                                rawCount: rawOps.length,
+                                dedupCount,
+                                stableCount,
+                                finalCount: ops.length,
+                                activeLiveBets,
+                                pollMode,
+                                socketDirtyConsumed,
+                                socketDirtyLiveConsumed,
+                                socketDirtyPrematchConsumed,
+                                socketRequotesAttempted,
+                                socketRequotesApplied,
+                                socketPrematchRefreshAttempted,
+                                socketPrematchRefreshApplied,
+                                socketPrematchRefreshChanged,
+                                hybridSelectiveCycle,
+                                hybridSkippedFullScan,
+                                hybridRequotesAttempted,
+                                hybridRequotesApplied,
+                                hybridReason,
+                                wsapiSocketsEnabledCount
+                        });
 
             // (Pre-match block moved up)
 
             // ---------------------------------------------------------
             // 3. MONITORING (Actualizar salidas)
             // ---------------------------------------------------------
-            // Usamos los rawEvents para el tracking.
-            // IMPORTANTE: Ejecutar siempre, incluso si rawEvents está vacío, para detectar partidos finalizados (Zombies)
-            if (rawEvents) {
+            // Usamos los rawEvents para el tracking solo cuando hubo full scan.
+            if (ranFullLiveOverview && rawEvents) {
                 // [MOD] Obtener Pinnacle Feed para sincronizar activeBets también
                 let pinFeed = [];
                 try {
@@ -843,6 +1456,8 @@ export const startBackgroundScanner = () => {
                 } catch(e) {}
                 
                 await updateActiveBetsWithLiveData(rawEvents, pinFeed);
+            } else if (hybridSelectiveCycle && ticks % 10 === 0) {
+                console.log('   🛰️ Hybrid selectivo activo: se omite refresh de activeBets en este subciclo.');
             }
 
             cachedOpportunities = ops;
@@ -867,6 +1482,9 @@ export const startBackgroundScanner = () => {
             if (pollMode === 'live-hot') {
                 MIN_POLL_INTERVAL = 2000;
                 RANDOM_JITTER = 600;
+            } else if (pollMode === 'hybrid-selective') {
+                MIN_POLL_INTERVAL = 2200;
+                RANDOM_JITTER = 700;
             } else if (pollMode === 'error') {
                 MIN_POLL_INTERVAL = 7000;
                 RANDOM_JITTER = 2000;
@@ -938,9 +1556,22 @@ export const getLiveDecisionDiagnostics = ({ limit = 200 } = {}) => {
             reentryMinOddPoints: AUTO_SNIPE_REENTRY_MIN_ODD_POINTS,
             maxEntriesPerPick: AUTO_SNIPE_MAX_ENTRIES_PER_PICK,
             liveGlobalStabilityEnabled: LIVE_GLOBAL_STABILITY_ENABLED,
-            liveGlobalStabilityMinHits: QUOTE_STABILITY_MIN_HITS
+            liveGlobalStabilityMinHits: QUOTE_STABILITY_MIN_HITS,
+            liveSocketRequoteEnabled: LIVE_SOCKET_REQUOTE_ENABLED,
+            liveSocketRequoteMaxPerCycle: LIVE_SOCKET_REQUOTE_MAX_PER_CYCLE,
+            liveSocketDirtyMaxAgeMs: LIVE_SOCKET_DIRTY_MAX_AGE_MS,
+            liveSocketRequoteAllowedFamilies: LIVE_SOCKET_REQUOTE_ALLOWED_FAMILIES,
+            prematchSocketRefreshEnabled: PREMATCH_SOCKET_REFRESH_ENABLED,
+            prematchSocketRefreshMaxPerCycle: PREMATCH_SOCKET_REFRESH_MAX_PER_CYCLE,
+            liveHybridSelectiveEnabled: LIVE_HYBRID_SELECTIVE_ENABLED,
+            liveHybridRequireWsapiDisabled: LIVE_HYBRID_REQUIRE_WSAPI_DISABLED,
+            liveHybridSocketColdMinRawMessages: LIVE_HYBRID_SOCKET_COLD_MIN_RAW_MESSAGES,
+            liveHybridFullScanEveryNCycles: LIVE_HYBRID_FULL_SCAN_EVERY_N_CYCLES,
+            liveHybridSelectiveMaxPerCycle: LIVE_HYBRID_SELECTIVE_MAX_PER_CYCLE,
+            liveHybridSelectiveAllowedFamilies: LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES
         },
         pipeline: lastLivePipelineStats,
+        acitySocketDiagnostics: getAcityLiveSocketDiagnostics(),
         liveSnipeDiagnostics: getLiveSnipeScanDiagnostics(),
         summary: {
             totalStored: liveDecisionLog.length,
