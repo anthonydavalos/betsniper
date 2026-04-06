@@ -7,6 +7,56 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.32] -- 2026-04-05 -- Sprint: DC Closure Indicator + Anti-Ghost Hardening
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Indicador de cierre reciente de mercado DC
+- **`src/services/arbitrageService.js`**:
+  - Nuevo diagnóstico de cierre reciente de Double Chance:
+    - `dcClosedRecentlyCount`
+    - `dcClosedRecentWindowMinutes`
+    - `dcClosedRecentlySample`
+  - El diagnóstico se calcula sobre eventos enlazados evaluados en preview.
+
+- **`client/src/App.jsx`**:
+  - Nuevo badge operativo en cabecera de ARBITRAJE:
+    - `DC cerrado recientemente: X (<= Ym)`
+  - Incluye detalle de muestra en tooltip para inspección rápida.
+
+### 🔄 Changed
+
+#### Hardening anti-fantasma de Double Chance
+- **`scripts/ingest-altenar.js`**:
+  - Si DC no viene en la extracción actual, ya no se hereda del snapshot previo.
+  - Se agregan metadatos de ciclo de vida de mercado:
+    - `dcMarketOpen`
+    - `dcLastSeenAt`
+    - `dcMarketClosedAt`
+
+- **`src/services/altenarPrematchScheduler.js`**:
+  - Refrescos `GetEventDetails` ahora actualizan metadatos de ciclo DC en cada heartbeat.
+  - Permite detectar cierres/reaperturas sin depender de ingesta forzada.
+
+#### Consistencia de arbitraje cross-provider
+- **`src/services/arbitrageService.js`**:
+  - Se mantiene guardia de preview para exigir arbitraje cruzado por provider.
+  - Diagnóstico explícito de descarte: `skippedSameProvider`.
+
+- **`.env.example`**:
+  - Nueva variable documentada: `ARBITRAGE_DC_CLOSED_RECENT_WINDOW_MINUTES=15`.
+
+### 🧪 Validated
+
+- Validación estática sin errores:
+  - `src/services/arbitrageService.js`
+  - `src/services/altenarPrematchScheduler.js`
+  - `scripts/ingest-altenar.js`
+  - `client/src/App.jsx`
+- Preview de arbitraje expone campos nuevos de diagnóstico en runtime.
+
 ## [v3.4.31] -- 2026-04-05 -- Sprint: Burn-in Stale 60m + Risk Auto-Refresh UI
 
 > Rama: `master`

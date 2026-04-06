@@ -43,3 +43,16 @@ Salida esperada:
 - `fromSamples.stale.p95`: salud de la corrida puntual.
 - `fromHistory.stale.p95`: salud consolidada en snapshots persistidos.
 - `passCriteria.bySamples` y `passCriteria.byHistory`: validación final del objetivo.
+
+## Indicador de cierre reciente de DC
+
+El preview de arbitraje expone diagnóstico para detectar cierre de mercado `Double Chance` entre snapshots:
+
+- `dcClosedRecentlyCount`
+- `dcClosedRecentWindowMinutes`
+- `dcClosedRecentlySample`
+
+Uso operativo:
+
+- Si `dcClosedRecentlyCount > 0`, tratar señales DC con cautela y priorizar refresh de confirmación.
+- El badge en UI ayuda a distinguir no-match de pricing vs cierre real de mercado.

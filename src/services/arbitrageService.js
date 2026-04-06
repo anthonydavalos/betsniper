@@ -19,6 +19,14 @@ const ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS = Math.max(
   60000,
   Math.floor(Number(process.env.ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS || 900000))
 );
+const ARBITRAGE_REQUIRE_CROSS_PROVIDER = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.ARBITRAGE_REQUIRE_CROSS_PROVIDER || 'true').trim().toLowerCase()
+);
+const ARBITRAGE_DC_CLOSED_RECENT_WINDOW_MINUTES = Math.max(
+  1,
+  Math.floor(Number(process.env.ARBITRAGE_DC_CLOSED_RECENT_WINDOW_MINUTES || 15))
+);
+const ARBITRAGE_DC_CLOSED_RECENT_SAMPLE_LIMIT = 3;
 const DC_OPPOSITE_COMBOS = [
   {
     code: '1X_PLUS_AWAY',
@@ -61,6 +69,15 @@ const safePositiveOdd = (value) => {
   const n = toNumber(value, NaN);
   if (!Number.isFinite(n) || n <= 1) return null;
   return n;
+};
+
+const hasDoubleChanceOdds = (odds = {}) => {
+  const dc = odds?.doubleChance || {};
+  return Boolean(
+    safePositiveOdd(dc.homeDraw) ||
+    safePositiveOdd(dc.homeAway) ||
+    safePositiveOdd(dc.drawAway)
+  );
 };
 
 const normalizeText = (value = '') => String(value)
@@ -373,6 +390,7 @@ const buildRejectionBreakdown = (diagnostics = {}) => {
     unlinked: Number(diagnostics?.skippedUnlinked || 0),
     staleAltenar: Number(diagnostics?.skippedStaleAltenar || 0),
     orientation: Number(diagnostics?.skippedOrientation || 0),
+    sameProvider: Number(diagnostics?.skippedSameProvider || 0),
     missingOdds1x2: Number(diagnostics?.skippedMissingOdds1x2 || 0),
     missingOddsDcOpposite: Number(diagnostics?.skippedMissingOddsDcOpposite || 0),
     filteredByRisk: Number(diagnostics?.filteredByRisk || 0),
@@ -558,10 +576,13 @@ export const getArbitragePreview1x2 = async ({
   let skippedUnlinked = 0;
   let skippedStaleAltenar = 0;
   let skippedOrientation = 0;
+  let skippedSameProvider = 0;
   let skippedMissingOdds1x2 = 0;
   let skippedMissingOddsDcOpposite = 0;
   let generated1x2 = 0;
   let generatedDcOpposite = 0;
+  const dcClosedRecentlyByEventId = new Map();
+  const dcClosedWindowMs = ARBITRAGE_DC_CLOSED_RECENT_WINDOW_MINUTES * 60 * 1000;
 
   for (const pin of eligiblePinnacleRows) {
     const altenarId = pin?.altenarId;
@@ -581,6 +602,22 @@ export const getArbitragePreview1x2 = async ({
     if (!Number.isFinite(altLastUpdatedMs) || altAgeMs > ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS) {
       skippedStaleAltenar += 1;
       continue;
+    }
+
+    const altDcClosedAtMs = new Date(alt?.dcMarketClosedAt || 0).getTime();
+    const wasDcClosedRecently = Number.isFinite(altDcClosedAtMs)
+      && altDcClosedAtMs <= nowMs
+      && (nowMs - altDcClosedAtMs) <= dcClosedWindowMs;
+    if (wasDcClosedRecently) {
+      const key = String(alt?.id || pin?.altenarId || '').trim();
+      if (key && !dcClosedRecentlyByEventId.has(key)) {
+        dcClosedRecentlyByEventId.set(key, {
+          eventId: alt?.id || null,
+          match: `${pin?.home || ''} vs ${pin?.away || ''}`.trim() || (alt?.name || '-'),
+          closedAt: alt?.dcMarketClosedAt || null,
+          hasDcNow: hasDoubleChanceOdds(alt?.odds || {})
+        });
+      }
     }
 
     const orientationInfo = resolveOrientation({
@@ -624,6 +661,18 @@ export const getArbitragePreview1x2 = async ({
     if (!bestOdds.home || !bestOdds.draw || !bestOdds.away) {
       skippedMissingOdds1x2 += 1;
     } else {
+      if (ARBITRAGE_REQUIRE_CROSS_PROVIDER) {
+        const providerSet = new Set([
+          bestOdds.home?.provider,
+          bestOdds.draw?.provider,
+          bestOdds.away?.provider
+        ].filter(Boolean));
+        if (providerSet.size < 2) {
+          skippedSameProvider += 1;
+          continue;
+        }
+      }
+
       const plan = buildThreeLegStakePlan({ bankroll: stakeBankroll, bestOdds });
       if (plan) {
         opportunities.push({
@@ -666,6 +715,11 @@ export const getArbitragePreview1x2 = async ({
 
       if (!dcBest || !oppositeBest) {
         skippedMissingOddsDcOpposite += 1;
+        continue;
+      }
+
+      if (ARBITRAGE_REQUIRE_CROSS_PROVIDER && dcBest.provider === oppositeBest.provider) {
+        skippedSameProvider += 1;
         continue;
       }
 
@@ -744,6 +798,10 @@ export const getArbitragePreview1x2 = async ({
     .sort((a, b) => Number(b?.plan?.edgePercent || 0) - Number(a?.plan?.edgePercent || 0))
     .slice(0, maxItems);
 
+  const dcClosedRecentlySample = Array.from(dcClosedRecentlyByEventId.values())
+    .sort((a, b) => new Date(b?.closedAt || 0).getTime() - new Date(a?.closedAt || 0).getTime())
+    .slice(0, ARBITRAGE_DC_CLOSED_RECENT_SAMPLE_LIMIT);
+
   const payload = {
     success: true,
     mode: 'preview-only',
@@ -769,12 +827,17 @@ export const getArbitragePreview1x2 = async ({
       skippedUnlinked,
       skippedStaleAltenar,
       skippedOrientation,
+      skippedSameProvider,
       skippedMissingOdds: skippedMissingOdds1x2 + skippedMissingOddsDcOpposite,
       skippedMissingOdds1x2,
       skippedMissingOddsDcOpposite,
       filteredByRisk,
       riskThresholds,
       altenarMaxOddAgeMs: ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS,
+      requireCrossProvider: ARBITRAGE_REQUIRE_CROSS_PROVIDER,
+      dcClosedRecentWindowMinutes: ARBITRAGE_DC_CLOSED_RECENT_WINDOW_MINUTES,
+      dcClosedRecentlyCount: dcClosedRecentlyByEventId.size,
+      dcClosedRecentlySample,
       generatedByType: {
         surebet1x2: generated1x2,
         surebetDcOpposite: generatedDcOpposite
