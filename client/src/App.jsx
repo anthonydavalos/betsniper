@@ -1325,7 +1325,23 @@ function App() {
                     .get(bookyAccountUrl, { timeout: forceBookyRefresh ? 30000 : 20000 })
                     .then((bookyRes) => {
                         if (!bookyRes?.data?.success) return;
-                        setBookyAccount(bookyRes.data);
+                        setBookyAccount((prev) => {
+                            const incoming = bookyRes.data || {};
+                            const prevAmount = parseNullableBalanceAmount(prev?.balance?.amount);
+                            const incomingAmount = parseNullableBalanceAmount(incoming?.balance?.amount);
+                            const preservePrevAmount = incomingAmount === null && Number.isFinite(prevAmount);
+
+                            return {
+                                ...prev,
+                                ...incoming,
+                                balance: {
+                                    ...(prev?.balance || {}),
+                                    ...(incoming?.balance || {}),
+                                    amount: preservePrevAmount ? prevAmount : incomingAmount,
+                                    stale: preservePrevAmount ? true : Boolean(incoming?.balance?.stale)
+                                }
+                            };
+                        });
                         latestBookyHistoryRef.current = Array.isArray(bookyRes.data?.history) ? bookyRes.data.history : [];
                         lastBookyAccountFetchAtRef.current = Date.now();
 
@@ -1697,6 +1713,19 @@ function App() {
         return parsed;
     };
 
+    const parseNullableBalanceAmount = (value) => {
+        if (value === null || value === undefined) return null;
+        if (typeof value === 'string' && value.trim() === '') return null;
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed < 0) return null;
+        return parsed;
+    };
+
+    const parseBalanceAmountOrNaN = (value) => {
+        const parsed = parseNullableBalanceAmount(value);
+        return Number.isFinite(parsed) ? parsed : NaN;
+    };
+
     const toNonNegativeNumber = (value, fallback) => {
         const parsed = Number(value);
         if (!Number.isFinite(parsed) || parsed < 0) return fallback;
@@ -1737,11 +1766,11 @@ function App() {
         const portfolioNavRaw = Number(portfolio?.balance);
         const portfolioNav = Number.isFinite(portfolioNavRaw) && portfolioNavRaw > 0 ? portfolioNavRaw : 0;
 
-        const bookyBalanceRaw = Number(bookyAccount?.balance?.amount);
+        const bookyBalanceRaw = parseBalanceAmountOrNaN(bookyAccount?.balance?.amount);
         const bookyBalance = Number.isFinite(bookyBalanceRaw) && bookyBalanceRaw >= 0 ? bookyBalanceRaw : NaN;
         const bookyCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
 
-        const pinnacleBalanceRaw = Number(pinnacleAccount?.balance?.amount);
+        const pinnacleBalanceRaw = parseBalanceAmountOrNaN(pinnacleAccount?.balance?.amount);
         const pinnacleBalance = Number.isFinite(pinnacleBalanceRaw) && pinnacleBalanceRaw >= 0 ? pinnacleBalanceRaw : NaN;
         const pinnacleCurrency = String(pinnacleAccount?.balance?.currency || 'USD').toUpperCase();
 
@@ -1813,8 +1842,8 @@ function App() {
         const altenarRequired = Number(providerSplit?.altenar || 0);
         const arcadiaRequired = Number(providerSplit?.arcadia || 0);
 
-        const bookyAvailableRaw = Number(bookyAccount?.balance?.amount);
-        const pinnacleAvailableRaw = Number(pinnacleAccount?.balance?.amount);
+        const bookyAvailableRaw = parseBalanceAmountOrNaN(bookyAccount?.balance?.amount);
+        const pinnacleAvailableRaw = parseBalanceAmountOrNaN(pinnacleAccount?.balance?.amount);
         const bookyCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
         const pinnacleCurrency = String(pinnacleAccount?.balance?.currency || 'USD').toUpperCase();
 
@@ -3202,10 +3231,10 @@ function App() {
     prevLiveOpsIdsRef.current = currentIds;
     }, [liveOps, portfolio?.activeBets, bookyAccount?.history]);
 
-    const realBalanceAmount = Number(bookyAccount?.balance?.amount);
+    const realBalanceAmount = parseBalanceAmountOrNaN(bookyAccount?.balance?.amount);
     const realBalanceCurrency = String(bookyAccount?.balance?.currency || 'PEN').toUpperCase();
     const activeBookyLabel = String(bookyAccount?.profile || bookyAccount?.integration || 'booky').toUpperCase();
-    const pinnacleBalanceAmount = Number(pinnacleAccount?.balance?.amount);
+    const pinnacleBalanceAmount = parseBalanceAmountOrNaN(pinnacleAccount?.balance?.amount);
     const pinnacleBalanceCurrency = String(pinnacleAccount?.balance?.currency || 'USD').toUpperCase();
     const pinnaclePnlSnapshotRaw = Number(pinnacleAccount?.pnl?.netAfterOpenStake ?? pinnacleAccount?.pnl?.total);
     const pinnaclePnlByBalanceRaw = Number(pinnacleAccount?.pnl?.byBalance);

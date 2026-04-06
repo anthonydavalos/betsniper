@@ -1960,7 +1960,10 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
 const requestProviderBalance = async (auth) => {
   const baseUrl = getPlatformOperationsBaseUrl();
   const headers = buildProviderHeaders(auth);
-  const timeout = 15000;
+  const configuredTimeout = Number(getRuntimeEnvValue('BOOKY_BALANCE_PROVIDER_TIMEOUT_MS', '9000'));
+  const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? Math.max(3000, Math.min(20000, configuredTimeout))
+    : 9000;
   const runtimeParams = buildRuntimeProviderParams();
 
   const endpoints = [
@@ -1983,6 +1986,24 @@ const requestProviderBalance = async (auth) => {
       if (parsed) return { ...parsed, endpoint, method: 'GET' };
     } catch (error) {
       lastError = error;
+
+      const code = String(error?.code || '').toUpperCase();
+      const msg = String(error?.message || '').toLowerCase();
+      const networkTimeoutFailure = (
+        code === 'ECONNABORTED' ||
+        code === 'ETIMEDOUT' ||
+        code === 'ENOTFOUND' ||
+        code === 'EAI_AGAIN' ||
+        code === 'ECONNRESET' ||
+        msg.includes('timeout') ||
+        msg.includes('aborted') ||
+        msg.includes('socket hang up')
+      );
+
+      // Si el primer endpoint ya falla por red/timeout, evitamos duplicar espera con el segundo.
+      if (networkTimeoutFailure) {
+        break;
+      }
 
       const status = Number(error?.response?.status || 0);
       const canFallbackToPost = status === 400 || status === 404 || status === 405;
@@ -2185,7 +2206,7 @@ export const getBookyHistory = async (limit = 60) => {
     .reverse()
     .map(row => ({ ...row, source: 'local' }));
 
-  const remote = await syncRemoteBookyHistory({ forceRefresh: false, limit: 0, profileKey: ctx.key, fetchAll: true });
+  const remote = await syncRemoteBookyHistory({ forceRefresh: false, limit: 0, profileKey: ctx.key, fetchAll: false });
   const remoteRows = Array.isArray(remote?.items) ? remote.items : [];
 
   const reconcileStats = reconcilePortfolioActiveBetsFromRemote(remoteRows, {
@@ -2616,11 +2637,11 @@ export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLim
   const balance = await fetchBookyBalance({ forceRefresh, profileKey: ctx.key });
   if (forceRefresh) {
     await syncRemoteBookyHistory({ forceRefresh: true, limit: historyLimit, profileKey: ctx.key });
+    await getBookyHistory(historyLimit);
   }
   if (cleanupOld) {
     await cleanupBookyHistoricalData({ retentionDays });
   }
-  await getBookyHistory(historyLimit);
   const parsedLimit = Number(historyLimit);
   const maxHistoryItems = Number.isFinite(parsedLimit)
     ? (parsedLimit <= 0 ? null : Math.max(1, parsedLimit))
