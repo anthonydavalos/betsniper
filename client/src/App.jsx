@@ -950,6 +950,8 @@ function App() {
     const prematchSseRef = useRef(null);
     const prematchSseReconnectTimerRef = useRef(null);
     const lastPrematchSseEventAtRef = useRef(0);
+    const bookyAccountFetchInFlightRef = useRef(false);
+    const lastBookyAccountFetchAttemptAtRef = useRef(0);
     const lastBookyAccountFetchAtRef = useRef(0);
     const lastKellyDiagnosticsFetchAtRef = useRef(0);
     const lastPrematchFetchAtRef = useRef(0);
@@ -1287,7 +1289,7 @@ function App() {
             const currentIsSimulatedDisplayMode = !(tokenHealthRef.current?.realPlacementEnabled === true);
             const nowMs = Date.now();
             const shouldForceRealFinishedHydration = (!currentIsSimulatedDisplayMode && currentActiveTab === 'FINISHED' && !realFinishedHydratedRef.current);
-            const shouldFetchBooky = forceBookyRefresh || (nowMs - lastBookyAccountFetchAtRef.current) >= 15000;
+            const shouldFetchBooky = forceBookyRefresh || (nowMs - lastBookyAccountFetchAttemptAtRef.current) >= 15000;
             const shouldFetchKellyDiagnostics = forceBookyRefresh || (nowMs - lastKellyDiagnosticsFetchAtRef.current) >= 60000;
             const selectedHistoryLimit = (!currentIsSimulatedDisplayMode && currentActiveTab === 'FINISHED')
                 ? BOOKY_HISTORY_LIMIT_FINISHED_REAL
@@ -1315,9 +1317,12 @@ function App() {
             ]);
             const [liveReq, portfolioReq] = settled;
 
-            if (shouldFetchBooky || shouldForceRealFinishedHydration) {
+            if ((shouldFetchBooky || shouldForceRealFinishedHydration) && !bookyAccountFetchInFlightRef.current) {
+                bookyAccountFetchInFlightRef.current = true;
+                lastBookyAccountFetchAttemptAtRef.current = Date.now();
+
                 void axios
-                    .get(bookyAccountUrl, { timeout: forceBookyRefresh ? 30000 : 12000 })
+                    .get(bookyAccountUrl, { timeout: forceBookyRefresh ? 30000 : 20000 })
                     .then((bookyRes) => {
                         if (!bookyRes?.data?.success) return;
                         setBookyAccount(bookyRes.data);
@@ -1338,6 +1343,9 @@ function App() {
                     })
                     .catch((error) => {
                         console.warn('⚠️ Booky account fetch falló. Se mantiene snapshot previo.', error?.message || error);
+                    })
+                    .finally(() => {
+                        bookyAccountFetchInFlightRef.current = false;
                     });
             }
 
