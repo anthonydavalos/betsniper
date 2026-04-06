@@ -7,7 +7,7 @@ import {
   getAutoPlacementProvider,
   setAutoPlacementProvider
 } from '../services/scannerService.js';
-import { scanPrematchOpportunities } from '../services/prematchScannerService.js';
+import { scanPrematchOpportunities, getPrematchDecisionDiagnostics } from '../services/prematchScannerService.js';
 import {
   getArbitragePreview1x2,
   getArbitrageDiagnosticsReport,
@@ -201,6 +201,18 @@ router.get('/live/diagnostics', async (req, res) => {
   try {
     const limit = Number(req.query?.limit || 200);
     const result = getLiveDecisionDiagnostics({ limit });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/opportunities/prematch/diagnostics
+// Retorna breakdown de filtros prematch y métricas del último pipeline.
+router.get('/prematch/diagnostics', async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 200);
+    const result = getPrematchDecisionDiagnostics({ limit });
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });

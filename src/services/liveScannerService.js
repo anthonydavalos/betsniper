@@ -53,6 +53,39 @@ const parseBooleanFromEnv = (rawValue, fallback = false, envName = 'ENV_FLAG', s
     return fallback;
 };
 
+const parseNonNegativeNumberFromEnv = (rawValue, fallback, envName = 'ENV_NUMBER', sourceTag = 'Config') => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}="${rawValue}" no es numérico. Usando default ${fallback}.`);
+        return fallback;
+    }
+
+    if (parsed < 0) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}=${parsed} es negativo. Se ajusta a 0.`);
+        return 0;
+    }
+
+    return parsed;
+};
+
+const parsePositiveNumberFromEnv = (rawValue, fallback, envName = 'ENV_NUMBER', sourceTag = 'Config') => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.warn(`⚠️ [${sourceTag}] ${envName}="${rawValue}" inválido (<=0 o no numérico). Usando default ${fallback}.`);
+        return fallback;
+    }
+
+    return parsed;
+};
+
 const ENABLE_MATCH_DIAGNOSTICS = parseBooleanFromEnv(
     process.env.MATCH_DIAGNOSTIC_LOG,
     false,
@@ -75,6 +108,18 @@ const LIVE_SNIPE_REQUIRE_PINNACLE_LIVE = parseBooleanFromEnv(
     process.env.LIVE_SNIPE_REQUIRE_PINNACLE_LIVE,
     true,
     'LIVE_SNIPE_REQUIRE_PINNACLE_LIVE',
+    'LiveScanner'
+);
+const LIVE_SNIPE_MIN_EV_PERCENT = parseNonNegativeNumberFromEnv(
+    process.env.LIVE_SNIPE_MIN_EV_PERCENT,
+    0,
+    'LIVE_SNIPE_MIN_EV_PERCENT',
+    'LiveScanner'
+);
+const LIVE_SNIPE_MIN_STAKE_SOL = parsePositiveNumberFromEnv(
+    process.env.LIVE_SNIPE_MIN_STAKE_SOL,
+    1,
+    'LIVE_SNIPE_MIN_STAKE_SOL',
     'LiveScanner'
 );
 
@@ -113,6 +158,8 @@ const finishLiveSnipeDiagnostics = () => {
 
 export const getLiveSnipeScanDiagnostics = () => ({
     ...liveSnipeDiagnostics,
+    minEvPercent: LIVE_SNIPE_MIN_EV_PERCENT,
+    minStakeSol: LIVE_SNIPE_MIN_STAKE_SOL,
     reasonCounts: { ...liveSnipeDiagnostics.reasonCounts }
 });
 
@@ -828,17 +875,17 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                             continue;
                         }
 
-                        if (evPercent <= 0) {
-                            bumpLiveSnipeReason('ev_non_positive');
+                        if (evPercent <= LIVE_SNIPE_MIN_EV_PERCENT) {
+                            bumpLiveSnipeReason('ev_below_min');
                             console.log(
-                                `   ⚠️ Skip LIVE_SNIPE por EV<=0: EV=${evPercent.toFixed(2)}% ` +
+                                `   ⚠️ Skip LIVE_SNIPE por EV<min: EV=${evPercent.toFixed(2)}% (min=${LIVE_SNIPE_MIN_EV_PERCENT.toFixed(2)}%) ` +
                                 `| realProb=${realProb.toFixed(2)}% | odd=${altenarOdd}`
                             );
                             continue;
                         }
                         
                         // Solo push si hay valor positivo y min 1 Sol
-                        if (kellyResult.amount >= 1) {
+                        if (kellyResult.amount >= LIVE_SNIPE_MIN_STAKE_SOL) {
                                 liveSnipeDiagnostics.pushed += 1;
                                 bumpLiveSnipeReason('pushed');
                              opportunities.push({
@@ -895,9 +942,9 @@ export const scanLiveOpportunities = async (preFetchedEvents = null, options = {
                                 }
                             });
                         } else {
-                            bumpLiveSnipeReason('stake_below_1');
+                            bumpLiveSnipeReason('stake_below_min');
                             console.log(
-                                `   ⚠️ Skip LIVE_SNIPE por stake<1: stake=${Number(kellyResult.amount || 0).toFixed(2)} ` +
+                                `   ⚠️ Skip LIVE_SNIPE por stake<min: stake=${Number(kellyResult.amount || 0).toFixed(2)} (min=${LIVE_SNIPE_MIN_STAKE_SOL.toFixed(2)}) ` +
                                 `| EV=${evPercent.toFixed(2)}% | realProb=${realProb.toFixed(2)}% | odd=${altenarOdd}`
                             );
                         }
