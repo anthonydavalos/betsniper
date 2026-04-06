@@ -57,6 +57,24 @@ This project demonstrates real-world techniques used in:
 
 Esta sección resume lo implementado desde el último commit para dejar trazabilidad técnica y operativa.
 
+### Actualización 2026-04-05 (v3.4.32)
+
+- **Indicador de cierre reciente de Double Chance (DC):**
+  - El backend ahora detecta eventos donde DC estaba disponible y se cerró recientemente.
+  - El preview expone en `diagnostics`:
+    - `dcClosedRecentlyCount`
+    - `dcClosedRecentWindowMinutes`
+    - `dcClosedRecentlySample`
+  - La UI de ARBITRAJE muestra un badge preventivo `DC cerrado recientemente` para visibilidad operativa.
+- **Anti-fantasma de DC en caché Altenar:**
+  - En la ingesta masiva de Altenar, si el feed actual no trae DC, ya no se hereda el DC previo.
+  - Esto elimina persistencia de cuotas DC stale por reciclaje de snapshot anterior.
+- **Guardia de arbitraje cross-provider (consistencia operativa):**
+  - El preview exige por defecto oportunidades cruzadas entre providers (`Altenar + Arcadia/Pinnacle`).
+  - Se agrega diagnóstico `skippedSameProvider` para auditar descartes por same-book.
+- **Nueva configuración documentada en `.env.example`:**
+  - `ARBITRAGE_DC_CLOSED_RECENT_WINDOW_MINUTES=15`
+
 ### Actualización 2026-04-05 (v3.4.31)
 
 - **Validación anti-stale extendida (burn-in 60m):**

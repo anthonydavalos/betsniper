@@ -4587,6 +4587,11 @@ function App() {
     }, 0);
     const arbitrageFilteredByRisk = Number(arbitrageMeta?.diagnostics?.filteredByRisk || 0);
     const arbitrageDisplayedCount = Number(arbitrageMeta?.count || arbitrageOps.length || 0);
+    const arbitrageDcClosedRecentlyCount = Number(arbitrageMeta?.diagnostics?.dcClosedRecentlyCount || 0);
+    const arbitrageDcClosedWindowMinutes = Number(arbitrageMeta?.diagnostics?.dcClosedRecentWindowMinutes || 0);
+    const arbitrageDcClosedRecentlySample = Array.isArray(arbitrageMeta?.diagnostics?.dcClosedRecentlySample)
+        ? arbitrageMeta.diagnostics.dcClosedRecentlySample
+        : [];
     const arbitrageHealthRequestWithOps = Number(arbitrageHealth24h?.request?.withOpportunities || 0);
     const arbitrageHealthRequestSnapshots = Number(arbitrageHealth24h?.request?.snapshotsInWindow || 0);
     const arbitrageHealthScheduledWithOps = Number(arbitrageHealth24h?.scheduled?.withOpportunities || 0);
@@ -5104,6 +5109,16 @@ function App() {
                                 <div className={`inline-flex items-center rounded-md border px-2 py-1 text-[10px] font-semibold ${arbitrageStatus.className}`}>
                                     {arbitrageStatus.label}
                                 </div>
+                                {arbitrageDcClosedRecentlyCount > 0 && (
+                                    <div
+                                        className="inline-flex items-center rounded-md border border-amber-500/40 bg-amber-500/15 px-2 py-1 text-[10px] font-semibold text-amber-200"
+                                        title={arbitrageDcClosedRecentlySample
+                                            .map((row) => `${row?.match || row?.eventId || 'evento'} @ ${formatTimeSafe(row?.closedAt)}`)
+                                            .join(' | ')}
+                                    >
+                                        {`DC cerrado recientemente: ${arbitrageDcClosedRecentlyCount}${arbitrageDcClosedWindowMinutes > 0 ? ` (<= ${arbitrageDcClosedWindowMinutes}m)` : ''}`}
+                                    </div>
+                                )}
                                 <div className="text-[10px] text-slate-400">
                                     {`Pulso 24h | Request ${arbitrageHealthRequestWithOps}/${arbitrageHealthRequestSnapshots} con señal | Scheduled ${arbitrageHealthScheduledWithOps}/${arbitrageHealthScheduledSnapshots} | Última señal: ${arbitrageHealthLastSignalLabel}${arbitrageHealth24h?.lastSignalTrigger ? ` (${arbitrageHealth24h.lastSignalTrigger})` : ''}`}
                                 </div>

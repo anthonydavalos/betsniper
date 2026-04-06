@@ -160,6 +160,37 @@ const getPriorityScore = (event, linkedSet) => {
     return score;
 };
 
+const hasDoubleChanceOdds = (odds = {}) => {
+    const dc = odds?.doubleChance || {};
+    return [dc.homeDraw, dc.homeAway, dc.drawAway].some((value) => {
+        const price = Number(value);
+        return Number.isFinite(price) && price > 1;
+    });
+};
+
+const applyDcLifecycleMetadata = (row, nextOdds, updatedAt) => {
+    if (!row || typeof row !== 'object') return;
+
+    const prevHasDc = hasDoubleChanceOdds(row?.odds || {});
+    const nextHasDc = hasDoubleChanceOdds(nextOdds || {});
+
+    row.odds = nextOdds;
+    row.lastUpdated = updatedAt;
+    row.dcMarketOpen = nextHasDc;
+
+    if (nextHasDc) {
+        row.dcLastSeenAt = updatedAt;
+        row.dcMarketClosedAt = null;
+        return;
+    }
+
+    if (prevHasDc) {
+        row.dcMarketClosedAt = updatedAt;
+    } else if (!row.dcMarketClosedAt) {
+        row.dcMarketClosedAt = null;
+    }
+};
+
 const extractOddsFromDetails = (details, eventName = '') => {
     const safeOdds = { home: 0, draw: 0, away: 0, doubleChance: {}, totals: [], btts: {} };
     if (!details || !Array.isArray(details.markets) || !Array.isArray(details.odds)) return safeOdds;
@@ -335,8 +366,7 @@ export const refreshAltenarEventDetailsNow = async ({ eventId } = {}) => {
         const changed = previousHash !== nextHash;
         const updatedAt = new Date().toISOString();
 
-        target.odds = extracted;
-        target.lastUpdated = updatedAt;
+        applyDcLifecycleMetadata(target, extracted, updatedAt);
         rows[idx] = target;
         db.data.altenarUpcoming = rows;
         db.data.altenarLastUpdate = updatedAt;
@@ -579,8 +609,7 @@ const refreshDueEventDetails = async () => {
             if (!update) continue;
             const target = byId.get(update.id);
             if (!target) continue;
-            target.odds = update.odds;
-            target.lastUpdated = update.lastUpdated;
+            applyDcLifecycleMetadata(target, update.odds, update.lastUpdated);
             refreshedCount += 1;
             if (update.changed) changedCount += 1;
         }

@@ -120,12 +120,16 @@ export const ingestAltenarPrematch = async (force = false) => {
       // Puede que solo tenga 1x2, o solo Totales, etc.
       // Modificamos para ser permisivos si hay ALGUNA información útil.
       const previous = existingById.get(String(event.id));
+      const previousHasDc = Boolean(
+        previous?.odds?.doubleChance?.homeDraw ||
+        previous?.odds?.doubleChance?.homeAway ||
+        previous?.odds?.doubleChance?.drawAway
+      );
       const extractedHasDc = Boolean(
         odds?.doubleChance?.homeDraw || odds?.doubleChance?.homeAway || odds?.doubleChance?.drawAway
       );
-      const mergedDoubleChance = extractedHasDc
-        ? odds.doubleChance
-        : (previous?.odds?.doubleChance || {});
+      const mergedDoubleChance = extractedHasDc ? odds.doubleChance : {};
+      const updatedAt = new Date().toISOString();
 
       if (odds.home || odds.draw || odds.away || odds.totals.length > 0 || odds.btts.yes || extractedHasDc) {
         const cleanObj = {
@@ -146,7 +150,14 @@ export const ingestAltenarPrematch = async (force = false) => {
               totals: odds.totals, // Array [{ line, over, under }]
               btts: odds.btts      // { yes, no }
           },
-          lastUpdated: new Date().toISOString()
+          lastUpdated: updatedAt,
+          dcMarketOpen: extractedHasDc,
+          dcLastSeenAt: extractedHasDc
+            ? updatedAt
+            : (previous?.dcLastSeenAt || null),
+          dcMarketClosedAt: extractedHasDc
+            ? null
+            : (previousHasDc ? updatedAt : (previous?.dcMarketClosedAt || null))
         };
         cleanEvents.push(cleanObj);
       }
