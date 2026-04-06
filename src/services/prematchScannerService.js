@@ -1,11 +1,62 @@
 import db, { writeDBWithRetry } from '../db/database.js';
-import { findMatch, isTimeMatch, normalizeName, getSimilarity, getTokenSimilarity, TEAM_ALIASES } from '../utils/teamMatcher.js';
+import { findMatch, isTimeMatch, normalizeName, getSimilarity, getTokenSimilarity, TEAM_ALIASES, diagnoseNoMatch } from '../utils/teamMatcher.js';
 import { calculateKellyStake } from '../utils/mathUtils.js';
 import { getAllPinnaclePrematchOdds } from './pinnacleService.js';
 import { getKellyBankrollBase } from './bookyAccountService.js';
 
+const parseNonNegativeNumberOr = (value, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+const parsePositiveNumberOr = (value, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const parsePositiveIntOr = (value, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    const intN = Math.floor(n);
+    return intN > 0 ? intN : fallback;
+};
+
+const parseBooleanFromEnv = (rawValue, fallback = false) => {
+    if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
+        return fallback;
+    }
+
+    const normalized = String(rawValue).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+};
+
+const parseUnitIntervalOr = (value, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    if (n < 0) return 0;
+    if (n > 1) return 1;
+    return n;
+};
+
 const NIGHT_MODE_START_HOUR_PE = 18;
 const NEXT_DAY_CUTOFF_HOUR_PE = 6;
+const PREMATCH_VALUE_MIN_EV_PERCENT = parseNonNegativeNumberOr(process.env.PREMATCH_VALUE_MIN_EV_PERCENT, 2);
+const PREMATCH_VALUE_MIN_STAKE_SOL = parsePositiveNumberOr(process.env.PREMATCH_VALUE_MIN_STAKE_SOL, 1);
+const PREMATCH_VALUE_ENABLE_STABILITY_FILTER = parseBooleanFromEnv(process.env.PREMATCH_VALUE_ENABLE_STABILITY_FILTER, false);
+const PREMATCH_VALUE_STABILITY_MIN_HITS = parsePositiveIntOr(process.env.PREMATCH_VALUE_STABILITY_MIN_HITS, 2);
+const PREMATCH_VALUE_STABILITY_MIN_AGE_MS = parsePositiveIntOr(process.env.PREMATCH_VALUE_STABILITY_MIN_AGE_MS, 4000);
+const PREMATCH_VALUE_STABILITY_WINDOW_MS = Math.max(
+    PREMATCH_VALUE_STABILITY_MIN_AGE_MS * 2,
+    parsePositiveIntOr(process.env.PREMATCH_VALUE_STABILITY_WINDOW_MS, 60000)
+);
+const PREMATCH_DIAG_MAX_ENTRIES = parsePositiveIntOr(process.env.PREMATCH_DIAG_MAX_ENTRIES, 2000);
+const PREMATCH_DIAG_TOP_REJECTED_LIMIT = parsePositiveIntOr(process.env.PREMATCH_DIAG_TOP_REJECTED_LIMIT, 10);
+const PREMATCH_DIAG_MISSING_LINK_SAMPLE_LIMIT = parsePositiveIntOr(process.env.PREMATCH_DIAG_MISSING_LINK_SAMPLE_LIMIT, 8);
+const PREMATCH_LINK_SECOND_PASS_ENABLED = parseBooleanFromEnv(process.env.PREMATCH_LINK_SECOND_PASS_ENABLED, true);
+const PREMATCH_LINK_SECOND_PASS_MAX_TIME_DIFF_MINUTES = parsePositiveIntOr(process.env.PREMATCH_LINK_SECOND_PASS_MAX_TIME_DIFF_MINUTES, 45);
+const PREMATCH_LINK_SECOND_PASS_MIN_PAIR_SCORE = parseUnitIntervalOr(process.env.PREMATCH_LINK_SECOND_PASS_MIN_PAIR_SCORE, 0.82);
 const PAIR_FALLBACK_TIME_WINDOW_MINUTES = Number.isFinite(Number(process.env.MATCH_TIME_EXTENDED_TOLERANCE_MINUTES))
     ? Number(process.env.MATCH_TIME_EXTENDED_TOLERANCE_MINUTES)
     : 30;
@@ -185,11 +236,301 @@ const applyLinkToDbMirror = (pinMatch = {}, altenarMatch = {}) => {
     return updated;
 };
 
+const getTimeDiffMinutesSafe = (a, b) => {
+    const ta = new Date(a || 0).getTime();
+    const tb = new Date(b || 0).getTime();
+    if (!Number.isFinite(ta) || !Number.isFinite(tb)) return NaN;
+    return Math.abs(ta - tb) / 60000;
+};
+
+const computePercentiles = (values = []) => {
+    const nums = (Array.isArray(values) ? values : [])
+        .map(v => Number(v))
+        .filter(v => Number.isFinite(v))
+        .sort((a, b) => a - b);
+
+    if (nums.length === 0) {
+        return {
+            count: 0,
+            min: null,
+            p50: null,
+            p75: null,
+            p90: null,
+            p95: null,
+            max: null
+        };
+    }
+
+    const pick = (q) => {
+        if (nums.length === 1) return nums[0];
+        const idx = Math.max(0, Math.min(nums.length - 1, Math.floor((nums.length - 1) * q)));
+        return nums[idx];
+    };
+
+    return {
+        count: nums.length,
+        min: Number(nums[0].toFixed(4)),
+        p50: Number(pick(0.50).toFixed(4)),
+        p75: Number(pick(0.75).toFixed(4)),
+        p90: Number(pick(0.90).toFixed(4)),
+        p95: Number(pick(0.95).toFixed(4)),
+        max: Number(nums[nums.length - 1].toFixed(4))
+    };
+};
+
+const pushTopByEv = (bucket = [], row = {}, limit = 10) => {
+    const ev = Number(row?.ev);
+    if (!Number.isFinite(ev)) return;
+
+    bucket.push({
+        ...row,
+        ev: Number(ev.toFixed(4))
+    });
+
+    bucket.sort((a, b) => Number(b?.ev || -Infinity) - Number(a?.ev || -Infinity));
+    if (bucket.length > limit) {
+        bucket.splice(limit);
+    }
+};
+
+const findSecondPassDirectPair = (pinMatch = {}, altenarEvents = []) => {
+    if (!PREMATCH_LINK_SECOND_PASS_ENABLED) return null;
+    if (!pinMatch?.home || !pinMatch?.away || !Array.isArray(altenarEvents) || altenarEvents.length === 0) return null;
+
+    let best = null;
+    let bestScore = -1;
+    let bestTimeDiff = Number.POSITIVE_INFINITY;
+
+    for (const candidate of altenarEvents) {
+        if (!candidate) continue;
+        const candidateDate = candidate.startDate || candidate.date;
+        const timeDiffMinutes = getTimeDiffMinutesSafe(pinMatch.date, candidateDate);
+        if (!Number.isFinite(timeDiffMinutes) || timeDiffMinutes > PREMATCH_LINK_SECOND_PASS_MAX_TIME_DIFF_MINUTES) continue;
+
+        const pairCheck = analyzePairMatch(pinMatch, candidate);
+        if (!pairCheck.valid || pairCheck.orientation !== 'direct') continue;
+        if (pairCheck.bestScore < PREMATCH_LINK_SECOND_PASS_MIN_PAIR_SCORE) continue;
+
+        if (
+            pairCheck.bestScore > bestScore ||
+            (pairCheck.bestScore === bestScore && timeDiffMinutes < bestTimeDiff)
+        ) {
+            best = candidate;
+            bestScore = pairCheck.bestScore;
+            bestTimeDiff = timeDiffMinutes;
+        }
+    }
+
+    if (!best) return null;
+    return {
+        match: best,
+        pairScore: bestScore,
+        timeDiffMinutes: Number(bestTimeDiff.toFixed(2)),
+        method: 'pair_second_pass'
+    };
+};
+
+const buildPrematchEvDiagnostics = ({
+    evEvaluated = [],
+    evRejectedBelowMin = [],
+    evRejectedStake = [],
+    evRejectedWarmup = [],
+    evPublished = [],
+    topRejectedByEv = [],
+    topPublishedByEv = []
+} = {}) => ({
+    evaluated: computePercentiles(evEvaluated),
+    rejectedBelowMin: computePercentiles(evRejectedBelowMin),
+    rejectedStake: computePercentiles(evRejectedStake),
+    rejectedWarmup: computePercentiles(evRejectedWarmup),
+    published: computePercentiles(evPublished),
+    topRejectedByEv: [...topRejectedByEv],
+    topPublishedByEv: [...topPublishedByEv]
+});
+
+const prematchOpportunityStability = new Map();
+const prematchDecisionLog = [];
+let lastPrematchScanStats = {
+    at: null,
+    totalPinnacleRows: 0,
+    validFutureRows: 0,
+    altenarRows: 0,
+    linkedRows: 0,
+    secondPassLinksCreated: 0,
+    valueBets: 0,
+    expiredRows: 0,
+    reasonCounts: {},
+    evDiagnostics: {},
+    missingLinkSamples: []
+};
+
+const appendPrematchDecisionLog = (payload = {}) => {
+    prematchDecisionLog.push({
+        at: new Date().toISOString(),
+        ...payload
+    });
+
+    if (prematchDecisionLog.length > PREMATCH_DIAG_MAX_ENTRIES) {
+        prematchDecisionLog.splice(0, prematchDecisionLog.length - PREMATCH_DIAG_MAX_ENTRIES);
+    }
+};
+
+const prunePrematchStabilityCache = () => {
+    const now = Date.now();
+    for (const [key, state] of prematchOpportunityStability.entries()) {
+        if ((now - Number(state?.lastSeenAt || 0)) > PREMATCH_VALUE_STABILITY_WINDOW_MS * 2) {
+            prematchOpportunityStability.delete(key);
+        }
+    }
+};
+
+const buildPrematchOpportunityKey = (op = {}) => {
+    const eventId = String(op?.eventId || op?.id || op?.altenarId || 'na');
+    const pinnacleId = String(op?.pinnacleId || 'na');
+    const market = String(op?.market || '').trim().toLowerCase();
+    const selection = String(op?.selection || '').trim().toLowerCase();
+    return `${eventId}|${pinnacleId}|${market}|${selection}`;
+};
+
+const shouldPublishStablePrematchOpportunity = (opKey = '') => {
+    if (!PREMATCH_VALUE_ENABLE_STABILITY_FILTER) return true;
+    if (!opKey) return true;
+
+    const now = Date.now();
+    const prev = prematchOpportunityStability.get(opKey);
+
+    if (!prev || (now - prev.lastSeenAt) > PREMATCH_VALUE_STABILITY_WINDOW_MS) {
+        prematchOpportunityStability.set(opKey, {
+            firstSeenAt: now,
+            lastSeenAt: now,
+            hits: 1
+        });
+
+        // Si el umbral es 1, no debe exigir una segunda confirmación.
+        if (PREMATCH_VALUE_STABILITY_MIN_HITS <= 1) {
+            return true;
+        }
+        return false;
+    }
+
+    const next = {
+        firstSeenAt: prev.firstSeenAt,
+        lastSeenAt: now,
+        hits: prev.hits + 1
+    };
+    prematchOpportunityStability.set(opKey, next);
+
+    if (PREMATCH_VALUE_STABILITY_MIN_HITS <= 1) {
+        return true;
+    }
+
+    const age = now - next.firstSeenAt;
+    return next.hits >= PREMATCH_VALUE_STABILITY_MIN_HITS && age >= PREMATCH_VALUE_STABILITY_MIN_AGE_MS;
+};
+
+export const getPrematchDecisionDiagnostics = ({ limit = 200 } = {}) => {
+    const safeLimit = Math.max(1, Math.min(2000, Number(limit) || 200));
+    const recent = prematchDecisionLog.slice(-safeLimit);
+
+    const reasonBreakdown = {};
+    for (const row of recent) {
+        const key = String(row?.reason || row?.outcome || 'unknown');
+        reasonBreakdown[key] = (reasonBreakdown[key] || 0) + 1;
+    }
+
+    return {
+        generatedAt: new Date().toISOString(),
+        scanner: {
+            prematchValueMinEvPercent: PREMATCH_VALUE_MIN_EV_PERCENT,
+            prematchValueMinStakeSol: PREMATCH_VALUE_MIN_STAKE_SOL,
+            prematchValueStabilityEnabled: PREMATCH_VALUE_ENABLE_STABILITY_FILTER,
+            prematchValueStabilityMinHits: PREMATCH_VALUE_STABILITY_MIN_HITS,
+            prematchValueStabilityMinAgeMs: PREMATCH_VALUE_STABILITY_MIN_AGE_MS,
+            prematchValueStabilityWindowMs: PREMATCH_VALUE_STABILITY_WINDOW_MS,
+            prematchDiagTopRejectedLimit: PREMATCH_DIAG_TOP_REJECTED_LIMIT,
+            prematchDiagMissingLinkSampleLimit: PREMATCH_DIAG_MISSING_LINK_SAMPLE_LIMIT,
+            prematchLinkSecondPassEnabled: PREMATCH_LINK_SECOND_PASS_ENABLED,
+            prematchLinkSecondPassMaxTimeDiffMinutes: PREMATCH_LINK_SECOND_PASS_MAX_TIME_DIFF_MINUTES,
+            prematchLinkSecondPassMinPairScore: PREMATCH_LINK_SECOND_PASS_MIN_PAIR_SCORE
+        },
+        pipeline: {
+            ...lastPrematchScanStats,
+            reasonCounts: { ...(lastPrematchScanStats?.reasonCounts || {}) }
+        },
+        summary: {
+            totalStored: prematchDecisionLog.length,
+            returned: recent.length,
+            reasonBreakdown
+        },
+        recent
+    };
+};
+
 // =====================================================================
 // SERVICE: PRE-MATCH VALUE SCANNER & LINKER
 // =====================================================================
 
 export const scanPrematchOpportunities = async () => {
+    const reasonCounts = {};
+    const bumpReason = (reason) => {
+        const key = String(reason || 'unknown');
+        reasonCounts[key] = (reasonCounts[key] || 0) + 1;
+    };
+
+    const evEvaluated = [];
+    const evRejectedBelowMin = [];
+    const evRejectedStake = [];
+    const evRejectedWarmup = [];
+    const evPublished = [];
+    const topRejectedByEv = [];
+    const topPublishedByEv = [];
+    const missingLinkSamples = [];
+
+    const trackOpportunityDecision = (row = {}) => {
+        const ev = Number(row?.ev);
+        const reason = String(row?.reason || 'unknown');
+        const outcome = String(row?.outcome || 'unknown');
+
+        if (Number.isFinite(ev)) {
+            evEvaluated.push(ev);
+        }
+
+        if (outcome === 'published') {
+            if (Number.isFinite(ev)) evPublished.push(ev);
+            pushTopByEv(topPublishedByEv, row, PREMATCH_DIAG_TOP_REJECTED_LIMIT);
+            return;
+        }
+
+        if (reason === 'ev_below_min' && Number.isFinite(ev)) {
+            evRejectedBelowMin.push(ev);
+        } else if (reason === 'stake_below_min' && Number.isFinite(ev)) {
+            evRejectedStake.push(ev);
+        } else if (reason === 'stability_warmup' && Number.isFinite(ev)) {
+            evRejectedWarmup.push(ev);
+        }
+
+        pushTopByEv(topRejectedByEv, row, PREMATCH_DIAG_TOP_REJECTED_LIMIT);
+    };
+
+    const captureMissingLinkSample = (pinMatch = {}, altenarEvents = []) => {
+        if (missingLinkSamples.length >= PREMATCH_DIAG_MISSING_LINK_SAMPLE_LIMIT) return;
+
+        const leagueName = pinMatch?.league?.name || pinMatch?.league || '';
+        const diag = diagnoseNoMatch(pinMatch?.home, pinMatch?.date, altenarEvents, leagueName);
+
+        missingLinkSamples.push({
+            pinnacleId: pinMatch?.id || null,
+            match: `${pinMatch?.home || '?'} vs ${pinMatch?.away || '?'}`,
+            date: pinMatch?.date || null,
+            league: leagueName || null,
+            probableReason: diag?.probableReason || 'unknown',
+            bestScore: Number.isFinite(Number(diag?.bestScore)) ? Number(Number(diag.bestScore).toFixed(4)) : null,
+            bestCandidate: diag?.bestCandidate || null
+        });
+    };
+
+    prunePrematchStabilityCache();
+
     try {
         console.log(`\n📡 [Pre-Match Scanner] Buscando Value Bets y Enlazando IDs...`);
 
@@ -347,6 +688,26 @@ export const scanPrematchOpportunities = async () => {
         }
 
         if (pinnacleMatches.length === 0 || altenarCachedEvents.length === 0) {
+            bumpReason('missing_data_sources');
+            lastPrematchScanStats = {
+                at: new Date().toISOString(),
+                totalPinnacleRows: Array.isArray(pinnacleMatches) ? pinnacleMatches.length : 0,
+                validFutureRows: 0,
+                altenarRows: Array.isArray(altenarCachedEvents) ? altenarCachedEvents.length : 0,
+                linkedRows: 0,
+                secondPassLinksCreated: 0,
+                valueBets: 0,
+                expiredRows: 0,
+                reasonCounts: { ...reasonCounts },
+                evDiagnostics: buildPrematchEvDiagnostics(),
+                missingLinkSamples: []
+            };
+            appendPrematchDecisionLog({
+                decision: 'no-opportunities',
+                outcome: 'none',
+                reason: 'missing_data_sources',
+                pipeline: { ...lastPrematchScanStats }
+            });
             console.log('   ⚠️ Faltan datos en DB. Ejecuta los scripts de ingesta (node scripts/ingest-pinnacle.js y node scripts/ingest-altenar.js).');
             return [];
         }
@@ -354,6 +715,7 @@ export const scanPrematchOpportunities = async () => {
         const valueBets = [];
         let totalMatchesFound = 0;
         let newLinksCreated = 0; // Contador de nuevos enlaces
+        let secondPassLinksCreated = 0;
         let expiredCount = 0;
 
         // Limpieza de partidos pasados (Started)
@@ -363,7 +725,10 @@ export const scanPrematchOpportunities = async () => {
             // Permitimos un margen de 5 min después del inicio por si hay delay en "En Vivo"
             // Pero idealmente, si ya empezó, es Live.
             const isFuture = matchDate > new Date(now.getTime() - 5 * 60000); 
-            if (!isFuture) expiredCount++;
+            if (!isFuture) {
+                expiredCount++;
+                bumpReason('expired_or_started');
+            }
             return isFuture;
         });
 
@@ -454,6 +819,21 @@ export const scanPrematchOpportunities = async () => {
                     }
                 }
 
+                // Second-pass conservador: tolerancia temporal controlada + score alto de par.
+                if (!matchResult) {
+                    const secondPass = findSecondPassDirectPair(pinMatch, altenarCachedEvents);
+                    if (secondPass?.match) {
+                        matchResult = {
+                            match: secondPass.match,
+                            score: secondPass.pairScore,
+                            method: secondPass.method,
+                            meta: {
+                                timeDiffMinutes: secondPass.timeDiffMinutes
+                            }
+                        };
+                    }
+                }
+
                 if (matchResult) {
                     const pairCheck = analyzePairMatch(pinMatch, matchResult.match);
                     if (pairCheck.valid && pairCheck.orientation === 'direct') {
@@ -467,6 +847,10 @@ export const scanPrematchOpportunities = async () => {
                         }
                         applyLinkToDbMirror(pinMatch, matchResult.match);
                         newLinksCreated++;
+                        if (matchResult?.method === 'pair_second_pass') {
+                            secondPassLinksCreated++;
+                            bumpReason('second_pass_linked');
+                        }
                         console.log(`   🔗 NUEVO ENLACE: ${pinMatch.home} (Pin) <--> ${matchResult.match.name} (Alt)`);
                     } else if (pairCheck.valid && pairCheck.orientation === 'swapped') {
                         console.log(`   ⚠️ NO LINK AUTO (SWAPPED): ${pinMatch.home} vs ${pinMatch.away} <-> ${matchResult.match.name}`);
@@ -512,12 +896,32 @@ export const scanPrematchOpportunities = async () => {
         for (const pinMatch of validPinnacleMatches) {
             
             let altenarEvent = null;
+            const dbMirror = (db.data.upcomingMatches || []).find(m => String(m.id) === String(pinMatch.id));
 
             // ESTRATEGIA HÍBRIDA: ID CACHEADO vs BUSQUEDA FUZZY
             if (pinMatch.altenarId) {
                 altenarEvent = altenarCachedEvents.find(e => e.id === pinMatch.altenarId);
             }
             // NOTA: Ya linkeamos arriba en Fase 1. Si no tiene link, es que falló findMatch globalmente.
+
+            if (!altenarEvent) {
+                const secondPass = findSecondPassDirectPair(pinMatch, altenarCachedEvents);
+                if (secondPass?.match) {
+                    altenarEvent = secondPass.match;
+                    pinMatch.altenarId = secondPass.match.id;
+                    pinMatch.altenarName = secondPass.match.name;
+                    pinMatch.linkSource = 'auto_second_pass';
+                    if (dbMirror) {
+                        dbMirror.altenarId = secondPass.match.id;
+                        dbMirror.altenarName = secondPass.match.name;
+                        dbMirror.linkSource = 'auto_second_pass';
+                    }
+                    applyLinkToDbMirror(pinMatch, secondPass.match);
+                    newLinksCreated++;
+                    secondPassLinksCreated++;
+                    bumpReason('second_pass_linked');
+                }
+            }
 
             if (altenarEvent) {
                 totalMatchesFound++;
@@ -529,9 +933,9 @@ export const scanPrematchOpportunities = async () => {
                 // ==========================================
                 const realProbs1x2 = getFairProbabilities(pinMatch.odds);
                 if (realProbs1x2 && altenarOdds) {
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs1x2.home, currentBankroll, '1x2', pinMatch.odds?.home);
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs1x2.draw, currentBankroll, '1x2', pinMatch.odds?.draw);
-                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs1x2.away, currentBankroll, '1x2', pinMatch.odds?.away);
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Home', altenarOdds.home, realProbs1x2.home, currentBankroll, '1x2', pinMatch.odds?.home, { bumpReason, onDecision: trackOpportunityDecision });
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Draw', altenarOdds.draw, realProbs1x2.draw, currentBankroll, '1x2', pinMatch.odds?.draw, { bumpReason, onDecision: trackOpportunityDecision });
+                     evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'Away', altenarOdds.away, realProbs1x2.away, currentBankroll, '1x2', pinMatch.odds?.away, { bumpReason, onDecision: trackOpportunityDecision });
                 }
 
                 // A.1) Analizar Double Chance
@@ -552,15 +956,15 @@ export const scanPrematchOpportunities = async () => {
 
                     if (dcAlt.homeDraw && dcPin.homeDraw) {
                         const realProb = dcFairProbs.homeDraw;
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '1X', dcAlt.homeDraw, realProb, currentBankroll, 'Double Chance', dcPin.homeDraw);
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '1X', dcAlt.homeDraw, realProb, currentBankroll, 'Double Chance', dcPin.homeDraw, { bumpReason, onDecision: trackOpportunityDecision });
                     }
                     if (dcAlt.homeAway && dcPin.homeAway) {
                         const realProb = dcFairProbs.homeAway;
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '12', dcAlt.homeAway, realProb, currentBankroll, 'Double Chance', dcPin.homeAway);
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, '12', dcAlt.homeAway, realProb, currentBankroll, 'Double Chance', dcPin.homeAway, { bumpReason, onDecision: trackOpportunityDecision });
                     }
                     if (dcAlt.drawAway && dcPin.drawAway) {
                         const realProb = dcFairProbs.drawAway;
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'X2', dcAlt.drawAway, realProb, currentBankroll, 'Double Chance', dcPin.drawAway);
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'X2', dcAlt.drawAway, realProb, currentBankroll, 'Double Chance', dcPin.drawAway, { bumpReason, onDecision: trackOpportunityDecision });
                     }
                 }
 
@@ -578,9 +982,9 @@ export const scanPrematchOpportunities = async () => {
                             if (realProbsTotal) {
 
                                 // Over (p1)
-                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Over ${pinTotal.line}`, altTotal.over, realProbsTotal.p1, currentBankroll, 'Total', pinTotal.over);
+                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Over ${pinTotal.line}`, altTotal.over, realProbsTotal.p1, currentBankroll, 'Total', pinTotal.over, { bumpReason, onDecision: trackOpportunityDecision });
                                 // Under (p2)
-                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Under ${pinTotal.line}`, altTotal.under, realProbsTotal.p2, currentBankroll, 'Total', pinTotal.under);
+                                evaluateOpportunity(valueBets, pinMatch, altenarEvent, `Under ${pinTotal.line}`, altTotal.under, realProbsTotal.p2, currentBankroll, 'Total', pinTotal.under, { bumpReason, onDecision: trackOpportunityDecision });
                             }
                         }
                     }
@@ -595,10 +999,13 @@ export const scanPrematchOpportunities = async () => {
                     const realProbsBTTS = getFair2Way(pinMatch.odds.btts.yes, pinMatch.odds.btts.no);
                     
                     if (realProbsBTTS) {
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS Yes', altenarOdds.btts.yes, realProbsBTTS.p1, currentBankroll, 'BTTS', pinMatch.odds?.btts?.yes);
-                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS No', altenarOdds.btts.no, realProbsBTTS.p2, currentBankroll, 'BTTS', pinMatch.odds?.btts?.no);
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS Yes', altenarOdds.btts.yes, realProbsBTTS.p1, currentBankroll, 'BTTS', pinMatch.odds?.btts?.yes, { bumpReason, onDecision: trackOpportunityDecision });
+                        evaluateOpportunity(valueBets, pinMatch, altenarEvent, 'BTTS No', altenarOdds.btts.no, realProbsBTTS.p2, currentBankroll, 'BTTS', pinMatch.odds?.btts?.no, { bumpReason, onDecision: trackOpportunityDecision });
                     }
                 }
+            } else {
+                bumpReason('missing_altenar_link');
+                captureMissingLinkSample(pinMatch, altenarCachedEvents);
             }
         }
 
@@ -643,6 +1050,34 @@ export const scanPrematchOpportunities = async () => {
         console.log(`   - Filtrados (Ya iniciaron): ${expiredCount}`);
         console.log(`   - Enlazados con Altenar:    ${totalLinked}`);
 
+        lastPrematchScanStats = {
+            at: new Date().toISOString(),
+            totalPinnacleRows: Array.isArray(pinnacleMatches) ? pinnacleMatches.length : 0,
+            validFutureRows: validPinnacleMatches.length,
+            altenarRows: Array.isArray(altenarCachedEvents) ? altenarCachedEvents.length : 0,
+            linkedRows: totalLinked,
+            secondPassLinksCreated,
+            valueBets: valueBets.length,
+            expiredRows: expiredCount,
+            reasonCounts: { ...reasonCounts },
+            evDiagnostics: buildPrematchEvDiagnostics({
+                evEvaluated,
+                evRejectedBelowMin,
+                evRejectedStake,
+                evRejectedWarmup,
+                evPublished,
+                topRejectedByEv,
+                topPublishedByEv
+            }),
+            missingLinkSamples: [...missingLinkSamples]
+        };
+        appendPrematchDecisionLog({
+            decision: valueBets.length > 0 ? 'has-opportunities' : 'no-opportunities',
+            outcome: valueBets.length > 0 ? 'value-bets-detected' : 'none',
+            reason: valueBets.length > 0 ? 'published' : 'no-published',
+            pipeline: { ...lastPrematchScanStats }
+        });
+
         if (valueBets.length > 0) {
             console.log(`💎 ${valueBets.length} VALUE BETS DETECTADAS`);
         } else {
@@ -652,60 +1087,132 @@ export const scanPrematchOpportunities = async () => {
         return valueBets;
 
     } catch (error) {
+        bumpReason('scan_error');
+        lastPrematchScanStats = {
+            at: new Date().toISOString(),
+            totalPinnacleRows: 0,
+            validFutureRows: 0,
+            altenarRows: 0,
+            linkedRows: 0,
+            secondPassLinksCreated: 0,
+            valueBets: 0,
+            expiredRows: 0,
+            reasonCounts: { ...reasonCounts },
+            evDiagnostics: buildPrematchEvDiagnostics({
+                evEvaluated,
+                evRejectedBelowMin,
+                evRejectedStake,
+                evRejectedWarmup,
+                evPublished,
+                topRejectedByEv,
+                topPublishedByEv
+            }),
+            missingLinkSamples: [...missingLinkSamples],
+            error: error?.message || String(error)
+        };
+        appendPrematchDecisionLog({
+            decision: 'scan-error',
+            outcome: 'error',
+            reason: 'scan_error',
+            error: error?.message || String(error),
+            pipeline: { ...lastPrematchScanStats }
+        });
         console.error('❌ Error en Pre-Match Scanner:', error.message);
         return [];
     }
 };
 
 // Helper interno para evaluar y agregar oportunidad
-const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd, realProb, bankroll, marketName = '1x2', pinnacleReferenceOdd = null) => {
-    if (!offeredOdd || offeredOdd <= 1) return;
+const evaluateOpportunity = (resultsArray, dbMatch, event, listSide, offeredOdd, realProb, bankroll, marketName = '1x2', pinnacleReferenceOdd = null, options = {}) => {
+    const bumpReason = typeof options.bumpReason === 'function' ? options.bumpReason : () => {};
+    const onDecision = typeof options.onDecision === 'function' ? options.onDecision : () => {};
+
+    const baseRow = {
+        pinnacleId: dbMatch?.id || null,
+        eventId: event?.id || null,
+        match: `${dbMatch?.home || '?'} vs ${dbMatch?.away || '?'}`,
+        market: marketName,
+        selection: listSide,
+        offeredOdd: Number(offeredOdd),
+        pinnacleReferenceOdd: Number.isFinite(Number(pinnacleReferenceOdd)) ? Number(pinnacleReferenceOdd) : null,
+        realProbPercent: Number.isFinite(Number(realProb)) ? Number(Number(realProb).toFixed(4)) : null
+    };
+
+    if (!offeredOdd || offeredOdd <= 1) {
+        bumpReason('offered_odd_invalid');
+        onDecision({ ...baseRow, outcome: 'rejected', reason: 'offered_odd_invalid' });
+        return;
+    }
 
     // EV Formula: (ProbReal * CuotaOfrecida) - 1
     const evPercentage = (realProb * offeredOdd - 1) * 100;
-    
-    // Filtro de Valor (> 2% EV por defecto)
-    if (evPercentage > 2.0) {
-        // Calcular Stake Kelly
-        // ESTRATEGIA: PREMATCH_VALUE (Perfil Bajo Riesgo, Alta Confianza)
-        const kellyResult = calculateKellyStake(realProb * 100, offeredOdd, bankroll, 'PREMATCH_VALUE');
-        
-        // [FILTER] Min Stake 1.00 PEN (Evitar centavos)
-        if (kellyResult.amount < 1) return;
 
-        resultsArray.push({
-            type: 'PREMATCH_VALUE',
-            eventId: event.id, // ID Vital para tracking
-            pinnacleId: dbMatch.id, // ID Pinnacle para referencia
-            match: `${dbMatch.home} vs ${dbMatch.away}`,
-            league: dbMatch.league?.name, // Nombre de liga formateado
-            catId: event.catId, // Metadata para liquidación
-            champId: event.champId,
-            sportId: event.sportId || 66,
-            date: dbMatch.date,
-            market: marketName,
-            selection: listSide,
-            odd: offeredOdd,
-            pinnaclePrice: Number.isFinite(Number(pinnacleReferenceOdd)) && Number(pinnacleReferenceOdd) > 1
-                ? Number(pinnacleReferenceOdd)
-                : null,
-            realProb: realProb * 100,
-            ev: evPercentage,
-            kellyStake: kellyResult.amount, // Extraer el monto ($) del objeto devuelto
-            bookmaker: 'Altenar',
-            snapshotTime: new Date().toISOString(),
-            // [NEW] Pinnacle Context for UI
-            pinnacleInfo: {
-                prematchContext: {
-                    home: dbMatch.odds?.home,
-                    draw: dbMatch.odds?.draw,
-                    away: dbMatch.odds?.away,
-                    over25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over,
-                    under25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under,
-                    totals: dbMatch.odds?.totals || [],
-                    btts: dbMatch.odds?.btts || null,
-                }
-            }
-        });
+    if (!Number.isFinite(evPercentage)) {
+        bumpReason('ev_invalid');
+        onDecision({ ...baseRow, outcome: 'rejected', reason: 'ev_invalid', ev: evPercentage });
+        return;
     }
+
+    // Filtro de Valor (configurable)
+    if (evPercentage <= PREMATCH_VALUE_MIN_EV_PERCENT) {
+        bumpReason('ev_below_min');
+        onDecision({ ...baseRow, outcome: 'rejected', reason: 'ev_below_min', ev: evPercentage });
+        return;
+    }
+
+    // Calcular Stake Kelly
+    // ESTRATEGIA: PREMATCH_VALUE (Perfil Bajo Riesgo, Alta Confianza)
+    const kellyResult = calculateKellyStake(realProb * 100, offeredOdd, bankroll, 'PREMATCH_VALUE');
+    const kellyAmount = Number(kellyResult?.amount);
+    if (!Number.isFinite(kellyAmount) || kellyAmount < PREMATCH_VALUE_MIN_STAKE_SOL) {
+        bumpReason('stake_below_min');
+        onDecision({ ...baseRow, outcome: 'rejected', reason: 'stake_below_min', ev: evPercentage, kellyStake: kellyAmount });
+        return;
+    }
+
+    const candidate = {
+        type: 'PREMATCH_VALUE',
+        eventId: event.id, // ID Vital para tracking
+        pinnacleId: dbMatch.id, // ID Pinnacle para referencia
+        match: `${dbMatch.home} vs ${dbMatch.away}`,
+        league: dbMatch.league?.name, // Nombre de liga formateado
+        catId: event.catId, // Metadata para liquidación
+        champId: event.champId,
+        sportId: event.sportId || 66,
+        date: dbMatch.date,
+        market: marketName,
+        selection: listSide,
+        odd: offeredOdd,
+        pinnaclePrice: Number.isFinite(Number(pinnacleReferenceOdd)) && Number(pinnacleReferenceOdd) > 1
+            ? Number(pinnacleReferenceOdd)
+            : null,
+        realProb: realProb * 100,
+        ev: evPercentage,
+        kellyStake: kellyAmount, // Extraer el monto ($) del objeto devuelto
+        bookmaker: 'Altenar',
+        snapshotTime: new Date().toISOString(),
+        // [NEW] Pinnacle Context for UI
+        pinnacleInfo: {
+            prematchContext: {
+                home: dbMatch.odds?.home,
+                draw: dbMatch.odds?.draw,
+                away: dbMatch.odds?.away,
+                over25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.over,
+                under25: (dbMatch.odds?.totals || []).find(t => Math.abs(t.line - 2.5) < 0.1)?.under,
+                totals: dbMatch.odds?.totals || [],
+                btts: dbMatch.odds?.btts || null,
+            }
+        }
+    };
+
+    const stabilityKey = buildPrematchOpportunityKey(candidate);
+    if (!shouldPublishStablePrematchOpportunity(stabilityKey)) {
+        bumpReason('stability_warmup');
+        onDecision({ ...baseRow, outcome: 'rejected', reason: 'stability_warmup', ev: evPercentage, kellyStake: kellyAmount });
+        return;
+    }
+
+    resultsArray.push(candidate);
+    bumpReason('published');
+    onDecision({ ...baseRow, outcome: 'published', reason: 'published', ev: evPercentage, kellyStake: kellyAmount });
 };
