@@ -141,6 +141,21 @@ const ALERT_SCANDALOUS_MODE = (() => {
     return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
 })();
 
+const ARBITRAGE_DUAL_DC_DOUBLECHECK_ENABLED = (() => {
+    const raw = String(import.meta?.env?.VITE_ARBITRAGE_DUAL_DC_DOUBLECHECK_ENABLED || 'true').trim().toLowerCase();
+    return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
+})();
+
+const ARBITRAGE_DUAL_DC_DOUBLECHECK_DELAY_MS = (() => {
+    const raw = Number(import.meta?.env?.VITE_ARBITRAGE_DUAL_DC_DOUBLECHECK_DELAY_MS);
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 1200;
+})();
+
+const ARBITRAGE_DUAL_DC_DOUBLECHECK_MAX_ODD_DRIFT = (() => {
+    const raw = Number(import.meta?.env?.VITE_ARBITRAGE_DUAL_DC_DOUBLECHECK_MAX_ODD_DRIFT);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 0.03;
+})();
+
 const normalizeFinishedProviderFilter = (value = 'ALL') => {
     const normalized = String(value || '').trim().toUpperCase();
     return FINISHED_PROVIDER_FILTER_ALLOWED.includes(normalized) ? normalized : 'ALL';
@@ -966,6 +981,8 @@ function App() {
     const activeTabRef = useRef(activeTab);
     const tokenHealthRef = useRef(tokenHealth);
     const realFinishedHydratedRef = useRef(false);
+    const pinnacleFinishedHydratedRef = useRef(false);
+    const pinnacleHistorySyncInFlightRef = useRef(false);
     const blockedBetIdsRef = useRef(new Set());
     const remoteOpenBetIdsRef = useRef(new Set());
     const remoteOpenEventIdsRef = useRef(new Set());
@@ -974,6 +991,7 @@ function App() {
     const placementProviderFetchInFlightRef = useRef(false);
     const arbitrageExecutingKeysRef = useRef(new Set());
     const arbitrageRiskAutoRefreshTimerRef = useRef(null);
+    const staleArcadiaProviderBetIdsRef = useRef(new Set());
 
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
@@ -1295,6 +1313,7 @@ function App() {
                 ? BOOKY_HISTORY_LIMIT_FINISHED_REAL
                 : BOOKY_HISTORY_LIMIT;
             const mustRefreshBookyNow = forceBookyRefresh || shouldForceRealFinishedHydration;
+            const shouldAutoHydratePinnacleFinished = (!currentIsSimulatedDisplayMode && currentActiveTab === 'FINISHED' && !pinnacleFinishedHydratedRef.current);
             const bookyAccountUrl = mustRefreshBookyNow
                 ? `/api/booky/account?refresh=1&historyLimit=${selectedHistoryLimit}`
                 : `/api/booky/account?historyLimit=${selectedHistoryLimit}`;
@@ -1309,6 +1328,46 @@ function App() {
 
             if (shouldFetchPinnacleBalance) {
                 void fetchPinnacleBalanceSnapshot({ force: forceBookyRefresh });
+            }
+
+            if (shouldAutoHydratePinnacleFinished && !pinnacleHistorySyncInFlightRef.current) {
+                pinnacleHistorySyncInFlightRef.current = true;
+
+                void axios.get('/api/pinnacle/history', {
+                    params: {
+                        refresh: 1,
+                        limit: PINNACLE_HISTORY_SYNC_LIMIT,
+                        status: 'settled',
+                        days: PINNACLE_HISTORY_SYNC_DAYS
+                    },
+                    timeout: 30000
+                })
+                    .then((res) => {
+                        if (!res?.data?.success) {
+                            throw new Error(res?.data?.error || 'No se pudo hidratar historial Pinnacle.');
+                        }
+
+                        setPinnacleHistorySyncMeta({
+                            fetchedAt: res.data?.fetchedAt || new Date().toISOString(),
+                            totalCount: Number(res.data?.totalCount || 0),
+                            touchedCount: Number(res.data?.reconcileStats?.touchedCount || 0),
+                            source: res.data?.source || null,
+                            error: null
+                        });
+
+                        pinnacleFinishedHydratedRef.current = true;
+                        void fetchPinnacleBalanceSnapshot({ force: true });
+                        void fetchData({ forceBookyRefresh: true });
+                    })
+                    .catch((error) => {
+                        setPinnacleHistorySyncMeta((prev) => ({
+                            ...prev,
+                            error: error?.message || 'No se pudo hidratar historial Pinnacle.'
+                        }));
+                    })
+                    .finally(() => {
+                        pinnacleHistorySyncInFlightRef.current = false;
+                    });
             }
 
             const settled = await Promise.allSettled([
@@ -2193,12 +2252,70 @@ function App() {
             const provider = String(bet?.placementProvider || bet?.provider || '').trim().toLowerCase();
             if (provider !== 'pinnacle') return false;
 
+            const providerBetId = String(bet?.providerBetId || '').trim();
+            if (providerBetId && staleArcadiaProviderBetIdsRef.current.has(providerBetId)) return false;
+
             const betEventId = String(bet?.eventId || '').trim();
             if (!betEventId || betEventId !== expectedEventId) return false;
 
             const betPick = String(bet?.pick || normalizePick(bet) || '').trim().toLowerCase();
             return betPick === expectedPick;
         }) || null;
+    };
+
+    const verifyArcadiaExposureStillOpen = async (bet = {}) => {
+        const providerBetId = String(bet?.providerBetId || '').trim();
+        if (!providerBetId) {
+            return { isOpen: true, reason: 'missing-provider-bet-id' };
+        }
+
+        try {
+            const unsettledRes = await axios.get('/api/pinnacle/history', {
+                params: {
+                    refresh: 1,
+                    status: 'unsettled',
+                    days: 30,
+                    limit: 0
+                },
+                timeout: 25000
+            });
+
+            const rows = Array.isArray(unsettledRes?.data?.items) ? unsettledRes.data.items : [];
+            const existsRemote = rows.some((row) => String(row?.providerBetId || '').trim() === providerBetId);
+
+            if (existsRemote) {
+                return { isOpen: true, reason: 'confirmed-remote-unsettled' };
+            }
+
+            staleArcadiaProviderBetIdsRef.current.add(providerBetId);
+
+            setPortfolio((prev) => {
+                const active = Array.isArray(prev?.activeBets) ? prev.activeBets : [];
+                const filtered = active.filter((row) => String(row?.providerBetId || '').trim() !== providerBetId);
+                if (filtered.length === active.length) return prev;
+                return {
+                    ...prev,
+                    activeBets: filtered
+                };
+            });
+
+            return { isOpen: false, reason: 'not-found-remote-unsettled' };
+        } catch (error) {
+            return {
+                isOpen: true,
+                reason: 'remote-check-failed',
+                message: error?.message || 'Fallo verificando exposición Arcadia en remoto.'
+            };
+        }
+    };
+
+    const resolveBlockingArcadiaExposure = async (opportunity = {}) => {
+        const existing = findOpenArcadiaExposureForOpportunity(opportunity);
+        if (!existing) return null;
+
+        const check = await verifyArcadiaExposureStillOpen(existing);
+        if (check?.isOpen) return existing;
+        return null;
     };
 
     const extractArbitrageLegSignature = (opportunity = {}) => {
@@ -2240,6 +2357,35 @@ function App() {
         return baseSig.every((key, idx) => key === candidateSig[idx]);
     };
 
+    const isDcOppositeArbitrageOpportunity = (opportunity = {}) => {
+        const type = String(opportunity?.type || '').trim().toUpperCase();
+        if (type === 'SUREBET_DC_OPPOSITE_PREMATCH') return true;
+
+        const market = String(opportunity?.market || '').trim().toLowerCase();
+        return market.includes('double_chance+opposite_1x2');
+    };
+
+    const isDoubleChanceLegMarket = (marketRaw = '') => {
+        const market = String(marketRaw || '').trim().toLowerCase();
+        return market.includes('double chance') || market.includes('doble oportunidad');
+    };
+
+    const extractAltenarDcOddFromOpportunity = (opportunity = {}) => {
+        const legs = Array.isArray(opportunity?.legs) ? opportunity.legs : [];
+        const dcLeg = legs.find((leg) => {
+            const bucket = normalizeArbitrageProviderBucket(leg?.provider || '');
+            return bucket === 'altenar' && isDoubleChanceLegMarket(leg?.market);
+        });
+
+        const legOdd = Number(dcLeg?.odd);
+        if (Number.isFinite(legOdd) && legOdd > 1) return legOdd;
+
+        const fallback = Number(opportunity?.odds?.altenar?.doubleChance);
+        if (Number.isFinite(fallback) && fallback > 1) return fallback;
+
+        return null;
+    };
+
     const runArbitrageDualPreflight = async ({ baseOpportunity = null } = {}) => {
         if (!baseOpportunity || typeof baseOpportunity !== 'object') {
             return { ok: false, reason: 'missing-base-opportunity', message: 'No se recibió oportunidad base para pre-flight.' };
@@ -2278,7 +2424,7 @@ function App() {
         }
 
         const rows = Array.isArray(arbitrageRes?.data?.data) ? arbitrageRes.data.data : [];
-        const refreshedOpportunity = rows.find((row) => isSameArbitrageOpportunity(baseOpportunity, row)) || null;
+        let refreshedOpportunity = rows.find((row) => isSameArbitrageOpportunity(baseOpportunity, row)) || null;
 
         if (!refreshedOpportunity) {
             return {
@@ -2286,6 +2432,67 @@ function App() {
                 reason: 'missing-after-refresh',
                 message: 'La oportunidad ya no existe en el snapshot actualizado.'
             };
+        }
+
+        const requiresDcDoubleCheck = ARBITRAGE_DUAL_DC_DOUBLECHECK_ENABLED
+            && isDcOppositeArbitrageOpportunity(refreshedOpportunity)
+            && Number.isFinite(Number(extractAltenarDcOddFromOpportunity(refreshedOpportunity)));
+
+        if (requiresDcDoubleCheck) {
+            const firstDcOdd = Number(extractAltenarDcOddFromOpportunity(refreshedOpportunity));
+
+            if (ARBITRAGE_DUAL_DC_DOUBLECHECK_DELAY_MS > 0) {
+                await new Promise((resolve) => setTimeout(resolve, ARBITRAGE_DUAL_DC_DOUBLECHECK_DELAY_MS));
+            }
+
+            const secondPreflightRes = await axios.get('/api/opportunities/arbitrage/preview', {
+                params: {
+                    ...preflightParams,
+                    refreshAltenarNow: 1,
+                    refreshAltenarEventId,
+                    _dcGuardTs: Date.now()
+                },
+                timeout: 25000
+            });
+
+            const secondRefresh = secondPreflightRes?.data?.onDemandRefresh?.altenarEvent || null;
+            if (!secondRefresh || secondRefresh?.success !== true) {
+                return {
+                    ok: false,
+                    reason: 'dc-second-refresh-failed',
+                    message: `No se pudo validar doble refresh del mercado DC (${secondRefresh?.message || 'sin detalle'}).`
+                };
+            }
+
+            const secondRows = Array.isArray(secondPreflightRes?.data?.data) ? secondPreflightRes.data.data : [];
+            const secondOpportunity = secondRows.find((row) => isSameArbitrageOpportunity(baseOpportunity, row)) || null;
+            if (!secondOpportunity) {
+                return {
+                    ok: false,
+                    reason: 'dc-missing-after-double-refresh',
+                    message: 'El mercado Double Chance desapareció tras doble confirmación; se bloquea ejecución para evitar ghost fill.'
+                };
+            }
+
+            const secondDcOdd = Number(extractAltenarDcOddFromOpportunity(secondOpportunity));
+            if (!(Number.isFinite(secondDcOdd) && secondDcOdd > 1)) {
+                return {
+                    ok: false,
+                    reason: 'dc-unavailable-after-double-refresh',
+                    message: 'La pata Double Chance de Altenar no quedó disponible tras doble refresh.'
+                };
+            }
+
+            const dcDrift = Math.abs(secondDcOdd - firstDcOdd);
+            if (dcDrift > ARBITRAGE_DUAL_DC_DOUBLECHECK_MAX_ODD_DRIFT) {
+                return {
+                    ok: false,
+                    reason: 'dc-odd-drift-after-double-refresh',
+                    message: `La cuota DC cambió demasiado en segundos (${firstDcOdd.toFixed(3)} -> ${secondDcOdd.toFixed(3)}).`
+                };
+            }
+
+            refreshedOpportunity = secondOpportunity;
         }
 
         const liveRoi = Number(refreshedOpportunity?.plan?.roiPercent || 0);
@@ -2490,7 +2697,7 @@ function App() {
         const arcadiaLeg = dualPlan.arcadia;
         const altenarLeg = dualPlan.altenar;
         const arcadiaPick = normalizePick(arcadiaLeg?.opportunity || {});
-        const existingArcadiaExposure = findOpenArcadiaExposureForOpportunity(arcadiaLeg?.opportunity || null);
+        const existingArcadiaExposure = await resolveBlockingArcadiaExposure(arcadiaLeg?.opportunity || null);
 
         if (existingArcadiaExposure) {
             const providerBetIdTxt = String(existingArcadiaExposure?.providerBetId || '').trim() || 'n/a';
@@ -2547,7 +2754,7 @@ function App() {
                 return;
             }
 
-            const existingAfterPreflight = findOpenArcadiaExposureForOpportunity(refreshedArcadiaLeg.opportunity);
+            const existingAfterPreflight = await resolveBlockingArcadiaExposure(refreshedArcadiaLeg.opportunity);
             if (existingAfterPreflight) {
                 const providerBetIdTxt = String(existingAfterPreflight?.providerBetId || '').trim() || 'n/a';
                 alert(
@@ -2911,7 +3118,9 @@ function App() {
 
     const handleManualPinnacleHistorySync = async () => {
         if (pinnacleHistorySyncing) return;
+        if (pinnacleHistorySyncInFlightRef.current) return;
 
+        pinnacleHistorySyncInFlightRef.current = true;
         setPinnacleHistorySyncing(true);
         setPinnacleHistorySyncMeta((prev) => ({ ...prev, error: null }));
 
@@ -2942,6 +3151,8 @@ function App() {
                 error: null
             });
 
+            pinnacleFinishedHydratedRef.current = true;
+
             await fetchPinnacleBalanceSnapshot({ force: true });
             await fetchData({ forceBookyRefresh: true });
 
@@ -2955,6 +3166,7 @@ function App() {
             alert(`⚠️ Sync Pinnacle falló: ${message}`);
         } finally {
             setPinnacleHistorySyncing(false);
+            pinnacleHistorySyncInFlightRef.current = false;
         }
     };
 
@@ -5366,9 +5578,19 @@ function App() {
                                     const dualRunning = arbitrageExecutingKeys.has(executionKey);
                                     const dualBlockedByLiquidity = Boolean(dualPlan?.canExecute) && !liquidityGuard.canFund;
                                     const dualPreflightAudit = arbitrageDualPreflightByKey[executionKey] || null;
+                                    const dualPreflightReasonKey = String(dualPreflightAudit?.reason || '').trim().toLowerCase();
+                                    const dualBlockedByDcGuard = [
+                                        'dc-second-refresh-failed',
+                                        'dc-missing-after-double-refresh',
+                                        'dc-unavailable-after-double-refresh',
+                                        'dc-odd-drift-after-double-refresh'
+                                    ].includes(dualPreflightReasonKey);
                                     const dualReasonText = (() => {
                                         if (dualBlockedByLiquidity) {
                                             return 'Bloqueado por liquidez: el split recomendado excede saldo disponible por provider.';
+                                        }
+                                        if (dualBlockedByDcGuard) {
+                                            return 'Guardrail DC activo: el mercado Double Chance está inestable o no confirmado en doble refresh.';
                                         }
                                         if (dualPlan?.canExecute) {
                                             return 'Secuencia: Arcadia -> Altenar (dry-run obligatorio en ambas patas)';
@@ -5469,6 +5691,11 @@ function App() {
                                             <div className="flex items-center justify-between gap-2 rounded border border-emerald-500/20 bg-emerald-500/5 p-2">
                                                 <div className="text-[10px] text-slate-300">
                                                     <div className="uppercase tracking-wide text-emerald-200 font-bold">Fase 2 · Ejecución Dual</div>
+                                                    {dualBlockedByDcGuard && (
+                                                        <div className="mt-1 inline-flex items-center rounded border border-amber-400/40 bg-amber-500/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-200">
+                                                            DC inestable · guardrail activo
+                                                        </div>
+                                                    )}
                                                     <div className="text-slate-400">{dualReasonText}</div>
                                                     {dualBlockedByLiquidity && (
                                                         <div className="mt-1 text-[10px] text-red-300 font-mono">

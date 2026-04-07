@@ -647,10 +647,17 @@ export const getArbitragePreview1x2 = async ({
         away: altOdds.away
       };
 
-    const altDoubleChance = mapDoubleChanceByOrientation({
-      doubleChance: altOdds.doubleChance || {},
-      orientation: orientationInfo.orientation
-    });
+    const altenarDcEnabled = alt?.dcMarketOpen !== false;
+    const altDoubleChance = altenarDcEnabled
+      ? mapDoubleChanceByOrientation({
+        doubleChance: altOdds.doubleChance || {},
+        orientation: orientationInfo.orientation
+      })
+      : {
+        homeDraw: null,
+        homeAway: null,
+        drawAway: null
+      };
 
     const bestOdds = {
       home: chooseBestOdd({ pinnacleOdd: pinOdds.home, altenarOdd: altMapped.home }),

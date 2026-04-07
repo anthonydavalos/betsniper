@@ -119,6 +119,8 @@ const extractLineFromText = (value = '') => {
 const normalizeText = (value = '') => String(value)
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[º°]/g, 'o')
+    .replace(/ª/g, 'a')
     .toLowerCase();
 
 const tokenize = (value = '') => normalizeText(value)
@@ -189,6 +191,53 @@ const applyDcLifecycleMetadata = (row, nextOdds, updatedAt) => {
     } else if (!row.dcMarketClosedAt) {
         row.dcMarketClosedAt = null;
     }
+};
+
+const isHalfTimeMarketName = (value = '') => {
+    const normalized = normalizeText(value);
+
+    const isHalfByNumericPattern = (
+        (/\b1\b[^a-z0-9]{0,3}(half|mitad|tiempo)\b/.test(normalized)) ||
+        (/\b2\b[^a-z0-9]{0,3}(half|mitad|tiempo)\b/.test(normalized)) ||
+        (/(half|mitad|tiempo)\b[^a-z0-9]{0,3}\b1\b/.test(normalized)) ||
+        (/(half|mitad|tiempo)\b[^a-z0-9]{0,3}\b2\b/.test(normalized))
+    );
+
+    if (isHalfByNumericPattern) return true;
+
+    return (
+        normalized.includes('1st half') ||
+        normalized.includes('first half') ||
+        normalized.includes('2nd half') ||
+        normalized.includes('second half') ||
+        normalized.includes('1a mitad') ||
+        normalized.includes('2a mitad') ||
+        normalized.includes('1o tiempo') ||
+        normalized.includes('2o tiempo') ||
+        normalized.includes('1er tiempo') ||
+        normalized.includes('2do tiempo') ||
+        normalized.includes('primer tiempo') ||
+        normalized.includes('segundo tiempo') ||
+        normalized.includes('1ra mitad') ||
+        normalized.includes('2da mitad') ||
+        normalized.includes('primera mitad') ||
+        normalized.includes('segunda mitad') ||
+        normalized.includes('half time') ||
+        normalized.includes('halftime')
+    );
+};
+
+const isFullTimeMarket = (market = {}) => {
+    if (!market || typeof market !== 'object') return false;
+
+    const periodRaw = market.period ?? market.periodId ?? market.periodNumber ?? market.p;
+    const periodNum = Number(periodRaw);
+    if (periodRaw !== undefined && periodRaw !== null && String(periodRaw).trim() !== '' && Number.isFinite(periodNum)) {
+        if (periodNum !== 0) return false;
+    }
+
+    if (isHalfTimeMarketName(market.name || '')) return false;
+    return true;
 };
 
 const extractOddsFromDetails = (details, eventName = '') => {
@@ -297,7 +346,10 @@ const extractOddsFromDetails = (details, eventName = '') => {
         if (no?.price) safeOdds.btts.no = no.price;
     }
 
-    const dcMarket = details.markets.find(m => m.typeId === 10 || normalizeText(m.name).includes('double chance') || normalizeText(m.name).includes('doble oportunidad'));
+    const dcMarket = details.markets.find((m) => (
+        (m.typeId === 10 || normalizeText(m.name).includes('double chance') || normalizeText(m.name).includes('doble oportunidad'))
+        && isFullTimeMarket(m)
+    ));
     if (dcMarket) {
         const odds = flattenOddIds(dcMarket).map(id => oddsMap.get(id)).filter(Boolean);
         for (const odd of odds) {

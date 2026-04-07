@@ -227,6 +227,60 @@ const extractOdds = (event, marketsMap, oddsMap) => {
     return [];
   };
 
+  const isHalfTimeMarketName = (value = '') => {
+    const normalized = String(value || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, ' ')
+      .replace(/[º°]/g, 'o')
+      .replace(/ª/g, 'a')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const isHalfByNumericPattern = (
+      (/\b1\b[^a-z0-9]{0,3}(half|mitad|tiempo)\b/.test(normalized)) ||
+      (/\b2\b[^a-z0-9]{0,3}(half|mitad|tiempo)\b/.test(normalized)) ||
+      (/(half|mitad|tiempo)\b[^a-z0-9]{0,3}\b1\b/.test(normalized)) ||
+      (/(half|mitad|tiempo)\b[^a-z0-9]{0,3}\b2\b/.test(normalized))
+    );
+
+    if (isHalfByNumericPattern) return true;
+
+    return (
+      normalized.includes('1st half') ||
+      normalized.includes('first half') ||
+      normalized.includes('2nd half') ||
+      normalized.includes('second half') ||
+      normalized.includes('1a mitad') ||
+      normalized.includes('2a mitad') ||
+      normalized.includes('1o tiempo') ||
+      normalized.includes('2o tiempo') ||
+      normalized.includes('1er tiempo') ||
+      normalized.includes('2do tiempo') ||
+      normalized.includes('primer tiempo') ||
+      normalized.includes('segundo tiempo') ||
+      normalized.includes('1ra mitad') ||
+      normalized.includes('2da mitad') ||
+      normalized.includes('primera mitad') ||
+      normalized.includes('segunda mitad') ||
+      normalized.includes('half time') ||
+      normalized.includes('halftime')
+    );
+  };
+
+  const isFullTimeMarket = (market = {}) => {
+    if (!market || typeof market !== 'object') return false;
+
+    const periodRaw = market.period ?? market.periodId ?? market.periodNumber ?? market.p;
+    const periodNum = Number(periodRaw);
+    if (periodRaw !== undefined && periodRaw !== null && String(periodRaw).trim() !== '' && Number.isFinite(periodNum)) {
+      if (periodNum !== 0) return false;
+    }
+
+    if (isHalfTimeMarketName(market.name || '')) return false;
+    return true;
+  };
+
   const extractLineFromText = (value = '') => {
     const normalized = String(value).toLowerCase().replace(',', '.');
     const match = normalized.match(/(\d+(?:\.\d+)?)/);
@@ -377,7 +431,7 @@ const extractOdds = (event, marketsMap, oddsMap) => {
     }
 
     // D) Mercado Double Chance (typeId 10 o nombre compatible)
-    if (market.typeId === 10 || (market.name && /double chance|doble oportunidad/i.test(market.name))) {
+    if ((market.typeId === 10 || (market.name && /double chance|doble oportunidad/i.test(market.name))) && isFullTimeMarket(market)) {
       for (const oddId of flattenMarketOddIds(market)) {
         const odd = oddsMap.get(oddId);
         if (!odd || !Number.isFinite(Number(odd.price)) || Number(odd.price) <= 1) continue;

@@ -16,6 +16,8 @@ const normalizeMarketText = (value = '') => String(value)
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[º°]/g, 'o')
+    .replace(/ª/g, 'a')
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -28,6 +30,56 @@ const is1x2MarketName = (value = '') => {
         normalized === 'match result' ||
         normalized === 'moneyline'
     );
+};
+
+const isDoubleChanceMarketName = (value = '') => {
+    const normalized = normalizeMarketText(value);
+    return normalized.includes('double chance') || normalized.includes('doble oportunidad');
+};
+
+const isHalfTimeMarketName = (value = '') => {
+    const normalized = normalizeMarketText(value);
+
+    const isHalfByNumericPattern = (
+        (/\b1\b[^a-z0-9]{0,3}(half|mitad|tiempo)\b/.test(normalized)) ||
+        (/\b2\b[^a-z0-9]{0,3}(half|mitad|tiempo)\b/.test(normalized)) ||
+        (/(half|mitad|tiempo)\b[^a-z0-9]{0,3}\b1\b/.test(normalized)) ||
+        (/(half|mitad|tiempo)\b[^a-z0-9]{0,3}\b2\b/.test(normalized))
+    );
+
+    if (isHalfByNumericPattern) return true;
+
+    return (
+        normalized.includes('1st half') ||
+        normalized.includes('first half') ||
+        normalized.includes('2nd half') ||
+        normalized.includes('second half') ||
+        normalized.includes('1er tiempo') ||
+        normalized.includes('2do tiempo') ||
+        normalized.includes('primer tiempo') ||
+        normalized.includes('segundo tiempo') ||
+        normalized.includes('1ra mitad') ||
+        normalized.includes('2da mitad') ||
+        normalized.includes('primera mitad') ||
+        normalized.includes('segunda mitad') ||
+        normalized.includes('1a mitad') ||
+        normalized.includes('2a mitad') ||
+        normalized.includes('half time') ||
+        normalized.includes('halftime')
+    );
+};
+
+const isFullTimeMarket = (market = {}) => {
+    if (!market || typeof market !== 'object') return false;
+
+    const periodRaw = market.period ?? market.periodId ?? market.periodNumber ?? market.p;
+    const periodNum = Number(periodRaw);
+    if (periodRaw !== undefined && periodRaw !== null && String(periodRaw).trim() !== '' && Number.isFinite(periodNum)) {
+        if (periodNum !== 0) return false;
+    }
+
+    if (isHalfTimeMarketName(market.name || '')) return false;
+    return true;
 };
 
 const extractFirstNumber = (value = '') => {
@@ -261,7 +313,7 @@ export const refreshOpportunity = async (opportunity) => {
             let isTargetMarket = false;
             // [FIX] Soporte canonical + legacy para 1x2
             if (is1x2MarketName(marketName) && (market.typeId === 1 || market.name === 'Match Result' || market.name === '1x2')) isTargetMarket = true;
-            else if (marketName === 'Double Chance' && market.typeId === 10) isTargetMarket = true;
+            else if (isDoubleChanceMarketName(marketName) && market.typeId === 10 && isFullTimeMarket(market)) isTargetMarket = true;
                 else if (isTotalsCandidate && (market.typeId === 18 || normalizeMarketText(market.name).includes('total'))) {
                       // En Altenar un mismo market typeId=18 puede contener múltiples líneas
                       // (ej. 1.5, 2.5, 3.5) dentro de desktopOddIds. La línea se decide por odd, no por market.
@@ -311,9 +363,18 @@ export const refreshOpportunity = async (opportunity) => {
                                 return Number(o.typeId) === 13 || oName.includes('under') || oName.includes('menos');
                             }
                         }
-                        if (marketName === 'Double Chance') {
-                            if (selectionName === '1X' && (oName.includes('1x') || oName.includes(details.name.split(' vs ')[0]))) return true;
-                            if (selectionName === 'X2' && (oName.includes('x2') || oName.includes(details.name.split(' vs ')[1]))) return true;
+                        if (isDoubleChanceMarketName(marketName)) {
+                            const selectionToken = String(selectionName || '').trim().toUpperCase();
+
+                            // Mapeo principal por typeId del proveedor: 9=1X, 10=12, 11=X2.
+                            if (selectionToken === '1X' && Number(o.typeId) === 9) return true;
+                            if (selectionToken === '12' && Number(o.typeId) === 10) return true;
+                            if (selectionToken === 'X2' && Number(o.typeId) === 11) return true;
+
+                            // Fallback por nombre (cuando typeId no llega estable).
+                            if (selectionToken === '1X' && (oName.includes('1x') || oName.includes('home draw') || oName.includes('local empate'))) return true;
+                            if (selectionToken === '12' && (oName.includes('12') || oName.includes('home away') || oName.includes('local visitante'))) return true;
+                            if (selectionToken === 'X2' && (oName.includes('x2') || oName.includes('draw away') || oName.includes('empate visitante'))) return true;
                         }
                         return false;
                     });
