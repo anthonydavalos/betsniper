@@ -85,6 +85,23 @@ const resolveTotalsLineForBet = (bet = {}) => {
     return NaN;
 };
 
+const isProviderManagedRealBet = (bet = {}) => {
+    if (!bet || typeof bet !== 'object') return false;
+
+    const providerIdRaw = bet?.providerBetId;
+    const hasProviderBetId = providerIdRaw !== null && providerIdRaw !== undefined && String(providerIdRaw).trim() !== '';
+    if (!hasProviderBetId) return false;
+
+    const providerLabel = String(
+        bet?.placementProvider ||
+        bet?.provider ||
+        bet?.integration ||
+        ''
+    ).trim().toLowerCase();
+
+    return providerLabel === 'booky' || providerLabel === 'pinnacle';
+};
+
 /**
  * Coloca una apuesta automática si no existe ya una para ese evento.
  */
@@ -271,6 +288,7 @@ import { getEventDetails, getEventResult } from './liveScannerService.js';
  */
 export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed = []) => {
     await initDB();
+    await db.read();
     const portfolio = db.data.portfolio;
     let hasChanges = false;
 
@@ -321,6 +339,7 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
     const updatedActiveBets = [];
 
     for (const bet of portfolio.activeBets) {
+        const providerManagedRealBet = isProviderManagedRealBet(bet);
         
         // [SELF-HEALING] Reparar picks corruptos o legacy ("unknown")
         if (bet.pick === 'unknown' && bet.selection) {
@@ -457,6 +476,13 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
             if (!bet.eventId && liveEvent.id) {
                 bet.eventId = liveEvent.id;
                 hasChanges = true;
+            }
+
+            // En apuestas reales con providerBetId (Booky/Pinnacle),
+            // la liquidación final se reconcilia desde historial remoto del proveedor.
+            if (providerManagedRealBet) {
+                updatedActiveBets.push(bet);
+                continue;
             }
 
             // [NUEVO] Early Settlement Check (Liquidación Anticipada)
@@ -625,6 +651,11 @@ export const updateActiveBetsWithLiveData = async (liveEvents, pinnacleLiveFeed 
 
         } else {
             // B) NO ESTÁ EN VIVO ACTIVAMENTE (O TERMINÓ)
+
+            if (providerManagedRealBet) {
+                updatedActiveBets.push(bet);
+                continue;
+            }
             
             // Caso Especial: Terminó y sigue en feed con estado FT/Ended
             if (isFinishedInFeed && liveEvent) {

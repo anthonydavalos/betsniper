@@ -1,5 +1,135 @@
 # Registro de Retoques y Correcciones
 
+## [2026-04-06] Plan Camino 2: Implementacion de Arbitraje Live Real (por fases y seguro)
+
+### Objetivo
+- Implementar un motor de arbitraje **live** separado del prematch, con rollout gradual, trazabilidad total y proteccion contra ejecucion parcial riesgosa.
+- Mantener el enfoque de seguridad operacional: primero preview, luego simulacion, luego real en canary.
+
+### Principios de seguridad (obligatorios)
+1. **Separacion de motores:** no mezclar logica prematch con live; crear pipeline live dedicado.
+2. **Preview-first:** no ejecutar placement real hasta tener estabilidad estadistica de preview.
+3. **Outcome obligatorio por intento:** cada intento debe cerrar en `CONFIRMED`, `REJECTED` o `UNCERTAIN`.
+4. **Sin reintento ciego:** ante estado incierto, reconciliar por cuenta/historial antes de cualquier reintento.
+5. **Cross-provider real:** mantener `requireCrossProvider=true` para evitar pseudo-arbitraje del mismo proveedor.
+
+### Fase 0 - Baseline y observabilidad minima
+**Objetivo:** asegurar que el sistema actual puede medir correctamente por que no aparecen oportunidades live.
+
+**Tareas:**
+1. Crear baseline de 60-120 minutos con diagnosticos live y arbitrage (sin tocar ejecucion real).
+2. Registrar top motivos de descarte: `sameProvider`, `unlinked`, `staleAltenar`, `missingOdds`, `noSurebetEdge`.
+3. Definir umbrales operativos minimos para avanzar de fase.
+
+**Criterio de salida:**
+1. Reporte con frecuencias de descarte y acciones propuestas por causa.
+2. Latencia de endpoints de diagnostico estable (sin timeouts recurrentes).
+
+---
+
+### Fase 1 - Motor de Arbitraje Live (Preview Only)
+**Objetivo:** detectar oportunidades live sin ejecutar apuestas.
+
+**Alcance tecnico:**
+1. Nuevo servicio (sugerido): `src/services/liveArbitrageService.js`.
+2. Nuevo endpoint (sugerido): `GET /api/opportunities/arbitrage/live/preview`.
+3. Endpoint de diagnostico live arbitrage (sugerido): `GET /api/opportunities/arbitrage/live/diagnostics`.
+
+**Reglas de deteccion inicial (MVP):**
+1. Mercados iniciales: `1x2` y `double_chance + opposite_1x2` (siempre que ambos lados esten disponibles en vivo).
+2. Filtro temporal: excluir eventos con estado incierto y odds stale.
+3. Filtro de calidad: bloquear categorias sensibles sin contexto estricto (Women/U21/Reserve/II/III).
+4. Normalizacion estricta de orientacion (`normal/swapped`) antes de calcular edge.
+5. Calculo financiero: stake split con redondeo y validacion de profit neto > 0 tras redondeo.
+
+**Criterio de salida:**
+1. Preview devuelve oportunidades live con `edgePercent`, `roiPercent`, `stakePlan` y `diagnostics` por descarte.
+2. 0 errores de runtime en scanner durante corrida de prueba >= 2 horas.
+
+---
+
+### Fase 2 - Simulacion Operativa (Paper + Dry-Run dual)
+**Objetivo:** ensayar ejecucion dual sin riesgo de capital real.
+
+**Tareas:**
+1. Implementar orquestador de 2 patas en modo simulacion con estados de operacion:
+  - `OPEN` -> `PARTIAL` -> `HEDGED` -> `CLOSED`.
+2. Integrar dry-run de placement para pata Booky antes de cualquier confirmacion.
+3. Registrar evidencia por pata: request/response/status/requestId/providerBody.
+4. Implementar politica de hedge cuando la segunda pata falla o cambia cuota fuera de tolerancia.
+
+**Guardas obligatorias:**
+1. Min EV y min stake por operacion.
+2. Cooldown por `eventId+pick` y limite por hora.
+3. Reentry solo si mejora minima de cuota (% o puntos).
+
+**Criterio de salida:**
+1. Simulacion de extremo a extremo con cierre correcto en escenarios:
+  - fill total,
+  - fallo de segunda pata,
+  - timeout incierto.
+2. 100% de operaciones con outcome final explicito.
+
+---
+
+### Fase 3 - Canary Real Controlado (baja exposicion)
+**Objetivo:** habilitar ejecucion real en ventana corta y bajo limites conservadores.
+
+**Configuracion recomendada inicial:**
+1. Ventana: 30-60 minutos por sesion.
+2. Kelly fraccion reducida (perfil LIVE_SNIPE, conservador).
+3. Limite de operaciones/hora bajo.
+4. Solo ligas de alta liquidez y bajo ruido.
+
+**Operacion segura:**
+1. `BOOKY_REAL_PLACEMENT_ENABLED=true` solo en ventana canary.
+2. Mantener `AUTO_SNIPE_DRY_RUN=false` solo si Fase 2 ya aprobo.
+3. Ante `UNCERTAIN`, reconciliar por `GET /api/booky/account?refresh=1` antes de reintentar.
+
+**Criterio de salida:**
+1. Tasa de `UNCERTAIN` bajo umbral definido.
+2. Sin incidentes de duplicado ni reintento ciego.
+3. PnL/ROI dentro de banda esperada sin desviaciones anormales de slippage.
+
+---
+
+### Fase 4 - Escalado gradual + hardening
+**Objetivo:** ampliar cobertura sin perder control de riesgo.
+
+**Tareas:**
+1. Expandir mercados live (totales/BTTS) por etapas.
+2. Mejorar matcher contextual en no-match dominantes (sin bajar umbrales globales a ciegas).
+3. Dashboard operativo de arbitraje live:
+  - abiertas/parciales/cerradas,
+  - slippage,
+  - latencia por proveedor,
+  - razones de rechazo.
+4. Alertas de degradacion y rollback automatico por thresholds.
+
+**Criterio de salida:**
+1. Estabilidad sostenida multi-sesion.
+2. Trazabilidad completa de operaciones y auditoria reproducible.
+
+---
+
+### Checklist de validacion por fase (paso a paso)
+1. Verificar diagnosticos live/arbitrage antes de cada fase.
+2. Ejecutar smoke tests de endpoints nuevos y validar JSON de salida.
+3. Ejecutar corrida controlada y guardar muestra de operaciones.
+4. Revisar metricas de rechazo/incertidumbre/slippage.
+5. Aprobar o rollback segun criterios de salida.
+
+### Reglas de rollback (siempre activas)
+1. Si sube `UNCERTAIN` sobre el umbral: volver a dry-run.
+2. Si hay duplicados por latencia: activar lock/cooldown estricto y cortar canary.
+3. Si cae calidad de matching (no-match alto): pausar escalado y corregir aliases/contexto.
+4. Si hay timeouts persistentes provider: desactivar real placement y mantener solo preview.
+
+### Entregable inmediato recomendado (Semana 1)
+1. Fase 0 completa (baseline + reporte de causas).
+2. Fase 1 MVP (preview live + diagnostics live).
+3. Sin ejecucion real todavia.
+
 ## [2026-04-01] Activación operativa DC para arbitraje (Pinnacle + Altenar)
 - **Pinnacle prematch:** `scripts/ingest-pinnacle.js` ahora deriva y persiste `odds.doubleChance` desde 1x2 para no depender del estado de un feed parcial.
 - **Cache-first prematch:** `src/services/prematchScannerService.js` conserva `doubleChance` al hidratar `upcomingMatches` desde `getAllPinnaclePrematchOdds`.
