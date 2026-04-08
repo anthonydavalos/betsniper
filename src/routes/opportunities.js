@@ -13,6 +13,11 @@ import {
   getArbitrageDiagnosticsReport,
   runArbitrageDiagnosticsInventory
 } from '../services/arbitrageService.js';
+import {
+  getLiveArbitragePreview,
+  getLiveArbitrageDiagnosticsReport,
+  runLiveArbitrageDiagnosticsInventory
+} from '../services/liveArbitrageService.js';
 import { refreshAltenarEventDetailsNow } from '../services/altenarPrematchScheduler.js';
 import db from '../db/database.js';
 
@@ -446,6 +451,88 @@ router.post('/arbitrage/diagnostics/inventory', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error?.message || 'No se pudo ejecutar inventario de arbitraje.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/live/preview
+// Preview de arbitraje live (sin ejecucion real): 1x2 + DC/opuesto.
+router.get('/arbitrage/live/preview', async (req, res) => {
+  try {
+    const bankrollRaw = Number(req.query?.bankroll);
+    const limitRaw = Number(req.query?.limit);
+    const minRoiPercentRaw = Number(req.query?.minRoiPercent);
+    const minProfitAbsRaw = Number(req.query?.minProfitAbs);
+
+    const payload = await getLiveArbitragePreview({
+      bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      minRoiPercent: Number.isFinite(minRoiPercentRaw) ? minRoiPercentRaw : undefined,
+      minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : undefined
+    });
+
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      mode: 'preview-only',
+      error: error?.message || 'No se pudo generar preview de arbitraje live.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/live/diagnostics
+// Historial persistido + resumen de rechazos del preview live.
+router.get('/arbitrage/live/diagnostics', async (req, res) => {
+  try {
+    const limitRaw = Number(req.query?.limit);
+    const triggerRaw = String(req.query?.trigger || 'all').trim().toLowerCase();
+    const windowMinutesRaw = Number(req.query?.windowMinutes);
+
+    const payload = await getLiveArbitrageDiagnosticsReport({
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      trigger: triggerRaw || 'all',
+      windowMinutes: Number.isFinite(windowMinutesRaw) ? windowMinutesRaw : undefined
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo consultar diagnosticos de arbitraje live.'
+    });
+  }
+});
+
+// POST /api/opportunities/arbitrage/live/diagnostics/inventory
+// Ejecuta un inventario inmediato del snapshot de arbitraje live.
+router.post('/arbitrage/live/diagnostics/inventory', async (req, res) => {
+  try {
+    const bankrollRaw = Number(req.body?.bankroll);
+    const limitRaw = Number(req.body?.limit);
+    const minRoiPercentRaw = Number(req.body?.minRoiPercent);
+    const minProfitAbsRaw = Number(req.body?.minProfitAbs);
+    const tag = String(req.body?.tag || 'manual-api').trim() || 'manual-api';
+
+    const payload = await runLiveArbitrageDiagnosticsInventory({
+      bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      minRoiPercent: Number.isFinite(minRoiPercentRaw) ? minRoiPercentRaw : null,
+      minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : null,
+      tag
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo ejecutar inventario de arbitraje live.'
     });
   }
 });
