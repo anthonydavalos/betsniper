@@ -12,6 +12,7 @@ yarn-error.log
 
 # Database
 db.json
+.db.json.tmp
 
 # Archivos con credenciales / runtime que nunca deben subirse
 data.txt
