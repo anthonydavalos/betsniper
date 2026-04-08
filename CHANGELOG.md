@@ -7,6 +7,59 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.33] -- 2026-04-08 -- Sprint: Cierre Fase 0/1 + Arranque Fase 2 Simulación Dual
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Fase 2: orquestador de simulación operativa (paper + dry-run dual)
+- **`src/services/liveArbitrageSimulationService.js`**:
+  - Nuevo orquestador de simulación live para operaciones de 2 patas.
+  - Máquina de estados implementada: `OPEN -> PARTIAL -> HEDGED -> CLOSED`.
+  - Outcome final obligatorio por operación:
+    - `CONFIRMED`
+    - `REJECTED`
+    - `UNCERTAIN`
+  - Evidencia por pata persistida: request/response, endpoint, payload y diagnóstico de provider.
+  - Limpieza de tickets temporales via cancelación best-effort para no contaminar flujo semi-auto real.
+
+- **`src/routes/opportunities.js`**:
+  - Nuevos endpoints de Fase 2:
+    - `POST /api/opportunities/arbitrage/live/simulation/run`
+    - `GET /api/opportunities/arbitrage/live/simulation/history`
+    - `GET /api/opportunities/arbitrage/live/simulation/summary`
+
+### 🔄 Changed
+
+#### Documentación oficial de estado de fases (0 -> 2)
+- **`PROJECT_BLUEPRINT.md`**:
+  - Nuevo bloque de estado operativo con:
+    - Fase 0 cerrada (baseline + causas de descarte),
+    - Fase 1 cerrada (preview/diagnostics + hardening),
+    - Fase 2 iniciada (simulación dual + endpoints).
+
+- **`.github/copilot-instructions.md`**:
+  - Nuevo bloque de gate operativo con lineamientos de implementación para Fase 0, Fase 1 y Fase 2.
+
+- **`retoques.md`**:
+  - Actualización de bitácora con cierre operativo de Fase 0 y Fase 1.
+  - Registro del arranque de Fase 2 y alcance inicial por API.
+
+- **`.gitignore`**:
+  - Se ignora `.db.json.tmp` para evitar ruido de artefactos temporales en commits.
+
+### 🧪 Validated
+
+- Smoke de Fase 2 sobre backend reiniciado:
+  - `POST /api/opportunities/arbitrage/live/simulation/run` -> `200`
+  - `GET /api/opportunities/arbitrage/live/simulation/history` -> `200`
+  - `GET /api/opportunities/arbitrage/live/simulation/summary` -> `200`
+- Validación estática sin errores en:
+  - `src/services/liveArbitrageSimulationService.js`
+  - `src/routes/opportunities.js`
+  - `retoques.md`
+
 ## [v3.4.32] -- 2026-04-05 -- Sprint: DC Closure Indicator + Anti-Ghost Hardening
 
 > Rama: `master`

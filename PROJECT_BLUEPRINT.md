@@ -3,6 +3,33 @@
 **Rol:** Actúa como Arquitecto de Software Senior y Experto en Matemáticas Financieras (Trading).
 **Objetivo:** Construir una aplicación Full-Stack para detectar apuestas de valor (Value Bets) y oportunidades en vivo (Live Trading) cruzando datos de Pinnacle (Arcadia API) y Altenar (DoradoBet).
 
+## 0. ESTADO DE IMPLEMENTACIÓN POR FASES (2026-04-08)
+
+### Fase 0 - Baseline y observabilidad mínima (CERRADA)
+1. Se ejecutó baseline extendido de diagnóstico live/arbitrage en ventana de 120 minutos.
+2. Se consolidaron causas dominantes de descarte: `unlinked`, `staleAltenar`, `noSurebetEdge`, `sameProvider`.
+3. Se validó estabilidad operativa de endpoints de diagnóstico sin timeouts recurrentes en la corrida objetivo.
+
+### Fase 1 - Motor de arbitraje live preview-only (CERRADA)
+1. Servicio implementado: `src/services/liveArbitrageService.js`.
+2. Endpoints activos:
+  - `GET /api/opportunities/arbitrage/live/preview`
+  - `GET /api/opportunities/arbitrage/live/diagnostics`
+  - `POST /api/opportunities/arbitrage/live/diagnostics/inventory`
+3. Reglas MVP implementadas: mercados `1x2` y `double_chance+opposite_1x2`, filtros de estado/stale/sensibles, normalización de orientación y stake split con validación de profit neto.
+4. Hardening aplicado: lectura resiliente del feed local Pinnacle y retry defensivo en lectura de DB para mitigar JSON parcial transitorio.
+5. Validación post-hardening: soak 30 minutos con `29/29` ciclos OK, `0` fallos runtime, `0` excepciones.
+
+### Fase 2 - Simulación operativa paper + dry-run dual (INICIADA)
+1. Orquestador inicial implementado: `src/services/liveArbitrageSimulationService.js`.
+2. Máquina de estados habilitada: `OPEN -> PARTIAL -> HEDGED -> CLOSED`.
+3. Outcome obligatorio por operación: `CONFIRMED`, `REJECTED` o `UNCERTAIN`.
+4. Endpoints activos:
+  - `POST /api/opportunities/arbitrage/live/simulation/run`
+  - `GET /api/opportunities/arbitrage/live/simulation/history`
+  - `GET /api/opportunities/arbitrage/live/simulation/summary`
+5. Evidencia por pata registrada en simulación: request/response/status/requestId/providerBody cuando aplica.
+
 ---
 
 ## 1. STACK TECNOLÓGICO

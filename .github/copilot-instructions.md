@@ -154,3 +154,16 @@ Cuando se procese `placeWidget` en `bookySemiAutoService`:
 1.  **Preservar evidencia provider:** no perder `providerStatus/providerBody/requestId` al envolver errores.
 2.  **Sin `bets[]` no hay confirmacion real:** archivar como rechazo auditable.
 3.  **Estado incierto no se reintenta ciego:** primero reconciliar por cuenta/historial remoto.
+
+## 13. ESTADO DE FASES (GATE OPERATIVO 2026-04-08)
+
+1.  **FASE 0 (CERRADA):** baseline 120m ejecutado con top causas de descarte consolidadas (`unlinked`, `staleAltenar`, `noSurebetEdge`, `sameProvider`).
+2.  **FASE 1 (CERRADA):** preview live + diagnostics implementados y validados; hardening aplicado para lectura JSON parcial (feed local + DB read retry).
+3.  **FASE 2 (INICIADA):** simulacion operacional paper + dry-run dual habilitada por API, con maquina de estados `OPEN -> PARTIAL -> HEDGED -> CLOSED` y outcome obligatorio `CONFIRMED`/`REJECTED`/`UNCERTAIN`.
+
+### 13.1 Reglas obligatorias para Fase 2
+
+1.  **Simulación primero:** no ejecutar placement real en este flujo; usar solo dry-run por pata.
+2.  **Evidencia por pata:** registrar siempre request/response/status/requestId/providerBody cuando aplique.
+3.  **Sin reintento ciego:** si una pata queda incierta, cerrar como `UNCERTAIN` y exigir reconciliación antes de cualquier paso real.
+4.  **Cross-provider:** mantener validación cruzada entre providers y no degradar a pseudo-arbitraje mono-provider.
