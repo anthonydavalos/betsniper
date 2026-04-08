@@ -16,7 +16,8 @@ import { refreshAltenarEventDetailsNow } from './altenarPrematchScheduler.js';
 import {
     preparePinnacleSemiAutoTicket,
     confirmPinnacleSemiAutoTicket,
-    confirmPinnacleRealPlacementFast
+    confirmPinnacleRealPlacementFast,
+    preflightPinnacleRealQuoteByOpportunity
 } from './pinnacleSemiAutoService.js';
 import fs from 'fs';
 import path from 'path';
@@ -428,6 +429,17 @@ const maybeRunAutoSnipe = async (opportunity) => {
 
         const placementMode = buildPlacementMode({ provider: placementProvider, realEnabled: providerRealEnabled });
         const runPlacementOnce = async () => {
+            if (placementProvider === 'pinnacle' && providerRealEnabled) {
+                const preflight = await preflightPinnacleRealQuoteByOpportunity(opportunity);
+                if (!preflight?.quoteable) {
+                    return {
+                        ok: false,
+                        reason: `not-quoteable:${String(preflight?.status || 'unknown')}`,
+                        preflight
+                    };
+                }
+            }
+
             const ticket = placementProvider === 'pinnacle'
                 ? await preparePinnacleSemiAutoTicket(opportunity)
                 : await prepareSemiAutoTicket(opportunity);

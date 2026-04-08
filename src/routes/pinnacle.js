@@ -9,6 +9,8 @@ import {
   syncRemotePinnacleHistory,
   getLatestPinnacleCapture,
   getPinnacleRealPlacementDryRun,
+  preflightPinnacleRealQuoteByOpportunity,
+  preflightPinnacleRealQuoteByTicket,
   confirmPinnacleRealPlacement,
   confirmPinnacleRealPlacementFast
 } from '../services/pinnacleSemiAutoService.js';
@@ -156,6 +158,26 @@ router.post('/real/dryrun/:id', async (req, res) => {
   try {
     const draft = await getPinnacleRealPlacementDryRun(req.params.id);
     res.json({ success: true, draft });
+  } catch (error) {
+    sendPinnacleError(res, error, 400);
+  }
+});
+
+// POST /api/pinnacle/real/preflight
+router.post('/real/preflight', async (req, res) => {
+  try {
+    const preflight = await preflightPinnacleRealQuoteByOpportunity(req.body || {});
+    res.json({ success: true, preflight });
+  } catch (error) {
+    sendPinnacleError(res, error, 400);
+  }
+});
+
+// POST /api/pinnacle/real/preflight/:id
+router.post('/real/preflight/:id', async (req, res) => {
+  try {
+    const data = await preflightPinnacleRealQuoteByTicket(req.params.id);
+    res.json({ success: true, ...data });
   } catch (error) {
     sendPinnacleError(res, error, 400);
   }

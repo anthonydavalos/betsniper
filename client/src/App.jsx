@@ -64,6 +64,13 @@ const LIVE_MANUAL_MAX_ODD_DROP_PCT = (() => {
     const raw = Number(import.meta?.env?.VITE_LIVE_MANUAL_MAX_ODD_DROP_PCT);
     return Number.isFinite(raw) && raw > 0 ? raw : 2.5;
 })();
+const PINNACLE_PREFLIGHT_TTL_MS = (() => {
+    const raw = Number(import.meta?.env?.VITE_PINNACLE_PREFLIGHT_TTL_MS);
+    if (Number.isFinite(raw) && raw >= 5000) {
+        return Math.min(300000, Math.floor(raw));
+    }
+    return 45000;
+})();
 
 const normalizeAutoPlacementProvider = (value = '', fallback = 'booky') => {
     const normalized = String(value || '').trim().toLowerCase();
@@ -238,6 +245,85 @@ const getFinishedProviderBadgeMeta = (row = {}) => {
         origin: 'SIM',
         label: 'SIM',
         className: 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+    };
+};
+
+const getPlacementProviderBadgeMeta = (providerRaw = '') => {
+    const provider = String(providerRaw || '').trim().toLowerCase();
+
+    if (
+        provider.includes('pinnacle') ||
+        provider.includes('arcadia')
+    ) {
+        return {
+            label: 'PINNACLE',
+            className: 'bg-orange-500/15 text-orange-300 border-orange-500/30'
+        };
+    }
+
+    if (
+        provider.includes('altenar') ||
+        provider.includes('booky') ||
+        provider.includes('acity') ||
+        provider.includes('dorado')
+    ) {
+        return {
+            label: 'BOOKY',
+            className: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+        };
+    }
+
+    return {
+        label: 'SIM',
+        className: 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+    };
+};
+
+const getPinnaclePreflightBadgeMeta = (entry = null) => {
+    if (!entry) {
+        return {
+            label: 'SIN PREFLIGHT',
+            className: 'bg-slate-500/10 text-slate-300 border-slate-500/30'
+        };
+    }
+
+    if (entry.checking) {
+        return {
+            label: 'PREFLIGHT...',
+            className: 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+        };
+    }
+
+    if (entry.quoteable) {
+        return {
+            label: 'QUOTEABLE',
+            className: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+        };
+    }
+
+    const status = String(entry.status || '').trim().toUpperCase();
+    if (status === 'NOT_QUOTEABLE_404') {
+        return {
+            label: 'NO QUOTE 404',
+            className: 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+        };
+    }
+    if (status === 'NOT_QUOTEABLE_MARKET_CLOSED' || status === 'NOT_QUOTEABLE_MARKET_UNAVAILABLE') {
+        return {
+            label: 'MERCADO CERRADO',
+            className: 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+        };
+    }
+    if (status === 'NOT_QUOTEABLE_INSUFFICIENT_BALANCE') {
+        return {
+            label: 'SALDO INSUF.',
+            className: 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+        };
+    }
+
+    return {
+        label: status || 'NO QUOTEABLE',
+        className: 'bg-red-500/15 text-red-300 border-red-500/30'
     };
 };
 
@@ -695,6 +781,58 @@ const hasLiveClockSignal = (value = '') => {
     return /\b\d{1,3}(?:\+\d{1,2})?\s*'?\s*(MIN)?\b/i.test(normalized);
 };
 
+const extractLiveClockMinute = (value = '') => {
+    const txt = String(value || '').trim().toUpperCase();
+    if (!txt) return null;
+
+    if (/\b(A\.?\s*M\.?|P\.?\s*M\.?|AM|PM)\b/i.test(txt)) return null;
+    if (txt.includes(':')) return null;
+
+    const minuteMatch = txt.match(/(\d{1,3})(?:\s*\+\s*(\d{1,2}))?/);
+    if (!minuteMatch) return null;
+
+    const base = Number(minuteMatch[1]);
+    const extra = Number(minuteMatch[2] || 0);
+    if (!Number.isFinite(base)) return null;
+
+    return Math.max(0, base + (Number.isFinite(extra) ? extra : 0));
+};
+
+const isPinnacleProviderBet = (row = {}) => {
+    const provider = String(row?.placementProvider || row?.provider || '').trim().toLowerCase();
+    return provider.includes('pinnacle') || provider.includes('arcadia');
+};
+
+const shouldAttemptPinnacleSettledAutoSyncForBet = (row = {}) => {
+    if (!row || typeof row !== 'object') return false;
+    if (!isPinnacleProviderBet(row)) return false;
+
+    const providerBetId = String(row?.providerBetId || '').trim();
+    if (!providerBetId) return false;
+
+    const providerStatus = String(row?.providerStatus || '').trim().toLowerCase();
+    if (providerStatus === 'settled') return false;
+
+    const liveSignal =
+        row?.liveTime ||
+        row?.time ||
+        row?.pinnacleInfo?.time ||
+        row?.raw?.selections?.[0]?.gameTime ||
+        '';
+    const liveSignalUpper = String(liveSignal || '').trim().toUpperCase();
+    if (liveSignalUpper === 'FINAL' || liveSignalUpper === 'FT') return true;
+
+    const liveMinute = extractLiveClockMinute(liveSignal);
+    if (Number.isFinite(liveMinute) && liveMinute >= 95) return true;
+
+    const startIso = resolveOpEventStartIso(row) || row?.matchDate || row?.date || null;
+    const startMs = new Date(startIso || 0).getTime();
+    if (!Number.isFinite(startMs)) return false;
+
+    const minutesSinceStart = (Date.now() - startMs) / 60000;
+    return Number.isFinite(minutesSinceStart) && minutesSinceStart >= 130;
+};
+
 const isEventInPlayNow = (row = {}, fallbackRow = null) => {
     const liveSignal =
         row?.liveTime ||
@@ -888,6 +1026,7 @@ function App() {
         counts: { fixtures: 0, subscribedTopics: 0 },
         error: null
     });
+    const [pinnaclePreflightByOpId, setPinnaclePreflightByOpId] = useState({});
     const [arbitrageExecutingKeys, setArbitrageExecutingKeys] = useState(new Set());
     const [arbitrageDualPreflightByKey, setArbitrageDualPreflightByKey] = useState({});
     const [arbitrageRiskProfileKey, setArbitrageRiskProfileKey] = useState('conservative');
@@ -975,7 +1114,9 @@ function App() {
     const lastPrematchWsHealthFetchAtRef = useRef(0);
     const lastPlacementProviderFetchAtRef = useRef(0);
     const lastPinnacleAccountFetchAtRef = useRef(0);
+    const lastPinnacleSettledAutoSyncAtRef = useRef(0);
     const pinnacleBalanceFetchInFlightRef = useRef(false);
+    const pinnacleSettledAutoSyncInFlightRef = useRef(false);
     const latestPortfolioActiveBetsRef = useRef([]);
     const latestBookyHistoryRef = useRef([]);
     const activeTabRef = useRef(activeTab);
@@ -1008,6 +1149,7 @@ function App() {
     const PINNACLE_BALANCE_POLL_MS = 15000;
     const PINNACLE_HISTORY_SYNC_DAYS = 180;
     const PINNACLE_HISTORY_SYNC_LIMIT = 500;
+    const PINNACLE_SETTLED_AUTO_SYNC_MS = 45000;
     const BOOKY_HISTORY_LIMIT = 120;
     const BOOKY_HISTORY_LIMIT_FINISHED_REAL = 0;
     const TOKEN_CLOCK_TICK_MS = 1000;
@@ -1020,6 +1162,8 @@ function App() {
   const localPlacedBetIdsRef = useRef(new Set());
   const pendingBetDetailsRef = useRef({});
     const optimisticWarnedIdsRef = useRef(new Set());
+    const pinnaclePreflightByOpIdRef = useRef({});
+    const pinnaclePreflightInFlightRef = useRef(new Set());
 
   // Trigger re-render when we update refs (hacky but works for instant feedback)
   const [, setTick] = useState(0);
@@ -1028,6 +1172,7 @@ function App() {
         // Mantener refs vivas para evitar cierres stale dentro de setInterval(fetchData).
         activeTabRef.current = activeTab;
         tokenHealthRef.current = tokenHealth;
+        pinnaclePreflightByOpIdRef.current = pinnaclePreflightByOpId;
 
     const hasPrematchContext = (info = null) => {
         const ctx = info?.prematchContext;
@@ -1642,6 +1787,55 @@ function App() {
                         })
                     ]
                 });
+
+                const shouldAutoSyncPinnacleSettled = serverActiveBets.some((bet) => shouldAttemptPinnacleSettledAutoSyncForBet(bet));
+                const canRunPinnacleSettledAutoSync =
+                    shouldAutoSyncPinnacleSettled
+                    && !pinnacleHistorySyncInFlightRef.current
+                    && !pinnacleSettledAutoSyncInFlightRef.current
+                    && (Date.now() - Number(lastPinnacleSettledAutoSyncAtRef.current || 0) >= PINNACLE_SETTLED_AUTO_SYNC_MS);
+
+                if (canRunPinnacleSettledAutoSync) {
+                    pinnacleSettledAutoSyncInFlightRef.current = true;
+                    pinnacleHistorySyncInFlightRef.current = true;
+                    lastPinnacleSettledAutoSyncAtRef.current = Date.now();
+
+                    void axios.get('/api/pinnacle/history', {
+                        params: {
+                            refresh: 1,
+                            limit: PINNACLE_HISTORY_SYNC_LIMIT,
+                            status: 'settled',
+                            days: PINNACLE_HISTORY_SYNC_DAYS
+                        },
+                        timeout: 30000
+                    })
+                        .then((res) => {
+                            if (!res?.data?.success) {
+                                throw new Error(res?.data?.error || 'No se pudo auto-sincronizar settled Pinnacle.');
+                            }
+
+                            setPinnacleHistorySyncMeta({
+                                fetchedAt: res.data?.fetchedAt || new Date().toISOString(),
+                                totalCount: Number(res.data?.totalCount || 0),
+                                touchedCount: Number(res.data?.reconcileStats?.touchedCount || 0),
+                                source: res.data?.source || null,
+                                error: null
+                            });
+
+                            pinnacleFinishedHydratedRef.current = true;
+                            void fetchData({ forceBookyRefresh: true });
+                        })
+                        .catch((error) => {
+                            setPinnacleHistorySyncMeta((prev) => ({
+                                ...prev,
+                                error: error?.message || 'Auto-sync settled Pinnacle falló.'
+                            }));
+                        })
+                        .finally(() => {
+                            pinnacleHistorySyncInFlightRef.current = false;
+                            pinnacleSettledAutoSyncInFlightRef.current = false;
+                        });
+                }
             } else if (portfolioReq?.status === 'rejected') {
                 console.warn('⚠️ Portfolio fetch falló. Se mantiene snapshot previo.', portfolioReq.reason?.message || portfolioReq.reason);
             }
@@ -1701,6 +1895,127 @@ function App() {
         });
     };
 
+    const canRunPinnacleQuotePreflightForOpportunity = (opportunity = {}) => {
+        if (!opportunity || typeof opportunity !== 'object') return false;
+        if (isLiveOriginOpportunity(opportunity)) return false;
+
+        const type = String(opportunity?.type || opportunity?.strategy || '').trim().toUpperCase();
+        if (!type.includes('PREMATCH')) return false;
+
+        const eventRef = String(opportunity?.eventId || opportunity?.pinnacleId || '').trim();
+        if (!eventRef) return false;
+
+        return true;
+    };
+
+    const extractPinnaclePreflightProviderDetail = (diagnostic = null) => {
+        const detail =
+            diagnostic?.firstError?.providerBody?.detail ||
+            diagnostic?.secondError?.providerBody?.detail ||
+            diagnostic?.providerBody?.detail ||
+            diagnostic?.resolution?.error?.message ||
+            null;
+        return detail ? String(detail).trim() : null;
+    };
+
+    const upsertPinnaclePreflightByOpId = (updater) => {
+        setPinnaclePreflightByOpId((prev) => {
+            const next = typeof updater === 'function' ? updater(prev) : updater;
+            pinnaclePreflightByOpIdRef.current = next;
+            return next;
+        });
+    };
+
+    const runPinnacleQuotePreflightForOpportunity = async (opportunity = {}, { force = false } = {}) => {
+        if (!canRunPinnacleQuotePreflightForOpportunity(opportunity)) return null;
+
+        const opId = getOpportunityId(opportunity);
+        if (!opId) return null;
+
+        const existing = pinnaclePreflightByOpIdRef.current?.[opId] || null;
+        const checkedAtMs = existing?.checkedAt ? new Date(existing.checkedAt).getTime() : NaN;
+        const hasFreshCache = Number.isFinite(checkedAtMs) && (Date.now() - checkedAtMs) <= PINNACLE_PREFLIGHT_TTL_MS;
+        if (!force && hasFreshCache && !existing?.checking) {
+            return existing;
+        }
+
+        if (pinnaclePreflightInFlightRef.current.has(opId)) {
+            return existing;
+        }
+
+        pinnaclePreflightInFlightRef.current.add(opId);
+        upsertPinnaclePreflightByOpId((prev) => ({
+            ...prev,
+            [opId]: {
+                ...(prev?.[opId] || {}),
+                checking: true,
+                requestedAt: new Date().toISOString(),
+                quoteable: prev?.[opId]?.quoteable ?? null,
+                status: prev?.[opId]?.status || 'CHECKING'
+            }
+        }));
+
+        try {
+            const res = await axios.post('/api/pinnacle/real/preflight', opportunity, { timeout: 20000 });
+            const preflight = res?.data?.preflight || {};
+            const record = {
+                checking: false,
+                quoteable: Boolean(preflight?.quoteable),
+                status: String(preflight?.status || (preflight?.quoteable ? 'QUOTEABLE' : 'NOT_QUOTEABLE_UNKNOWN')),
+                checkedAt: preflight?.checkedAt || new Date().toISOString(),
+                message: preflight?.message || null,
+                providerStatus: Number.isFinite(Number(preflight?.providerStatus)) ? Number(preflight.providerStatus) : null,
+                providerDetail: extractPinnaclePreflightProviderDetail(preflight?.diagnostic || null),
+                retriedWithMarketRefresh: Boolean(preflight?.retriedWithMarketRefresh)
+            };
+
+            upsertPinnaclePreflightByOpId((prev) => ({
+                ...prev,
+                [opId]: record
+            }));
+
+            return record;
+        } catch (error) {
+            const payload = error?.response?.data || {};
+            const preflight = payload?.preflight || null;
+            const record = {
+                checking: false,
+                quoteable: false,
+                status: String(preflight?.status || payload?.code || 'PREFLIGHT_ERROR').toUpperCase(),
+                checkedAt: preflight?.checkedAt || new Date().toISOString(),
+                message: preflight?.message || payload?.message || error?.message || 'Error de preflight',
+                providerStatus: Number.isFinite(Number(preflight?.providerStatus))
+                    ? Number(preflight.providerStatus)
+                    : (Number.isFinite(Number(error?.response?.status)) ? Number(error.response.status) : null),
+                providerDetail: extractPinnaclePreflightProviderDetail(preflight?.diagnostic || payload?.diagnostic || null),
+                retriedWithMarketRefresh: Boolean(preflight?.retriedWithMarketRefresh)
+            };
+
+            upsertPinnaclePreflightByOpId((prev) => ({
+                ...prev,
+                [opId]: record
+            }));
+
+            return record;
+        } finally {
+            pinnaclePreflightInFlightRef.current.delete(opId);
+        }
+    };
+
+    const preflightPrematchRowsForPinnacle = async (rows = [], { force = false } = {}) => {
+        const provider = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+        if (provider !== 'pinnacle') return;
+
+        const list = Array.isArray(rows) ? rows : [];
+        const candidates = list
+            .filter((row) => canRunPinnacleQuotePreflightForOpportunity(row))
+            .slice(0, 14);
+
+        if (candidates.length === 0) return;
+
+        await Promise.all(candidates.map((row) => runPinnacleQuotePreflightForOpportunity(row, { force })));
+    };
+
     const fetchPrematchData = async ({ force = false } = {}) => {
         if (prematchFetchInFlightRef.current) return;
 
@@ -1717,6 +2032,7 @@ function App() {
             if (prematchRes?.data?.data) {
                 const cleanOps = sanitizePrematchRows(prematchRes.data.data);
                 setPrematchOps(cleanOps);
+                void preflightPrematchRowsForPinnacle(cleanOps, { force: false });
             }
 
             lastPrematchFetchAtRef.current = Date.now();
@@ -2064,11 +2380,15 @@ function App() {
         const stake = Number(resolveArbitrageLegStake({ op, leg, legIdx }));
         if (!(Number.isFinite(stake) && stake > 0)) return null;
 
-        const market = String(leg?.market || '').trim();
-        if (market !== '1x2') return null;
+        const marketRaw = String(leg?.market || '').trim();
+        const marketLower = marketRaw.toLowerCase();
+        const isOneXTwo = marketLower === '1x2';
+        const isDoubleChance = marketLower.includes('double chance') || marketLower.includes('doble oportunidad');
+        if (!isOneXTwo && !isDoubleChance) return null;
 
-        const selection = normalizeArbitrageLegSelection(market, leg?.selection || '');
-        if (!(selection === 'Home' || selection === 'Draw' || selection === 'Away')) return null;
+        const selection = normalizeArbitrageLegSelection(marketRaw, leg?.selection || '');
+        if (isOneXTwo && !(selection === 'Home' || selection === 'Draw' || selection === 'Away')) return null;
+        if (isDoubleChance && !(selection === '1X' || selection === 'X2' || selection === '12')) return null;
 
         const ev = Number(op?.plan?.roiPercent || 0);
         const realProb = (Number.isFinite(ev) && Number.isFinite(odd) && odd > 1)
@@ -2083,7 +2403,7 @@ function App() {
             match: op?.match || '-',
             league: op?.league || '-',
             date: op?.matchDate || null,
-            market: '1x2',
+            market: isOneXTwo ? '1x2' : 'Double Chance',
             selection,
             action: `Apostar ${selection}`,
             odd,
@@ -2100,11 +2420,26 @@ function App() {
         };
     };
 
-    const pickMaxStakeLeg = (candidates = []) => {
-        if (!Array.isArray(candidates) || candidates.length === 0) return null;
-        return candidates
-            .slice()
-            .sort((a, b) => Number(b?.stake || 0) - Number(a?.stake || 0))[0] || null;
+    const sortExecutionLegs = (candidates = []) => {
+        if (!Array.isArray(candidates) || candidates.length === 0) return [];
+
+        const bySignature = new Map();
+        for (const candidate of candidates) {
+            if (!candidate) continue;
+            const market = String(candidate?.opportunity?.market || candidate?.leg?.market || '').trim().toLowerCase();
+            const selection = String(candidate?.opportunity?.selection || candidate?.leg?.selection || '').trim().toUpperCase();
+            const signature = `${market}|${selection}`;
+
+            if (!signature) continue;
+
+            const previous = bySignature.get(signature) || null;
+            if (!previous || Number(candidate?.stake || 0) > Number(previous?.stake || 0)) {
+                bySignature.set(signature, candidate);
+            }
+        }
+
+        return Array.from(bySignature.values())
+            .sort((a, b) => Number(b?.stake || 0) - Number(a?.stake || 0));
     };
 
     const buildArbitrageFallbackLegs1x2 = (op = {}) => {
@@ -2168,8 +2503,10 @@ function App() {
             })
             .filter(Boolean);
 
-        const arcadia = pickMaxStakeLeg(arcadiaCandidates);
-        const altenar = pickMaxStakeLeg(altenarCandidates);
+        const arcadiaLegs = sortExecutionLegs(arcadiaCandidates);
+        const altenarLegs = sortExecutionLegs(altenarCandidates);
+        const arcadia = arcadiaLegs[0] || null;
+        const altenar = altenarLegs[0] || null;
 
         if (!arcadia || !altenar) {
             let reason = 'requires-arcadia-and-altenar-legs';
@@ -2185,7 +2522,9 @@ function App() {
                 canExecute: false,
                 reason,
                 arcadia: arcadia || null,
-                altenar: altenar || null
+                altenar: altenar || null,
+                arcadiaLegs,
+                altenarLegs
             };
         }
 
@@ -2194,7 +2533,9 @@ function App() {
                 canExecute: false,
                 reason: 'missing-pinnacle-id',
                 arcadia,
-                altenar
+                altenar,
+                arcadiaLegs,
+                altenarLegs
             };
         }
 
@@ -2205,6 +2546,8 @@ function App() {
                 reason: 'match-started',
                 arcadia,
                 altenar,
+                arcadiaLegs,
+                altenarLegs,
                 matchDate: new Date(matchDateMs).toISOString()
             };
         }
@@ -2213,7 +2556,9 @@ function App() {
             canExecute: true,
             reason: null,
             arcadia,
-            altenar
+            altenar,
+            arcadiaLegs,
+            altenarLegs
         };
     };
 
@@ -2694,27 +3039,45 @@ function App() {
             return;
         }
 
-        const arcadiaLeg = dualPlan.arcadia;
-        const altenarLeg = dualPlan.altenar;
-        const arcadiaPick = normalizePick(arcadiaLeg?.opportunity || {});
-        const existingArcadiaExposure = await resolveBlockingArcadiaExposure(arcadiaLeg?.opportunity || null);
+        const arcadiaLegs = Array.isArray(dualPlan?.arcadiaLegs) && dualPlan.arcadiaLegs.length > 0
+            ? dualPlan.arcadiaLegs
+            : (dualPlan?.arcadia ? [dualPlan.arcadia] : []);
+        const altenarLegs = Array.isArray(dualPlan?.altenarLegs) && dualPlan.altenarLegs.length > 0
+            ? dualPlan.altenarLegs
+            : (dualPlan?.altenar ? [dualPlan.altenar] : []);
+
+        let existingArcadiaExposure = null;
+        let existingArcadiaLeg = null;
+        for (const leg of arcadiaLegs) {
+            const existing = await resolveBlockingArcadiaExposure(leg?.opportunity || null);
+            if (existing) {
+                existingArcadiaExposure = existing;
+                existingArcadiaLeg = leg;
+                break;
+            }
+        }
 
         if (existingArcadiaExposure) {
             const providerBetIdTxt = String(existingArcadiaExposure?.providerBetId || '').trim() || 'n/a';
+            const blockedPick = normalizePick(existingArcadiaLeg?.opportunity || {});
             alert(
                 '⚠️ Ejecución dual bloqueada para evitar duplicado Arcadia.\n\n' +
-                `Ya existe exposición abierta en Arcadia para este pick (${arcadiaPick || 'n/a'}).\n` +
+                `Ya existe exposición abierta en Arcadia para este pick (${blockedPick || 'n/a'}).\n` +
                 `ticket local: ${existingArcadiaExposure?.id || 'n/a'} | providerBetId: ${providerBetIdTxt}\n\n` +
                 'Acción: primero cubrir/cerrar esa exposición y luego volver a evaluar arbitraje.'
             );
             return;
         }
 
+        const formatExecutionLegLine = (providerLabel, leg, idx) => (
+            `${idx + 1}) ${providerLabel}: ${leg?.opportunity?.selection || '-'} @ ${Number(leg?.opportunity?.odd || 0).toFixed(3)} | Stake S/. ${Number(leg?.opportunity?.kellyStake || 0).toFixed(2)}`
+        );
+
         const confirmMsg =
             'Ejecución dual secuencial (Arcadia → Altenar)\n\n' +
             `Partido: ${op?.match || '-'}\n` +
-            `Arcadia: ${arcadiaLeg?.opportunity?.selection || '-'} @ ${Number(arcadiaLeg?.opportunity?.odd || 0).toFixed(3)} | Stake S/. ${Number(arcadiaLeg?.opportunity?.kellyStake || 0).toFixed(2)}\n` +
-            `Altenar: ${altenarLeg?.opportunity?.selection || '-'} @ ${Number(altenarLeg?.opportunity?.odd || 0).toFixed(3)} | Stake S/. ${Number(altenarLeg?.opportunity?.kellyStake || 0).toFixed(2)}\n\n` +
+            `Arcadia (${arcadiaLegs.length}):\n${arcadiaLegs.map((leg, idx) => formatExecutionLegLine('Arcadia', leg, idx)).join('\n')}\n\n` +
+            `Altenar (${altenarLegs.length}):\n${altenarLegs.map((leg, idx) => formatExecutionLegLine('Altenar', leg, idx)).join('\n')}\n\n` +
             'Se ejecutará dry-run obligatorio en ambos providers antes de confirmar real.\n\n' +
             '¿Continuar?';
 
@@ -2745,16 +3108,27 @@ function App() {
                 return;
             }
 
-            const refreshedArcadiaLeg = preflight?.dualPlan?.arcadia;
-            const refreshedAltenarLeg = preflight?.dualPlan?.altenar;
-            if (!refreshedArcadiaLeg?.opportunity || !refreshedAltenarLeg?.opportunity) {
+            const refreshedArcadiaLegs = Array.isArray(preflight?.dualPlan?.arcadiaLegs) && preflight.dualPlan.arcadiaLegs.length > 0
+                ? preflight.dualPlan.arcadiaLegs
+                : (preflight?.dualPlan?.arcadia ? [preflight.dualPlan.arcadia] : []);
+            const refreshedAltenarLegs = Array.isArray(preflight?.dualPlan?.altenarLegs) && preflight.dualPlan.altenarLegs.length > 0
+                ? preflight.dualPlan.altenarLegs
+                : (preflight?.dualPlan?.altenar ? [preflight.dualPlan.altenar] : []);
+            if (refreshedArcadiaLegs.length === 0 || refreshedAltenarLegs.length === 0) {
                 alert('⛔ Pre-flight dual abortado: plan refrescado inválido para ejecutar Arcadia + Altenar.');
                 await refreshArbitrageWithPrematch();
                 await fetchData({ forceBookyRefresh: true });
                 return;
             }
 
-            const existingAfterPreflight = await resolveBlockingArcadiaExposure(refreshedArcadiaLeg.opportunity);
+            let existingAfterPreflight = null;
+            for (const leg of refreshedArcadiaLegs) {
+                const existing = await resolveBlockingArcadiaExposure(leg?.opportunity || null);
+                if (existing) {
+                    existingAfterPreflight = existing;
+                    break;
+                }
+            }
             if (existingAfterPreflight) {
                 const providerBetIdTxt = String(existingAfterPreflight?.providerBetId || '').trim() || 'n/a';
                 alert(
@@ -2840,43 +3214,63 @@ function App() {
                 // Si token-health falla, no bloquear ciegamente: seguirá validando en backend al confirmar Booky.
             }
 
-            const arcadiaResult = await runProviderRealPlacement({
-                provider: 'pinnacle',
-                opportunity: refreshedArcadiaLeg.opportunity,
-                confirmMode: 'confirm-fast'
-            });
+            const arcadiaResults = [];
+            for (const leg of refreshedArcadiaLegs) {
+                const legResult = await runProviderRealPlacement({
+                    provider: 'pinnacle',
+                    opportunity: leg.opportunity,
+                    confirmMode: 'confirm-fast'
+                });
+                arcadiaResults.push({ leg, result: legResult });
 
-            if (arcadiaResult.outcome !== 'confirmed') {
-                const code = arcadiaResult?.code ? ` | code=${arcadiaResult.code}` : '';
-                alert(`❌ Resultado final=REJECTED (Arcadia)${code}\n${arcadiaResult?.message || 'No se pudo confirmar pata Arcadia.'}`);
-                await fetchData({ forceBookyRefresh: true });
-                return;
+                if (legResult.outcome !== 'confirmed') {
+                    const code = legResult?.code ? ` | code=${legResult.code}` : '';
+                    const failedSelection = leg?.opportunity?.selection || 'n/a';
+                    alert(`❌ Resultado final=REJECTED (Arcadia ${failedSelection})${code}\n${legResult?.message || 'No se pudo confirmar pata Arcadia.'}`);
+                    await fetchData({ forceBookyRefresh: true });
+                    return;
+                }
             }
 
-            const altenarResult = await runProviderRealPlacement({
-                provider: 'booky',
-                opportunity: refreshedAltenarLeg.opportunity,
-                confirmMode: 'confirm-fast'
-            });
+            const altenarResults = [];
+            for (const leg of refreshedAltenarLegs) {
+                const legResult = await runProviderRealPlacement({
+                    provider: 'booky',
+                    opportunity: leg.opportunity,
+                    confirmMode: 'confirm-fast'
+                });
+                altenarResults.push({ leg, result: legResult });
 
-            if (altenarResult.outcome === 'confirmed') {
-                alert(
-                    '✅ Resultado final=CONFIRMED (DUAL)\n\n' +
-                    `Arcadia ticket: ${arcadiaResult?.ticketId || 'n/a'}\n` +
-                    `Altenar ticket: ${altenarResult?.ticketId || 'n/a'}`
-                );
-                await fetchData({ forceBookyRefresh: true });
-                return;
+                if (legResult.outcome !== 'confirmed') {
+                    const secondOutcome = legResult.outcome === 'uncertain' ? 'UNCERTAIN' : 'REJECTED';
+                    const code = legResult?.code ? ` | code=${legResult.code}` : '';
+                    const confirmedArcadiaTickets = arcadiaResults
+                        .map((row, idx) => `${idx + 1}) ${row?.leg?.opportunity?.selection || '-'} => ${row?.result?.ticketId || 'n/a'}`)
+                        .join('\n');
+
+                    alert(
+                        `⚠️ Resultado final=HEDGE_REQUIRED\n\n` +
+                        `Arcadia CONFIRMED (${arcadiaResults.length}):\n${confirmedArcadiaTickets || 'n/a'}\n\n` +
+                        `Altenar ${secondOutcome}${code}\n` +
+                        `${legResult?.message || 'Sin detalle adicional.'}\n\n` +
+                        'Acción: cubrir manualmente el riesgo de las patas Arcadia ya ejecutadas.'
+                    );
+                    await fetchData({ forceBookyRefresh: true });
+                    return;
+                }
             }
 
-            const secondOutcome = altenarResult.outcome === 'uncertain' ? 'UNCERTAIN' : 'REJECTED';
-            const code = altenarResult?.code ? ` | code=${altenarResult.code}` : '';
+            const confirmedArcadiaText = arcadiaResults
+                .map((row, idx) => `${idx + 1}) ${row?.leg?.opportunity?.selection || '-'} => ${row?.result?.ticketId || 'n/a'}`)
+                .join('\n');
+            const confirmedAltenarText = altenarResults
+                .map((row, idx) => `${idx + 1}) ${row?.leg?.opportunity?.selection || '-'} => ${row?.result?.ticketId || 'n/a'}`)
+                .join('\n');
+
             alert(
-                `⚠️ Resultado final=HEDGE_REQUIRED\n\n` +
-                `Arcadia CONFIRMED (ticket ${arcadiaResult?.ticketId || 'n/a'})\n` +
-                `Altenar ${secondOutcome}${code}\n` +
-                `${altenarResult?.message || 'Sin detalle adicional.'}\n\n` +
-                'Acción: cubrir manualmente el riesgo de la pata Arcadia ya ejecutada.'
+                '✅ Resultado final=CONFIRMED (DUAL)\n\n' +
+                `Arcadia (${arcadiaResults.length}):\n${confirmedArcadiaText}\n\n` +
+                `Altenar (${altenarResults.length}):\n${confirmedAltenarText}`
             );
             await fetchData({ forceBookyRefresh: true });
         } catch (error) {
@@ -3116,6 +3510,13 @@ function App() {
         }
     };
 
+    useEffect(() => {
+        const provider = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+        if (provider !== 'pinnacle') return;
+        if (!Array.isArray(prematchOps) || prematchOps.length === 0) return;
+        void preflightPrematchRowsForPinnacle(prematchOps, { force: false });
+    }, [autoPlacementProvider, prematchOps]);
+
     const handleManualPinnacleHistorySync = async () => {
         if (pinnacleHistorySyncing) return;
         if (pinnacleHistorySyncInFlightRef.current) return;
@@ -3241,6 +3642,7 @@ function App() {
             const payload = JSON.parse(String(evt?.data || '{}'));
             const rows = sanitizePrematchRows(payload?.data || []);
             setPrematchOps(rows);
+            void preflightPrematchRowsForPinnacle(rows, { force: false });
             lastPrematchSseEventAtRef.current = Date.now();
             lastPrematchFetchAtRef.current = Date.now();
             fetchPrematchWsHealth();
@@ -3747,6 +4149,21 @@ function App() {
     
         // Evitar doble clic (lock inmediato con ref para evitar race de setState)
         if (processingBetsRef.current.has(id)) return;
+
+        if (!isBookyManualPlacement) {
+            const preflight = await runPinnacleQuotePreflightForOpportunity(opportunity, { force: true });
+            if (!preflight?.quoteable) {
+                const statusTxt = String(preflight?.status || 'NOT_QUOTEABLE').trim();
+                const detailTxt = String(preflight?.providerDetail || preflight?.message || '').trim();
+                alert(
+                    '⛔ Preflight Pinnacle bloqueó la ejecución.\n\n' +
+                    `Estado: ${statusTxt}` +
+                    `${detailTxt ? `\nDetalle: ${detailTxt}` : ''}`
+                );
+                return;
+            }
+        }
+
         processingBetsRef.current.add(id);
     
     // UI Optimista: Añadir a procesando
@@ -5963,6 +6380,7 @@ function App() {
                                             : (betData?.placementProvider || betData?.provider || op?.placementProvider || op?.provider || '')
                                     ).trim();
                                     const displayProviderBucket = normalizeArbitrageProviderBucket(displayProviderRaw);
+                                    const placementProviderBadge = getPlacementProviderBadgeMeta(displayProviderRaw);
                                     const altDisplayOdd = (displayProviderBucket === 'altenar' && Number.isFinite(displayOdd) && displayOdd > 1)
                                         ? displayOdd
                                         : null;
@@ -6002,6 +6420,41 @@ function App() {
 
                                     // Display Logic Fixes: Include Explicit Finish here
                                     const showFinished = executionStatus === 'FINISHED' || op.isFinished || isExplicitlyFinished;
+                                    const manualProviderIsPinnacle = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky') === 'pinnacle';
+                                    const shouldShowPinnaclePreflight = Boolean(
+                                        manualProviderIsPinnacle
+                                        && executionStatus === 'PENDING'
+                                        && !showFinished
+                                        && !isLive
+                                        && canRunPinnacleQuotePreflightForOpportunity(op)
+                                    );
+                                    const preflightEntry = shouldShowPinnaclePreflight
+                                        ? (pinnaclePreflightByOpId[opBetKey] || null)
+                                        : null;
+                                    const preflightBadge = getPinnaclePreflightBadgeMeta(preflightEntry);
+                                    const preflightCheckedAtMs = preflightEntry?.checkedAt
+                                        ? new Date(preflightEntry.checkedAt).getTime()
+                                        : NaN;
+                                    const preflightIsFresh = Number.isFinite(preflightCheckedAtMs)
+                                        ? (Date.now() - preflightCheckedAtMs) <= PINNACLE_PREFLIGHT_TTL_MS
+                                        : false;
+                                    const preflightIsStale = Boolean(preflightEntry && !preflightEntry?.checking && !preflightIsFresh);
+                                    const preflightBlocksPlacement = Boolean(
+                                        shouldShowPinnaclePreflight
+                                        && preflightEntry
+                                        && !preflightEntry?.checking
+                                        && !preflightEntry?.quoteable
+                                        && preflightIsFresh
+                                    );
+                                    const preflightDetailText = String(
+                                        preflightEntry?.providerDetail ||
+                                        preflightEntry?.message ||
+                                        ''
+                                    ).trim();
+                                    const betButtonDisabled = Boolean(preflightBlocksPlacement);
+                                    const betButtonComputedTitle = preflightBlocksPlacement
+                                        ? `${betButtonTitle}\n\nBloqueado por preflight: ${preflightBadge.label}`
+                                        : betButtonTitle;
 
                                     return (
                                     <tr key={idx} className={`hover:bg-slate-700/50 transition-colors ${isLive ? 'bg-slate-800/80 border-l-2 border-red-500' : ''}`}>
@@ -6080,33 +6533,39 @@ function App() {
                                         </td>
                                         <td className="p-3">
                                             {/* STRATEGY BADGE */}
-                                            {((isLive || showFinished || executionStatus === 'FINISHED' || executionStatus === 'ACTIVE') || (entryMeta && entryMeta.total > 1)) && (
-                                                <div className="mb-1 flex items-center gap-1.5 flex-wrap">
-                                                    {(isLive || showFinished || executionStatus === 'FINISHED') && (
-                                                        <>
-                                                            {showValueBadge ? (
-                                                                <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                                    VALUE BET
-                                                                </span>
-                                                            ) : showSnipeBadge ? (
-                                                                <span className="text-[9px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                                    SNIPE
-                                                                </span>
-                                                            ) : showPrematchBadge ? (
-                                                                <span className="text-[9px] font-bold bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                                    PRE-MATCH
-                                                                </span>
-                                                            ) : null}
-                                                        </>
-                                                    )}
+                                            <div className="mb-1 flex items-center gap-1.5 flex-wrap">
+                                                <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border tracking-wide ${placementProviderBadge.className}`}>
+                                                    {placementProviderBadge.label}
+                                                </span>
 
-                                                    {entryMeta && entryMeta.total > 1 && (
-                                                        <span className="text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
-                                                            ENTRY #{entryMeta.index}/{entryMeta.total}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            )}
+                                                {((isLive || showFinished || executionStatus === 'FINISHED' || executionStatus === 'ACTIVE') || (entryMeta && entryMeta.total > 1)) && (
+                                                    <>
+                                                        {(isLive || showFinished || executionStatus === 'FINISHED') && (
+                                                            <>
+                                                                {showValueBadge ? (
+                                                                    <span className="text-[9px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                                        VALUE BET
+                                                                    </span>
+                                                                ) : showSnipeBadge ? (
+                                                                    <span className="text-[9px] font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                                        SNIPE
+                                                                    </span>
+                                                                ) : showPrematchBadge ? (
+                                                                    <span className="text-[9px] font-bold bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                                        PRE-MATCH
+                                                                    </span>
+                                                                ) : null}
+                                                            </>
+                                                        )}
+
+                                                        {entryMeta && entryMeta.total > 1 && (
+                                                            <span className="text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded tracking-wide uppercase">
+                                                                ENTRY #{entryMeta.index}/{entryMeta.total}
+                                                            </span>
+                                                        )}
+                                                    </>
+                                                )}
+                                            </div>
                                             <div className="text-slate-200 font-bold text-sm text-wrap max-w-50 md:max-w-none">{op.match}</div>
                                             {(op.isBookyHistory || activeTab === 'LIVE' || activeTab === 'FINISHED' || ticketIdForRow) ? (
                                                 <div className="text-slate-500 text-[10px] flex gap-2 flex-wrap items-center">
@@ -6321,11 +6780,46 @@ function App() {
                                                     <span className="text-[9px] uppercase tracking-wide text-slate-500 font-bold">
                                                         Manual {autoPlacementProviderLabel}
                                                     </span>
+                                                    {shouldShowPinnaclePreflight && (
+                                                        <div className="w-full rounded border border-slate-600/50 bg-slate-900/60 px-2 py-1.5 text-left">
+                                                            <div className="flex items-center justify-between gap-2">
+                                                                <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border tracking-wide ${preflightBadge.className}`}>
+                                                                    {preflightBadge.label}
+                                                                </span>
+                                                                <button
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        void runPinnacleQuotePreflightForOpportunity(op, { force: true });
+                                                                    }}
+                                                                    disabled={Boolean(preflightEntry?.checking)}
+                                                                    className={`text-[9px] uppercase px-1.5 py-0.5 rounded border transition-colors ${preflightEntry?.checking
+                                                                        ? 'border-slate-600 text-slate-500 cursor-not-allowed'
+                                                                        : 'border-blue-500/40 text-blue-300 hover:bg-blue-500/15'}`}
+                                                                    title="Consultar quoteability en Arcadia"
+                                                                >
+                                                                    {preflightEntry?.checking ? '...' : 'PRECHECK'}
+                                                                </button>
+                                                            </div>
+                                                            {preflightDetailText && (
+                                                                <div className="mt-1 text-[9px] text-slate-300 truncate" title={preflightDetailText}>
+                                                                    {preflightDetailText}
+                                                                </div>
+                                                            )}
+                                                            {preflightIsStale && (
+                                                                <div className="mt-1 text-[9px] text-amber-300">
+                                                                    Estado vencido, refresca precheck.
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
                                                     {/* BOTÓN APOSTAR */}
                                                     <button 
                                                         onClick={(e) => { e.stopPropagation(); handlePlaceBet(op); }}
-                                                        className="flex items-center gap-2 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/50 hover:border-emerald-400 text-emerald-100 rounded px-3 py-1.5 w-full justify-between transition-all group cursor-pointer shadow-[0_0_10px_rgba(16,185,129,0.1)] hover:shadow-[0_0_15px_rgba(16,185,129,0.3)] active:scale-95"
-                                                        title={betButtonTitle}
+                                                        disabled={betButtonDisabled}
+                                                        className={`flex items-center gap-2 rounded px-3 py-1.5 w-full justify-between transition-all group shadow-[0_0_10px_rgba(16,185,129,0.1)] ${betButtonDisabled
+                                                            ? 'bg-slate-700/40 border border-slate-600 text-slate-500 cursor-not-allowed'
+                                                            : 'bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/50 hover:border-emerald-400 text-emerald-100 cursor-pointer hover:shadow-[0_0_15px_rgba(16,185,129,0.3)] active:scale-95'}`}
+                                                        title={betButtonComputedTitle}
                                                     >
                                                         <span className="font-bold text-[10px] group-hover:text-white">APOSTAR</span>
                                                         <span className="font-mono font-bold text-sm">S/. {(op.kellyStake || 0).toFixed(2)}</span>
