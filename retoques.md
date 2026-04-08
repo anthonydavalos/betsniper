@@ -1,5 +1,39 @@
 # Registro de Retoques y Correcciones
 
+## [2026-04-08] Cierre operativo Fase 0 y Fase 1 (Arbitraje Live Preview)
+
+### Fase 0 - Baseline y observabilidad minima (Estado: CERRADA)
+- **Baseline ejecutado:** corrida extendida de diagnosticos/arbitrage en ventana de 120 minutos.
+- **Resultado operacional:** endpoints estables sin timeouts recurrentes ni errores de runtime durante la corrida.
+- **Top causas de descarte observadas:**
+  - `unlinked` (dominante),
+  - `staleAltenar`,
+  - `noSurebetEdge`,
+  - `sameProvider` (baja frecuencia).
+- **Accion aplicada para cuello de botella dominante:** fallback contextual de linking (Altenar live -> upcoming) y fallback contextual para mapping a Pinnacle live cuando falla el id-match directo.
+
+### Fase 1 - Motor de Arbitraje Live (Preview Only) (Estado: CERRADA)
+- **Entregables implementados:**
+  - servicio `src/services/liveArbitrageService.js`,
+  - endpoint `GET /api/opportunities/arbitrage/live/preview`,
+  - endpoint `GET /api/opportunities/arbitrage/live/diagnostics`,
+  - endpoint operativo `POST /api/opportunities/arbitrage/live/diagnostics/inventory` para inventario de snapshots.
+- **Cobertura MVP validada:**
+  - mercados `1x2` y `double_chance + opposite_1x2`,
+  - filtros de estado incierto/stale,
+  - filtro de categorias sensibles,
+  - normalizacion de orientacion,
+  - stake split con redondeo y chequeo de profit neto positivo.
+- **Contrato de salida validado:** `edgePercent`, `roiPercent`, `stakePlan` y `diagnostics` por descarte presentes en preview.
+- **Hardening aplicado post-baseline:**
+  - lectura resiliente del feed local de Pinnacle (retry corto + fallback a ultimo snapshot valido),
+  - retry defensivo en lectura de DB para mitigar parseos parciales transitorios.
+- **Validacion de estabilidad sostenida post-hardening:**
+  - soak de 30 minutos: `29/29` ciclos OK, `0` failed cycles, `0` exceptions, `200/200` en preview/diagnostics.
+
+### Decision de gate para siguiente fase
+- **Decision:** habilitado el paso a **Fase 2 (Simulacion Operativa)** en modo paper/dry-run dual, manteniendo `preview-first` y `requireCrossProvider=true`.
+
 ## [2026-04-06] Plan Camino 2: Implementacion de Arbitraje Live Real (por fases y seguro)
 
 ### Objetivo
