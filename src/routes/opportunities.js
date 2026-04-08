@@ -18,6 +18,11 @@ import {
   getLiveArbitrageDiagnosticsReport,
   runLiveArbitrageDiagnosticsInventory
 } from '../services/liveArbitrageService.js';
+import {
+  runLiveArbitrageSimulation,
+  getLiveArbitrageSimulationHistory,
+  getLiveArbitrageSimulationSummary
+} from '../services/liveArbitrageSimulationService.js';
 import { refreshAltenarEventDetailsNow } from '../services/altenarPrematchScheduler.js';
 import db from '../db/database.js';
 
@@ -533,6 +538,76 @@ router.post('/arbitrage/live/diagnostics/inventory', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error?.message || 'No se pudo ejecutar inventario de arbitraje live.'
+    });
+  }
+});
+
+// POST /api/opportunities/arbitrage/live/simulation/run
+// Ejecuta simulacion operacional de 2 patas (paper + dry-run dual) con cierre explicito.
+router.post('/arbitrage/live/simulation/run', async (req, res) => {
+  try {
+    const bankrollRaw = Number(req.body?.bankroll);
+    const limitRaw = Number(req.body?.limit);
+    const minRoiPercentRaw = Number(req.body?.minRoiPercent);
+    const minProfitAbsRaw = Number(req.body?.minProfitAbs);
+
+    const payload = await runLiveArbitrageSimulation({
+      bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      minRoiPercent: Number.isFinite(minRoiPercentRaw) ? minRoiPercentRaw : null,
+      minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : null
+    });
+
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      mode: 'simulation-paper-dryrun',
+      error: error?.message || 'No se pudo ejecutar simulacion live de arbitraje.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/live/simulation/history
+// Retorna historial reciente de operaciones simuladas (estados y evidencia por pata).
+router.get('/arbitrage/live/simulation/history', async (req, res) => {
+  try {
+    const limitRaw = Number(req.query?.limit);
+
+    const payload = await getLiveArbitrageSimulationHistory({
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo consultar historial de simulacion live.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/live/simulation/summary
+// Retorna resumen agregado de outcomes simulados en ventana temporal.
+router.get('/arbitrage/live/simulation/summary', async (req, res) => {
+  try {
+    const windowMinutesRaw = Number(req.query?.windowMinutes);
+
+    const payload = await getLiveArbitrageSimulationSummary({
+      windowMinutes: Number.isFinite(windowMinutesRaw) ? windowMinutesRaw : undefined
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo consultar resumen de simulacion live.'
     });
   }
 });

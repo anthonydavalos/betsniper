@@ -1,5 +1,23 @@
 # Registro de Retoques y Correcciones
 
+## [2026-04-08] Fase 2 iniciada: Simulacion Operativa (Paper + Dry-Run dual)
+
+- **Orquestador inicial implementado:** `src/services/liveArbitrageSimulationService.js`.
+- **Pipeline operativo (2 patas):**
+  - Selecciona candidatos `SUREBET_DC_OPPOSITE_LIVE` (solo operaciones de 2 patas).
+  - Ejecuta dry-run por pata usando flujos semi-auto existentes:
+    - Altenar/Booky: `prepareSemiAutoTicket` + `getRealPlacementDryRun`.
+    - Pinnacle: `preparePinnacleSemiAutoTicket` + `getPinnacleRealPlacementDryRun`.
+  - Limpia tickets temporales en ambos providers via cancelacion best-effort.
+- **Maquina de estados (simulacion):** `OPEN -> PARTIAL -> HEDGED -> CLOSED`.
+- **Outcome final obligatorio por operacion:** `CONFIRMED`, `REJECTED` o `UNCERTAIN`.
+- **Evidencia por pata registrada:** request/response, endpoint, preview, payload y diagnostico (`providerStatus`, `providerBody`, `requestId`) cuando aplica.
+- **API Fase 2 disponible:**
+  - `POST /api/opportunities/arbitrage/live/simulation/run`
+  - `GET /api/opportunities/arbitrage/live/simulation/history`
+  - `GET /api/opportunities/arbitrage/live/simulation/summary`
+- **Smoke API:** endpoints respondiendo `200` sobre backend reiniciado; en la muestra actual no hubo operaciones simuladas porque el preview live estaba en `count=0` en ese instante.
+
 ## [2026-04-08] Cierre operativo Fase 0 y Fase 1 (Arbitraje Live Preview)
 
 ### Fase 0 - Baseline y observabilidad minima (Estado: CERRADA)
