@@ -15,6 +15,10 @@ const ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES = Math.max(
   10,
   Math.floor(Number(process.env.ARBITRAGE_DIAG_SUMMARY_WINDOW_MINUTES || 180))
 );
+const ARBITRAGE_DIAG_SNAPSHOT_TOP_OPS = Math.max(
+  1,
+  Math.min(10, Math.floor(Number(process.env.ARBITRAGE_DIAG_SNAPSHOT_TOP_OPS || 5)))
+);
 const ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS = Math.max(
   60000,
   Math.floor(Number(process.env.ARBITRAGE_ALTENAR_MAX_ODD_AGE_MS || 900000))
@@ -398,6 +402,77 @@ const buildRejectionBreakdown = (diagnostics = {}) => {
   };
 };
 
+const normalizeOpportunityLegsForSnapshot = (opportunity = {}) => {
+  const type = String(opportunity?.type || '').trim().toUpperCase();
+
+  if (type === 'SUREBET_1X2_PREMATCH') {
+    const best = opportunity?.odds?.best || {};
+    return [
+      {
+        market: '1x2',
+        selection: 'Home',
+        provider: best?.home?.provider || null,
+        odd: Number(best?.home?.odd || 0) || null
+      },
+      {
+        market: '1x2',
+        selection: 'Draw',
+        provider: best?.draw?.provider || null,
+        odd: Number(best?.draw?.odd || 0) || null
+      },
+      {
+        market: '1x2',
+        selection: 'Away',
+        provider: best?.away?.provider || null,
+        odd: Number(best?.away?.odd || 0) || null
+      }
+    ];
+  }
+
+  if (Array.isArray(opportunity?.legs)) {
+    return opportunity.legs.map((leg) => ({
+      market: leg?.market || null,
+      selection: leg?.selection || null,
+      provider: leg?.provider || null,
+      odd: Number(leg?.odd || 0) || null
+    }));
+  }
+
+  return [];
+};
+
+const buildTopOpportunitiesSnapshot = (rows = [], { top = ARBITRAGE_DIAG_SNAPSHOT_TOP_OPS } = {}) => {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+
+  const safeTop = Math.max(1, Math.min(10, Math.floor(Number(top) || ARBITRAGE_DIAG_SNAPSHOT_TOP_OPS)));
+
+  return rows.slice(0, safeTop).map((op, idx) => ({
+    rank: idx + 1,
+    type: op?.type || null,
+    comboCode: op?.comboCode || null,
+    comboLabel: op?.comboLabel || null,
+    eventId: op?.eventId || null,
+    pinnacleId: op?.pinnacleId || null,
+    match: op?.match || null,
+    matchDate: op?.matchDate || null,
+    league: op?.league || null,
+    country: op?.country || null,
+    plan: {
+      roiPercent: Number(op?.plan?.roiPercent || 0),
+      edgePercent: Number(op?.plan?.edgePercent || 0),
+      expectedProfit: Number(op?.plan?.expectedProfit || 0),
+      guaranteedPayout: Number(op?.plan?.guaranteedPayout || 0),
+      impliedSum: Number(op?.plan?.impliedSum || 0)
+    },
+    legs: normalizeOpportunityLegsForSnapshot(op),
+    odds: {
+      pinnacle: op?.odds?.pinnacle || null,
+      altenar: op?.odds?.altenar || null,
+      best: op?.odds?.best || null
+    }
+  }));
+};
+
 const persistArbitrageDiagnosticSnapshot = async ({
   payload,
   query,
@@ -425,6 +500,9 @@ const persistArbitrageDiagnosticSnapshot = async ({
       source: payload?.source || null,
       market: payload?.market || null
     },
+    topOpportunities: buildTopOpportunitiesSnapshot(payload?.data || [], {
+      top: ARBITRAGE_DIAG_SNAPSHOT_TOP_OPS
+    }),
     diagnostics: payload.diagnostics,
     rejections: buildRejectionBreakdown(payload.diagnostics)
   };
