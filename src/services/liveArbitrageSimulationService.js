@@ -40,6 +40,98 @@ const normalizeProvider = (provider = '') => {
   return null;
 };
 
+const normalizeSimulatedLegStatus = (value) => {
+  const raw = String(value || '').trim().toUpperCase();
+  if (raw === 'CONFIRMED' || raw === 'REJECTED' || raw === 'UNCERTAIN') return raw;
+  return null;
+};
+
+const isTruthy = (value) => {
+  const v = String(value || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+};
+
+const buildDefaultControlledScenarios = () => {
+  const now = Date.now();
+  return [
+    {
+      type: 'SUREBET_DC_OPPOSITE_LIVE',
+      market: 'double_chance+opposite_1x2',
+      comboCode: '1X_PLUS_AWAY',
+      comboLabel: '1X + Away',
+      eventId: `sim-ctrl-${now}-1`,
+      altenarId: `sim-ctrl-${now}-1`,
+      pinnacleId: `sim-ctrl-${now}-1`,
+      match: 'CONTROLLED FILL TOTAL',
+      league: 'Controlled League',
+      liveTime: "72'",
+      score: '1-1',
+      edgePercent: 1.9,
+      roiPercent: 1.7,
+      expectedProfit: 1.7,
+      guaranteedPayout: 101.7,
+      stakePlan: {
+        labels: { cover: '1X', opposite: 'Away' },
+        stakes: { cover: 58.7, opposite: 41.3 }
+      },
+      legs: [
+        { market: 'Double Chance', selection: '1X', provider: 'booky', odd: 1.73, simulatedStatus: 'CONFIRMED' },
+        { market: '1x2', selection: 'Away', provider: 'pinnacle', odd: 2.46, simulatedStatus: 'CONFIRMED' }
+      ]
+    },
+    {
+      type: 'SUREBET_DC_OPPOSITE_LIVE',
+      market: 'double_chance+opposite_1x2',
+      comboCode: 'X2_PLUS_HOME',
+      comboLabel: 'X2 + Home',
+      eventId: `sim-ctrl-${now}-2`,
+      altenarId: `sim-ctrl-${now}-2`,
+      pinnacleId: `sim-ctrl-${now}-2`,
+      match: 'CONTROLLED SECOND LEG FAIL',
+      league: 'Controlled League',
+      liveTime: "61'",
+      score: '0-1',
+      edgePercent: 1.4,
+      roiPercent: 1.1,
+      expectedProfit: 1.1,
+      guaranteedPayout: 101.1,
+      stakePlan: {
+        labels: { cover: 'X2', opposite: 'Home' },
+        stakes: { cover: 54.2, opposite: 45.8 }
+      },
+      legs: [
+        { market: 'Double Chance', selection: 'X2', provider: 'pinnacle', odd: 1.84, simulatedStatus: 'CONFIRMED' },
+        { market: '1x2', selection: 'Home', provider: 'booky', odd: 2.12, simulatedStatus: 'REJECTED' }
+      ]
+    },
+    {
+      type: 'SUREBET_DC_OPPOSITE_LIVE',
+      market: 'double_chance+opposite_1x2',
+      comboCode: '12_PLUS_DRAW',
+      comboLabel: '12 + Draw',
+      eventId: `sim-ctrl-${now}-3`,
+      altenarId: `sim-ctrl-${now}-3`,
+      pinnacleId: `sim-ctrl-${now}-3`,
+      match: 'CONTROLLED UNCERTAIN TIMEOUT',
+      league: 'Controlled League',
+      liveTime: "83'",
+      score: '2-2',
+      edgePercent: 1.2,
+      roiPercent: 0.9,
+      expectedProfit: 0.9,
+      guaranteedPayout: 100.9,
+      stakePlan: {
+        labels: { cover: '12', opposite: 'Draw' },
+        stakes: { cover: 63.1, opposite: 36.9 }
+      },
+      legs: [
+        { market: 'Double Chance', selection: '12', provider: 'booky', odd: 1.58, simulatedStatus: 'CONFIRMED' },
+        { market: '1x2', selection: 'Draw', provider: 'pinnacle', odd: 3.08, simulatedStatus: 'UNCERTAIN' }
+      ]
+    }
+  ];
+};
+
 const isLikelyUncertainError = (error) => {
   const msg = String(error?.message || '').toLowerCase();
   const code = String(error?.code || '').toLowerCase();
@@ -121,6 +213,71 @@ const buildLegOpportunity = ({ operation, leg, stake, order }) => {
 };
 
 const runLegDryRun = async ({ operation, leg, stake, order }) => {
+  const simulatedStatus = normalizeSimulatedLegStatus(leg?.simulatedStatus);
+  if (simulatedStatus) {
+    const ok = simulatedStatus === 'CONFIRMED';
+    const simRequestId = `sim-${operation.id}-${order}`;
+    const simulatedMessage = simulatedStatus === 'CONFIRMED'
+      ? 'Dry-run simulado como exitoso.'
+      : simulatedStatus === 'REJECTED'
+        ? 'Dry-run simulado como rechazo definitivo.'
+        : 'Dry-run simulado como incierto por timeout de red.';
+
+    return {
+      ok,
+      provider: normalizeProvider(leg?.provider),
+      status: simulatedStatus,
+      stage: 'dryrun-simulated',
+      message: String(leg?.simulatedMessage || simulatedMessage),
+      request: {
+        ticketId: `sim-ticket-${operation.id}-${order}`,
+        market: leg?.market || null,
+        selection: leg?.selection || null,
+        stake: Number(stake || 0),
+        price: Number(leg?.odd || 0),
+        eventId: operation?.eventId || null,
+        pinnacleId: operation?.pinnacleId || null,
+        endpoint: 'simulation://dryrun'
+      },
+      response: ok
+        ? {
+          endpoint: 'simulation://dryrun',
+          quoteEndpoint: 'simulation://quote',
+          preview: {
+            requestId: simRequestId,
+            stake: Number(stake || 0),
+            price: Number(leg?.odd || 0)
+          },
+          quotePreview: {
+            requestId: simRequestId,
+            providerStatus: 200
+          },
+          payload: {
+            simulated: true,
+            requestId: simRequestId
+          }
+        }
+        : null,
+      diagnostic: ok
+        ? null
+        : {
+          code: simulatedStatus === 'UNCERTAIN' ? 'SIMULATED_TIMEOUT' : 'SIMULATED_REJECTED',
+          statusCode: simulatedStatus === 'UNCERTAIN' ? 504 : 409,
+          providerStatus: simulatedStatus === 'UNCERTAIN' ? 504 : 409,
+          providerBody: {
+            simulated: true,
+            outcome: simulatedStatus,
+            requestId: simRequestId
+          },
+          requestId: simRequestId,
+          rawDiagnostic: {
+            simulated: true,
+            scenario: operation?.match || null
+          }
+        }
+    };
+  }
+
   const provider = normalizeProvider(leg?.provider);
   if (!provider) {
     return {
@@ -271,6 +428,8 @@ const createOperationFromOpportunity = (opportunity, index = 0) => {
       selection: leg?.selection || null,
       provider: normalizeProvider(leg?.provider),
       odd: safeNum(leg?.odd, null),
+      simulatedStatus: normalizeSimulatedLegStatus(leg?.simulatedStatus),
+      simulatedMessage: leg?.simulatedMessage || null,
       stake: toNonNegativeNumber(legStakeBySelection.get(String(leg?.selection || '').toLowerCase()), 0),
       status: 'PENDING',
       evidence: null
@@ -430,13 +589,61 @@ export const runLiveArbitrageSimulation = async ({
   bankroll = null,
   limit = SIM_DEFAULT_LIMIT,
   minRoiPercent = null,
-  minProfitAbs = null
+  minProfitAbs = null,
+  controlledScenarios = null,
+  useDefaultControlledScenarios = false
 } = {}) => {
   await initDB();
   await db.read();
   ensureSimulationStore();
 
   const safeLimit = toPositiveInt(limit, SIM_DEFAULT_LIMIT);
+  const controlledInput = Array.isArray(controlledScenarios) ? controlledScenarios : null;
+  const useDefaultControlled = isTruthy(useDefaultControlledScenarios);
+
+  if (useDefaultControlled || (controlledInput && controlledInput.length > 0)) {
+    const sourceRows = useDefaultControlled
+      ? buildDefaultControlledScenarios()
+      : controlledInput;
+
+    const selectedRows = sourceRows.slice(0, Math.max(1, safeLimit));
+    const operations = [];
+
+    for (let i = 0; i < selectedRows.length; i += 1) {
+      const operation = createOperationFromOpportunity(selectedRows[i], i);
+      const finalOperation = await runSingleOperationSimulation(operation);
+      operations.push(finalOperation);
+    }
+
+    const runSummary = await persistSimulationRun(operations, {
+      generatedAt: nowIso(),
+      sourceCount: sourceRows.length,
+      selectedCount: operations.length,
+      risk: {
+        mode: 'controlled-simulation'
+      }
+    });
+
+    return {
+      success: true,
+      mode: 'simulation-paper-dryrun-controlled',
+      generatedAt: nowIso(),
+      source: {
+        previewCount: 0,
+        selectedForSimulation: operations.length,
+        filters: {
+          type: 'CONTROLLED_SCENARIOS',
+          legs: 2
+        },
+        controlled: {
+          usedDefaults: useDefaultControlled,
+          providedScenarios: controlledInput?.length || 0
+        }
+      },
+      summary: runSummary,
+      operations
+    };
+  }
 
   const preview = await getLiveArbitragePreview(
     {

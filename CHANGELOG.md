@@ -7,6 +7,53 @@ Versión semántica conforme a [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v3.4.34] -- 2026-04-08 -- Sprint: Cierre Fase 2 + Habilitación Gate Fase 3
+
+> Rama: `master`
+
+### ✅ Added
+
+#### Corrida controlada de Fase 2 (auditable)
+- **`src/services/liveArbitrageSimulationService.js`**:
+  - Soporte de escenarios controlados por API para validar cierres operativos determinísticos.
+  - Nuevas rutas de simulación forzada por pata (`simulatedStatus`) para reproducir:
+    - `CONFIRMED` (fill total),
+    - `REJECTED` (fallo de segunda pata),
+    - `UNCERTAIN` (timeout incierto).
+- **`scripts/phase2-controlled-run.mjs`**:
+  - Nuevo script operativo para ejecutar corrida controlada y validar automáticamente criterios de salida de Fase 2.
+  - Genera evidencia en `data/phase2-controlled-run-*.json` con operaciones, transiciones, outcomes y diagnósticos por pata.
+
+### 🔄 Changed
+
+#### API de simulación live (Fase 2)
+- **`src/routes/opportunities.js`**:
+  - `POST /api/opportunities/arbitrage/live/simulation/run` ahora acepta:
+    - `useDefaultControlledScenarios`
+    - `controlledScenarios`
+
+#### Estado oficial de fases (0 -> 3)
+- **`PROJECT_BLUEPRINT.md`**:
+  - Fase 2 actualizada a **CERRADA**.
+  - Fase 3 actualizada a **HABILITADA PARA INICIO** (canary real controlado).
+- **`.github/copilot-instructions.md`**:
+  - Gate operativo actualizado con Fase 2 cerrada y reglas obligatorias de Fase 3 canary.
+
+#### Operación y trazabilidad
+- **`package.json`**:
+  - Nuevo script: `phase2:controlled`.
+- **`retoques.md`**:
+  - Registro de corrida controlada completada con evidencia auditable y criterios de salida cumplidos.
+
+### 🧪 Validated
+
+- Corrida controlada ejecutada satisfactoriamente:
+  - `npm run phase2:controlled`
+  - Resultado: `total=3`, `confirmed=1`, `rejected=1`, `uncertain=1`, `closed=3`.
+- Criterio de salida Fase 2 validado:
+  - `100%` de operaciones con outcome final explícito.
+- Gate operativo habilitado para iniciar Fase 3 canary real controlado.
+
 ## [v3.4.33] -- 2026-04-08 -- Sprint: Cierre Fase 0/1 + Arranque Fase 2 Simulación Dual
 
 > Rama: `master`

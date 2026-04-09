@@ -36,6 +36,7 @@
     "token:booky:dorado:wait-close": "node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=doradobet",
     "health:latency": "node scripts/health-latency.js",
     "phase1:soak": "node scripts/phase1-live-arbitrage-soak.mjs",
+    "phase2:controlled": "node scripts/phase2-controlled-run.mjs",
     "ingest:pinnacle:force": "node scripts/ingest-pinnacle.js --force",
     "ingest:pinnacle:safe": "node scripts/ingest-pinnacle.js --force --no-incremental-flush",
     "cleanup:booky:orphans": "node scripts/cleanup-booky-orphans.js",
