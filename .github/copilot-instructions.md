@@ -159,7 +159,8 @@ Cuando se procese `placeWidget` en `bookySemiAutoService`:
 
 1.  **FASE 0 (CERRADA):** baseline 120m ejecutado con top causas de descarte consolidadas (`unlinked`, `staleAltenar`, `noSurebetEdge`, `sameProvider`).
 2.  **FASE 1 (CERRADA):** preview live + diagnostics implementados y validados; hardening aplicado para lectura JSON parcial (feed local + DB read retry).
-3.  **FASE 2 (INICIADA):** simulacion operacional paper + dry-run dual habilitada por API, con maquina de estados `OPEN -> PARTIAL -> HEDGED -> CLOSED` y outcome obligatorio `CONFIRMED`/`REJECTED`/`UNCERTAIN`.
+3.  **FASE 2 (CERRADA):** simulacion operacional paper + dry-run dual validada con corrida controlada auditada (3 escenarios) y outcome obligatorio `CONFIRMED`/`REJECTED`/`UNCERTAIN` en `100%` de operaciones.
+4.  **FASE 3 (HABILITADA PARA INICIO):** canary real controlado autorizado, con baja exposicion, ventana corta y rollback inmediato ante degradacion.
 
 ### 13.1 Reglas obligatorias para Fase 2
 
@@ -167,3 +168,10 @@ Cuando se procese `placeWidget` en `bookySemiAutoService`:
 2.  **Evidencia por pata:** registrar siempre request/response/status/requestId/providerBody cuando aplique.
 3.  **Sin reintento ciego:** si una pata queda incierta, cerrar como `UNCERTAIN` y exigir reconciliación antes de cualquier paso real.
 4.  **Cross-provider:** mantener validación cruzada entre providers y no degradar a pseudo-arbitraje mono-provider.
+
+### 13.2 Reglas obligatorias para Fase 3 (Canary Real)
+
+1.  **Ventana acotada:** ejecutar canary en sesiones de `30-60m` con limites bajos de operaciones/hora.
+2.  **Exposicion conservadora:** usar perfil de riesgo live conservador y sin escalar stake durante la sesion.
+3.  **Rollback por incertidumbre:** ante aumento de `UNCERTAIN`, volver a dry-run y reconciliar antes de continuar.
+4.  **Sin reintento ciego:** cada intento real debe cerrar en `CONFIRMED`, `REJECTED` o `UNCERTAIN` con evidencia completa.

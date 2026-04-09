@@ -20,7 +20,7 @@
 4. Hardening aplicado: lectura resiliente del feed local Pinnacle y retry defensivo en lectura de DB para mitigar JSON parcial transitorio.
 5. Validación post-hardening: soak 30 minutos con `29/29` ciclos OK, `0` fallos runtime, `0` excepciones.
 
-### Fase 2 - Simulación operativa paper + dry-run dual (INICIADA)
+### Fase 2 - Simulación operativa paper + dry-run dual (CERRADA)
 1. Orquestador inicial implementado: `src/services/liveArbitrageSimulationService.js`.
 2. Máquina de estados habilitada: `OPEN -> PARTIAL -> HEDGED -> CLOSED`.
 3. Outcome obligatorio por operación: `CONFIRMED`, `REJECTED` o `UNCERTAIN`.
@@ -29,6 +29,16 @@
   - `GET /api/opportunities/arbitrage/live/simulation/history`
   - `GET /api/opportunities/arbitrage/live/simulation/summary`
 5. Evidencia por pata registrada en simulación: request/response/status/requestId/providerBody cuando aplica.
+6. Corrida controlada auditada completada con 3 escenarios de salida:
+  - `fill total` -> `CONFIRMED`
+  - `fallo de segunda pata` -> `REJECTED`
+  - `timeout incierto` -> `UNCERTAIN`
+7. Criterio de salida validado: `100%` de operaciones con outcome final explícito (`closed=3/3`).
+
+### Fase 3 - Canary real controlado (HABILITADA PARA INICIO)
+1. Gate de entrada aprobado tras cierre de Fase 2 con evidencia auditable.
+2. Alcance inicial: ventana corta (30-60 minutos), baja exposición y ligas de alta liquidez.
+3. Mantener guardas operativas estrictas: no reintento ciego, reconciliación previa ante `UNCERTAIN`, y validación cross-provider.
 
 ---
 

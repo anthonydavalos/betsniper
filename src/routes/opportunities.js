@@ -550,12 +550,16 @@ router.post('/arbitrage/live/simulation/run', async (req, res) => {
     const limitRaw = Number(req.body?.limit);
     const minRoiPercentRaw = Number(req.body?.minRoiPercent);
     const minProfitAbsRaw = Number(req.body?.minProfitAbs);
+    const controlledScenarios = Array.isArray(req.body?.controlledScenarios) ? req.body.controlledScenarios : null;
+    const useDefaultControlledScenarios = ['1', 'true', 'yes', 'on'].includes(String(req.body?.useDefaultControlledScenarios || '').trim().toLowerCase());
 
     const payload = await runLiveArbitrageSimulation({
       bankroll: Number.isFinite(bankrollRaw) ? bankrollRaw : null,
       limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
       minRoiPercent: Number.isFinite(minRoiPercentRaw) ? minRoiPercentRaw : null,
-      minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : null
+      minProfitAbs: Number.isFinite(minProfitAbsRaw) ? minProfitAbsRaw : null,
+      controlledScenarios,
+      useDefaultControlledScenarios
     });
 
     res.json(payload);

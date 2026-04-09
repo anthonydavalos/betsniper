@@ -1,5 +1,19 @@
 # Registro de Retoques y Correcciones
 
+## [2026-04-08] Corrida controlada Fase 2 completada (evidencia auditable)
+
+- **Ejecucion controlada realizada:** `npm run phase2:controlled`.
+- **Resultado de validacion:** `success=true`, `runStatus=200`, `summaryStatus=200`.
+- **Criterios de salida Fase 2 (cumplidos en corrida controlada):**
+  - `fill total` -> `CONFIRMED`.
+  - `fallo de segunda pata` -> `REJECTED`.
+  - `timeout incierto` -> `UNCERTAIN`.
+  - `100% outcome explicito` -> `closed=3/3`.
+- **Evidencia generada en JSON:** `data/phase2-controlled-run-2026-04-08T23-49-33-637Z.json`.
+- **Refuerzo tecnico aplicado para operar la corrida:**
+  - Soporte de escenarios controlados en `POST /api/opportunities/arbitrage/live/simulation/run`.
+  - Modo controlado con defaults (`useDefaultControlledScenarios=true`) y evidencia por pata conservando `request/response/diagnostic`.
+
 ## [2026-04-08] Fase 2 iniciada: Simulacion Operativa (Paper + Dry-Run dual)
 
 - **Orquestador inicial implementado:** `src/services/liveArbitrageSimulationService.js`.
