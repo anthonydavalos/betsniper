@@ -74,6 +74,7 @@ const ACITY_SOCKET_RECONNECT_MAX_MS = parsePositiveIntOr(process.env.ACITY_SOCKE
 const ACITY_SOCKET_EVENT_MAX_BUFFER = parsePositiveIntOr(process.env.ACITY_SOCKET_EVENT_MAX_BUFFER, 200);
 const ACITY_SOCKET_DIRTY_EVENT_TTL_MS = parsePositiveIntOr(process.env.ACITY_SOCKET_DIRTY_EVENT_TTL_MS, 90000);
 const ACITY_SOCKET_REPORT_PATH = path.resolve('data', 'booky', 'acity-live-socket-analysis.latest.json');
+const ACITY_SOCKET_REPORT_CACHE_MAX_AGE_MS = parsePositiveIntOr(process.env.ACITY_SOCKET_REPORT_CACHE_MAX_AGE_MS, 2000);
 const ACITY_HAYWIRE_SUBSCRIBE_ENABLED = parseBooleanFromEnv(process.env.ACITY_HAYWIRE_SUBSCRIBE_ENABLED, true);
 const ACITY_HAYWIRE_TOPICS_EVENT = String(process.env.ACITY_HAYWIRE_TOPICS_EVENT || 'haywire/topics').trim();
 const ACITY_HAYWIRE_SPORT_ID = parsePositiveIntOr(process.env.ACITY_HAYWIRE_SPORT_ID || process.env.ALTENAR_SPORT_ID, 66);
@@ -115,6 +116,64 @@ const ACITY_HAYWIRE_MQTT_API_KEY_ENV = String(
 ).trim();
 const ACITY_HAYWIRE_MQTT_MAX_ATTEMPTS = parsePositiveIntOr(process.env.ACITY_HAYWIRE_MQTT_MAX_ATTEMPTS, 48);
 
+const latestSocketReportCache = {
+  loadedAtMs: 0,
+  mtimeMs: 0,
+  exists: false,
+  json: null
+};
+
+function parseJsonSafe(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+const readLatestSocketReportCached = () => {
+  const nowMs = Date.now();
+  const cacheAgeMs = nowMs - Number(latestSocketReportCache.loadedAtMs || 0);
+  if (latestSocketReportCache.loadedAtMs > 0 && cacheAgeMs <= ACITY_SOCKET_REPORT_CACHE_MAX_AGE_MS) {
+    return latestSocketReportCache.json;
+  }
+
+  try {
+    if (!fs.existsSync(ACITY_SOCKET_REPORT_PATH)) {
+      latestSocketReportCache.loadedAtMs = nowMs;
+      latestSocketReportCache.exists = false;
+      latestSocketReportCache.json = null;
+      latestSocketReportCache.mtimeMs = 0;
+      return null;
+    }
+
+    const stat = fs.statSync(ACITY_SOCKET_REPORT_PATH);
+    const mtimeMs = Number(stat?.mtimeMs || 0);
+
+    if (
+      latestSocketReportCache.exists &&
+      latestSocketReportCache.json &&
+      latestSocketReportCache.mtimeMs === mtimeMs
+    ) {
+      latestSocketReportCache.loadedAtMs = nowMs;
+      return latestSocketReportCache.json;
+    }
+
+    const raw = fs.readFileSync(ACITY_SOCKET_REPORT_PATH, 'utf8');
+    const parsed = parseJsonSafe(raw);
+
+    latestSocketReportCache.loadedAtMs = nowMs;
+    latestSocketReportCache.exists = true;
+    latestSocketReportCache.mtimeMs = mtimeMs;
+    latestSocketReportCache.json = parsed;
+
+    return parsed;
+  } catch {
+    latestSocketReportCache.loadedAtMs = nowMs;
+    return latestSocketReportCache.json;
+  }
+};
+
 const extractUrlsFromText = (value = '') => {
   const out = [];
   const text = String(value || '');
@@ -131,9 +190,8 @@ const extractUrlsFromText = (value = '') => {
 
 const getRuntimeHostsFromLatestReport = () => {
   try {
-    if (!fs.existsSync(ACITY_SOCKET_REPORT_PATH)) return [];
-    const raw = fs.readFileSync(ACITY_SOCKET_REPORT_PATH, 'utf8');
-    const json = parseJsonSafe(raw);
+    const json = readLatestSocketReportCached();
+    if (!json) return [];
     const hosts = new Set();
 
     const requests = Array.isArray(json?.requests) ? json.requests : [];
@@ -172,9 +230,8 @@ const getRuntimeHostsFromLatestReport = () => {
 
 const getWsapiSocketsEnabledFromLatestReport = () => {
   try {
-    if (!fs.existsSync(ACITY_SOCKET_REPORT_PATH)) return null;
-    const raw = fs.readFileSync(ACITY_SOCKET_REPORT_PATH, 'utf8');
-    const json = parseJsonSafe(raw);
+    const json = readLatestSocketReportCached();
+    if (!json) return null;
     const requests = Array.isArray(json?.requests) ? json.requests : [];
 
     for (const row of requests) {
@@ -315,14 +372,6 @@ const pushRecentEvent = (row = {}) => {
   }
 };
 
-const parseJsonSafe = (raw) => {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-};
-
 const extractSessionFromLoginPacket = (payload = '') => {
   const match = String(payload || '').match(/"session"\s*:\s*"([^"]+)"/i);
   return match ? String(match[1] || '').trim() : '';
@@ -330,9 +379,8 @@ const extractSessionFromLoginPacket = (payload = '') => {
 
 const getSessionFromLatestReport = () => {
   try {
-    if (!fs.existsSync(ACITY_SOCKET_REPORT_PATH)) return '';
-    const raw = fs.readFileSync(ACITY_SOCKET_REPORT_PATH, 'utf8');
-    const json = parseJsonSafe(raw);
+    const json = readLatestSocketReportCached();
+    if (!json) return '';
     const frames = Array.isArray(json?.websocket?.framesSample) ? json.websocket.framesSample : [];
 
     for (const frame of frames) {
@@ -362,9 +410,8 @@ const getHaywireApiKeyFromLatestReport = () => {
   if (ACITY_HAYWIRE_MQTT_API_KEY_ENV) return ACITY_HAYWIRE_MQTT_API_KEY_ENV;
 
   try {
-    if (!fs.existsSync(ACITY_SOCKET_REPORT_PATH)) return '';
-    const raw = fs.readFileSync(ACITY_SOCKET_REPORT_PATH, 'utf8');
-    const json = parseJsonSafe(raw);
+    const json = readLatestSocketReportCached();
+    if (!json) return '';
     const requests = Array.isArray(json?.requests) ? json.requests : [];
 
     for (const row of requests) {
@@ -382,9 +429,8 @@ const getHaywireApiKeyFromLatestReport = () => {
 
 const getAuthUserFromLatestReport = () => {
   try {
-    if (!fs.existsSync(ACITY_SOCKET_REPORT_PATH)) return '';
-    const raw = fs.readFileSync(ACITY_SOCKET_REPORT_PATH, 'utf8');
-    const json = parseJsonSafe(raw);
+    const json = readLatestSocketReportCached();
+    if (!json) return '';
     const requests = Array.isArray(json?.requests) ? json.requests : [];
 
     for (const row of requests) {

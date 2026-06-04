@@ -228,8 +228,16 @@ const arcadiaRequest = async (method, endpoint, { data, params } = {}) => {
   });
 
   if (response.status >= 400) {
+    const providerBody = response.data || null;
+    const providerTitle = String(providerBody?.title || '').trim();
+    const providerDetail = String(providerBody?.detail || '').trim();
+    const providerMessage = String(providerBody?.message || '').trim();
+    const providerHint = [providerTitle, providerDetail, providerMessage].filter(Boolean).join(' | ');
+
     throw createPinnacleError(
-      `Arcadia ${endpoint} devolvio HTTP ${response.status}.`,
+      providerHint
+        ? `Arcadia ${endpoint} devolvio HTTP ${response.status}: ${providerHint}`
+        : `Arcadia ${endpoint} devolvio HTTP ${response.status}.`,
       {
         code: 'PINNACLE_API_HTTP_ERROR',
         statusCode: response.status,
@@ -237,7 +245,7 @@ const arcadiaRequest = async (method, endpoint, { data, params } = {}) => {
           endpoint,
           method,
           providerStatus: response.status,
-          providerBody: response.data || null,
+          providerBody,
           requestedAt: nowIso()
         }
       }
@@ -717,6 +725,50 @@ const buildRealPlacementPayloadFromQuote = ({ quoteResponse, opportunity }) => {
     });
   }
 
+  const limits = Array.isArray(quoteResponse?.limits) ? quoteResponse.limits : [];
+  const getLimitAmountByType = (type = '') => {
+    const normalizedType = normalizeText(type);
+    const row = limits.find((entry) => normalizeText(entry?.type || '') === normalizedType);
+    const amount = Number(row?.amount);
+    return Number.isFinite(amount) ? Number(amount) : null;
+  };
+
+  const requestedStake = getStakeFromOpportunity(opportunity);
+  const minRiskStake = getLimitAmountByType('minRiskStake');
+  const maxRiskStake = getLimitAmountByType('maxRiskStake');
+
+  if (Number.isFinite(minRiskStake) && requestedStake < minRiskStake) {
+    throw createPinnacleError(
+      `Stake Arcadia por debajo del minimo permitido (${requestedStake.toFixed(2)} < ${Number(minRiskStake).toFixed(2)}).`,
+      {
+        code: 'PINNACLE_STAKE_BELOW_MIN',
+        statusCode: 409,
+        diagnostic: {
+          requestedStake,
+          minRiskStake,
+          maxRiskStake,
+          limits
+        }
+      }
+    );
+  }
+
+  if (Number.isFinite(maxRiskStake) && requestedStake > maxRiskStake) {
+    throw createPinnacleError(
+      `Stake Arcadia por encima del maximo permitido (${requestedStake.toFixed(2)} > ${Number(maxRiskStake).toFixed(2)}).`,
+      {
+        code: 'PINNACLE_STAKE_ABOVE_MAX',
+        statusCode: 409,
+        diagnostic: {
+          requestedStake,
+          minRiskStake,
+          maxRiskStake,
+          limits
+        }
+      }
+    );
+  }
+
   return {
     oddsFormat: 'decimal',
     requestId: randomUUID(),
@@ -729,7 +781,7 @@ const buildRealPlacementPayloadFromQuote = ({ quoteResponse, opportunity }) => {
       designation: firstSelection.designation,
       price: quotePriceDecimal
     }],
-    stake: getStakeFromOpportunity(opportunity),
+    stake: requestedStake,
     originTag: 'sl:bsd',
     acceptBetterPrice: true
   };
@@ -825,7 +877,7 @@ const runPinnacleQuoteabilityPreflightInternal = async (opportunity = {}) => {
     }
 
     const status = Number(error?.statusCode || 0);
-    if (status !== 400 && status !== 410) {
+    if (status !== 400 && status !== 404 && status !== 410) {
       return {
         quoteable: false,
         status: mapQuoteabilityStatusFromHttp(status),
@@ -990,7 +1042,7 @@ const prepareRealPlacementDraftInternal = async (ticketId) => {
 
     // Fallback robusto: refrescar marketKey/designation/price desde related/straight
     // y reintentar quote una sola vez con precio vigente.
-    if (status === 400 || status === 410) {
+    if (status === 400 || status === 404 || status === 410) {
       let refreshedSelection = null;
       try {
         refreshedSelection = await resolveArcadiaQuoteSelectionFromRelatedMarkets(
@@ -1032,7 +1084,7 @@ const prepareRealPlacementDraftInternal = async (ticketId) => {
         throw createPinnacleError(
           'Arcadia quote no pudo refrescarse desde related/straight. Refresca y reintenta.',
           {
-            code: status === 410 ? 'PINNACLE_QUOTE_GONE' : 'PINNACLE_QUOTE_BAD_REQUEST',
+            code: (status === 410 || status === 404) ? 'PINNACLE_QUOTE_GONE' : 'PINNACLE_QUOTE_BAD_REQUEST',
             statusCode: 409,
             diagnostic: {
               ticketId,
@@ -1079,9 +1131,9 @@ const prepareRealPlacementDraftInternal = async (ticketId) => {
             }
           );
         }
-        if (retryStatus === 410) {
+        if (retryStatus === 410 || retryStatus === 404) {
           throw createPinnacleError(
-            'Arcadia quote no disponible (HTTP 410): la seleccion/mercado ya no esta cotizable en este momento. Refresca y reintenta.',
+            `Arcadia quote no disponible (HTTP ${retryStatus}): la seleccion/mercado ya no esta cotizable en este momento. Refresca y reintenta.`,
             {
               code: 'PINNACLE_QUOTE_GONE',
               statusCode: 409,

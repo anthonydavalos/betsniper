@@ -1,5 +1,21 @@
 # Registro de Retoques y Correcciones
 
+## [2026-04-12] Cierre Fase 3 + Arranque Fase 4 (Escalado gradual y hardening)
+
+- **Gate Fase 3 cerrado:** corrida canary final de 30 minutos validada con `readyForPhase4=true` y persistencia estable de `arbitrageExecutionAudit`.
+- **Entregable inicial Fase 4 implementado:** dashboard operativo live por API para seguimiento de ejecucion y riesgo.
+- **Endpoint nuevo:** `GET /api/opportunities/arbitrage/live/operations-dashboard`.
+- **Cobertura del dashboard (ventana configurable):**
+  - estados y outcomes de operaciones (`OPEN/PARTIAL/HEDGED/CLOSED`, `CONFIRMED/REJECTED/UNCERTAIN`),
+  - latencia de ciclo por ejecucion y desglose por proveedor,
+  - codigos/razones de rechazo en `execution-audit`,
+  - slippage observado (odd solicitada vs odd aceptada) con agregados y top desvíos.
+- **Flags de rollout reflejadas en respuesta:**
+  - `LIVE_ARBITRAGE_ROLLOUT_TOTALS_ENABLED` (default `false`),
+  - `LIVE_ARBITRAGE_ROLLOUT_BTTS_ENABLED` (default `false`),
+  - `LIVE_ARBITRAGE_REQUIRE_CROSS_PROVIDER`.
+- **Siguiente incremento recomendado Fase 4:** habilitar rollout progresivo de mercados `totals` y `BTTS` detrás de flags + guardas de liquidez.
+
 ## [2026-04-08] Corrida controlada Fase 2 completada (evidencia auditable)
 
 - **Ejecucion controlada realizada:** `npm run phase2:controlled`.

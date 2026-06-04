@@ -118,6 +118,61 @@ const parseScoreValue = (value) => {
     return Math.floor(n);
 };
 
+const getLimitAmountByType = (limits = [], type = '') => {
+    const normalizedType = normalizeMarketText(type || '').trim();
+    if (!normalizedType || !Array.isArray(limits)) return null;
+
+    const row = limits.find((entry) => normalizeMarketText(entry?.type || '').trim() === normalizedType);
+    const amount = Number(row?.amount);
+    return Number.isFinite(amount) ? Number(amount) : null;
+};
+
+const parseMarketMaxRiskStake = (market = {}) => getLimitAmountByType(market?.limits || [], 'maxRiskStake');
+
+const isBttsMarket = (market = {}) => {
+    const type = normalizeMarketText(market?.type || '').trim();
+    const key = normalizeMarketText(market?.key || '').trim();
+
+    if (!type && !key) return false;
+
+    if (type === 'both_teams_to_score' || type === 'btts') return true;
+    if (type.includes('both') && type.includes('score')) return true;
+    if (key.includes(';0;b')) return true;
+
+    return false;
+};
+
+const parseBttsFromPrices = (prices = []) => {
+    if (!Array.isArray(prices) || prices.length === 0) return null;
+
+    const byDesignation = (wanted = []) => prices.find((row) => wanted.includes(normalizeMarketText(row?.designation || '').trim()));
+
+    const yesObj = byDesignation(['yes', 'si']) || prices.find((row) => {
+        const token = normalizeMarketText(row?.participant || row?.name || '').trim();
+        return token === 'yes' || token === 'si';
+    });
+    const noObj = byDesignation(['no']) || prices.find((row) => {
+        const token = normalizeMarketText(row?.participant || row?.name || '').trim();
+        return token === 'no';
+    });
+
+    if (!yesObj || !noObj) return null;
+
+    const yesRaw = Number(yesObj?.price);
+    const noRaw = Number(noObj?.price);
+    if (!Number.isFinite(yesRaw) || !Number.isFinite(noRaw)) return null;
+
+    const yes = Math.abs(yesRaw) > 20 ? americanToDecimal(yesRaw) : yesRaw;
+    const no = Math.abs(noRaw) > 20 ? americanToDecimal(noRaw) : noRaw;
+
+    if (!Number.isFinite(yes) || !Number.isFinite(no) || yes <= 1 || no <= 1) return null;
+
+    return {
+        yes: Number(yes.toFixed(3)),
+        no: Number(no.toFixed(3))
+    };
+};
+
 // HELPER: Calcular Double Chance desde 1x2 (para no depender de la API)
 const calculateDCFromMoneyline = (homeStr, drawStr, awayStr) => {
     // Input puede ser string o number
@@ -193,6 +248,7 @@ export const getAllPinnacleLiveOdds = async () => {
                 // Build Prices (Soporte Dual: Estructura Plana vs Anidada Legacy)
                 let moneyline = null;
                 let totals = [];
+                let btts = null;
                 
                 // CASO A: Estructura Plana (Authenticated API - pinnacleLight.js)
                 if (ev.markets && Array.isArray(ev.markets)) {
@@ -222,10 +278,22 @@ export const getAllPinnacleLiveOdds = async () => {
                              totals.push({
                                  line: overP.points || m.points,
                                  over: Number(valO.toFixed(3)),
-                                 under: Number(valU.toFixed(3))
+                                 under: Number(valU.toFixed(3)),
+                                 maxRiskStake: parseMarketMaxRiskStake(m)
                              });
                          }
                     });
+
+                    const bttsMarket = ev.markets.find((m) => isBttsMarket(m) && m.period === 0 && m.status === 'open');
+                    if (bttsMarket) {
+                        const parsedBtts = parseBttsFromPrices(bttsMarket.prices || []);
+                        if (parsedBtts) {
+                            btts = {
+                                ...parsedBtts,
+                                maxRiskStake: parseMarketMaxRiskStake(bttsMarket)
+                            };
+                        }
+                    }
 
                 } else if (ev.prices) { 
                     // CASO B: Estructura Legacy (Mock / Version anterior)
@@ -313,7 +381,8 @@ export const getAllPinnacleLiveOdds = async () => {
                     isLive: true,
                     moneyline: moneyline,
                     doubleChance: moneyline ? calculateDCFromMoneyline(moneyline.home, moneyline.draw || 100, moneyline.away) : null,
-                    totals: totals // Usamos los totales extraídos
+                    totals: totals, // Usamos los totales extraídos
+                    btts
                 });
             }
             return oddsMap;
@@ -392,7 +461,8 @@ export const getAllPinnacleLiveOdds = async () => {
                     ...metaMap.get(market.matchupId), // Inyectar metadata
                     moneyline: null,
                     doubleChance: null, 
-                    totals: []
+                    totals: [],
+                    btts: null
                 });
             }
 
@@ -440,8 +510,20 @@ export const getAllPinnacleLiveOdds = async () => {
                      parsed.totals.push({
                          line: Number(line),
                          over: Number(americanToDecimal(overObj.price).toFixed(3)),
-                         under: Number(americanToDecimal(underObj.price).toFixed(3))
+                         under: Number(americanToDecimal(underObj.price).toFixed(3)),
+                         maxRiskStake: parseMarketMaxRiskStake(market)
                      });
+                }
+            }
+
+            // C) BTTS
+            if (market.period === 0 && isBttsMarket(market)) {
+                const parsedBtts = parseBttsFromPrices(market.prices || []);
+                if (parsedBtts) {
+                    parsed.btts = {
+                        ...parsedBtts,
+                        maxRiskStake: parseMarketMaxRiskStake(market)
+                    };
                 }
             }
         }
@@ -722,7 +804,8 @@ export const getPinnacleLiveOdds = async (pinnacleMatchId) => {
                     return {
                         line: Number(line),
                         over: Number(americanToDecimal(overP.price).toFixed(3)),
-                        under: Number(americanToDecimal(underP.price).toFixed(3))
+                        under: Number(americanToDecimal(underP.price).toFixed(3)),
+                        maxRiskStake: parseMarketMaxRiskStake(m)
                     };
                 }
                 return null;
@@ -733,10 +816,23 @@ export const getPinnacleLiveOdds = async (pinnacleMatchId) => {
             totals.sort((a,b) => a.line - b.line);
         }
 
+        // ----------------------------------------------------------------
+        // 3. BTTS (Both Teams To Score)
+        // ----------------------------------------------------------------
+        const bttsMarket = data.find((m) => m.period === 0 && m.status === 'open' && isBttsMarket(m));
+        const parsedBtts = bttsMarket ? parseBttsFromPrices(bttsMarket.prices || []) : null;
+        const btts = parsedBtts
+            ? {
+                ...parsedBtts,
+                maxRiskStake: parseMarketMaxRiskStake(bttsMarket)
+            }
+            : null;
+
         return {
             moneyline,
             doubleChance,
             totals,
+            btts,
             timestamp: Date.now()
         };
 

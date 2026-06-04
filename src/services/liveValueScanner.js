@@ -863,6 +863,34 @@ const checkAndAddOpp = (opsArray, event, pinMatch, marketName, selection, altOdd
  */
 export const getLiveOddsComparison = async () => {
     await initDB();
+    const MONITOR_MAX_ACTIVE_EVENTS = Math.max(10, parsePositiveIntOr(process.env.MONITOR_MAX_ACTIVE_EVENTS, 35));
+    const MONITOR_DETAILS_MAX_EVENTS = parsePositiveIntOr(process.env.MONITOR_DETAILS_MAX_EVENTS, 12);
+    const MONITOR_DETAILS_TIMEOUT_MS = Math.max(150, parsePositiveIntOr(process.env.MONITOR_DETAILS_TIMEOUT_MS, 700));
+    const MONITOR_TOTAL_BUDGET_MS = Math.max(
+        MONITOR_DETAILS_TIMEOUT_MS,
+        parsePositiveIntOr(process.env.MONITOR_TOTAL_BUDGET_MS, 5500)
+    );
+
+    const withTimeout = async (promise, timeoutMs) => {
+        let timer = null;
+        try {
+            return await Promise.race([
+                promise,
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => {
+                        const error = new Error(`MONITOR_EVENT_TIMEOUT_${timeoutMs}MS`);
+                        error.code = 'MONITOR_EVENT_TIMEOUT';
+                        reject(error);
+                    }, timeoutMs);
+                })
+            ]);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    };
+
+    const scanStartedAtMs = Date.now();
+    let detailsFetchCount = 0;
     const pinnacleDb = db.data.upcomingMatches || [];
     const altenarPrematchDb = db.data.altenarUpcoming || []; // [NEW] Load Altenar Prematch
     
@@ -872,7 +900,11 @@ export const getLiveOddsComparison = async () => {
     });
 
     const liveEvents = await getLiveOverview();
-    const activeEvents = liveEvents.filter(e => e.liveTime !== 'Final');
+    const activeEvents = liveEvents
+        .filter(e => e.liveTime !== 'Final')
+        // Priorizamos eventos linkeados para mantener cobertura útil bajo alta carga.
+        .sort((a, b) => Number(linkedMatches.has(String(b.id))) - Number(linkedMatches.has(String(a.id))))
+        .slice(0, MONITOR_MAX_ACTIVE_EVENTS);
 
     const { getAllPinnacleLiveOdds } = await import('./pinnacleService.js');
     const globalPinnacleOdds = await getAllPinnacleLiveOdds();
@@ -948,12 +980,18 @@ export const getLiveOddsComparison = async () => {
         }
 
 
-        // 2. Fetch Details (SIEMPRE intentar extraer Altenar para diagnóstico)
+        // 2. Fetch Details con presupuesto de tiempo y tope de eventos (evita freezing del Monitor).
         let details = null;
-        try {
-            details = await getMonitorEventDetailsCached(event.id);
-        } catch (e) {
-             // console.error(`Err detail ${event.id}`); 
+        const elapsedMs = Date.now() - scanStartedAtMs;
+        const hasRemainingBudget = elapsedMs < MONITOR_TOTAL_BUDGET_MS;
+        const canFetchDetails = detailsFetchCount < MONITOR_DETAILS_MAX_EVENTS && hasRemainingBudget;
+        if (canFetchDetails) {
+            detailsFetchCount += 1;
+            try {
+                details = await withTimeout(getMonitorEventDetailsCached(event.id), MONITOR_DETAILS_TIMEOUT_MS);
+            } catch (e) {
+                details = null;
+            }
         }
 
         // [FIX] Actualizar visualización (Tiempo y Score) con lógica de "Reloj Ganador"

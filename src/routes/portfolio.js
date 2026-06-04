@@ -4,6 +4,18 @@ import { refreshOpportunity } from '../services/oddsService.js';
 
 const router = express.Router();
 
+const isArbitrageLegOpportunity = (opportunity = {}) => {
+  const source = String(opportunity?.source || '').trim().toUpperCase();
+  const type = String(opportunity?.type || opportunity?.strategy || '').trim().toUpperCase();
+  const arbitrageType = String(opportunity?.arbitrageType || '').trim().toUpperCase();
+
+  if (source === 'ARBITRAGE_PREVIEW_LEG') return true;
+  if (type.startsWith('SUREBET_')) return true;
+  if (arbitrageType.startsWith('SUREBET_')) return true;
+  if (arbitrageType.includes('ARBITRAGE')) return true;
+  return false;
+};
+
 // POST /api/portfolio/place-bet
 // Colocar una apuesta manualmente desde el UI
 router.post('/place-bet', async (req, res) => {
@@ -31,7 +43,7 @@ router.post('/place-bet', async (req, res) => {
         }
 
         // 2. Verificar si sigue siendo EV+ (Opcional: o simplemente informar al usuario)
-        if (freshOpportunity.ev <= 0) {
+        if (!isArbitrageLegOpportunity(freshOpportunity) && freshOpportunity.ev <= 0) {
             return res.json({ success: false, message: `El valor desapareció. Nueva cuota: ${freshOpportunity.price} (EV: ${freshOpportunity.ev}%)` });
         }
 

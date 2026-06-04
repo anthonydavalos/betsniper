@@ -20,7 +20,7 @@ const LEAGUE_MISS_LOG_THROTTLE_MS = 5 * 60 * 1000;
 const BOOKY_SETTLED_PROVIDER_STATUSES = new Set([1, 2, 4, 8, 18]);
 const DEFAULT_ORPHAN_ACTIVE_GRACE_MS = 2 * 60 * 1000;
 const DEFAULT_ORPHAN_ACTIVE_HARD_MAX_MS = 20 * 60 * 1000;
-const TOKEN_RENEW_COOLDOWN_MS = 15000;
+const DEFAULT_SYNC_TOKEN_RENEW_COOLDOWN_MS = 120000;
 
 const memoryBalanceCacheByProfile = new Map();
 const memoryHistoryCacheByProfile = new Map();
@@ -68,6 +68,17 @@ const getRuntimeEnvValue = (key, fallback = '') => {
     return String(processValue).trim();
   }
   return fallback;
+};
+
+const getSyncTokenRenewCooldownMs = () => {
+  const raw = Number(
+    getRuntimeEnvValue(
+      'BOOKY_SYNC_TOKEN_RENEW_COOLDOWN_MS',
+      getRuntimeEnvValue('BOOKY_TOKEN_RENEW_COOLDOWN_MS', String(DEFAULT_SYNC_TOKEN_RENEW_COOLDOWN_MS))
+    )
+  );
+  if (!Number.isFinite(raw)) return DEFAULT_SYNC_TOKEN_RENEW_COOLDOWN_MS;
+  return Math.max(15000, Math.floor(raw));
 };
 
 const getConfiguredCashflowFromDate = () => {
@@ -380,29 +391,63 @@ const isSyncTokenAutoRefreshEnabled = () => {
   return getRuntimeEnvValue('BOOKY_AUTO_TOKEN_REFRESH_SYNC_ENABLED', 'false').toLowerCase() === 'true';
 };
 
+const isSyncPassiveAutoRefreshEnabled = () => {
+  return getRuntimeEnvValue('BOOKY_SYNC_PASSIVE_AUTO_RENEW_ENABLED', 'false').toLowerCase() === 'true';
+};
+
 const getSyncTokenMinRemainingMinutes = () => {
-  const raw = Number(
+  const rawSync = Number(
     getRuntimeEnvValue(
       'BOOKY_SYNC_TOKEN_MIN_REMAINING_MINUTES',
       getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', '2')
     )
   );
+  const rawExec = Number(
+    getRuntimeEnvValue(
+      'BOOKY_EXEC_TOKEN_MIN_REMAINING_MINUTES',
+      getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', '2')
+    )
+  );
+  const rawHealth = Number(getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', '2'));
+
+  const syncMin = Number.isFinite(rawSync) && rawSync >= 0 ? rawSync : 2;
+  const execMin = Number.isFinite(rawExec) && rawExec >= 0 ? rawExec : 2;
+  const healthMin = Number.isFinite(rawHealth) && rawHealth >= 0 ? rawHealth : 2;
+
+  // En canary evitamos ventanas inconsistentes: sync nunca por debajo de health/exec.
+  return Math.max(syncMin, execMin, healthMin);
+};
+
+const getSyncTokenRenewLeadMinutes = () => {
+  const raw = Number(getRuntimeEnvValue('BOOKY_SYNC_TOKEN_RENEW_LEAD_MINUTES', '2'));
   return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+};
+
+const getSyncTokenAutoRenewMaxThresholdMinutes = () => {
+  const fallback = Number(getRuntimeEnvValue('BOOKY_TOKEN_AUTO_RENEW_MAX_THRESHOLD_MINUTES', '12'));
+  const raw = Number(
+    getRuntimeEnvValue(
+      'BOOKY_SYNC_TOKEN_AUTO_RENEW_MAX_THRESHOLD_MINUTES',
+      String(Number.isFinite(fallback) && fallback > 0 ? fallback : 12)
+    )
+  );
+  return Number.isFinite(raw) && raw > 0 ? raw : 12;
 };
 
 const triggerSyncTokenRenewal = () => {
   const now = Date.now();
   const elapsed = now - lastSyncTokenRenewLaunchAt;
+  const cooldownMs = getSyncTokenRenewCooldownMs();
   const profile = getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase();
   const renewalCommand = `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${profile}`;
 
-  if (lastSyncTokenRenewLaunchAt > 0 && elapsed < TOKEN_RENEW_COOLDOWN_MS) {
+  if (lastSyncTokenRenewLaunchAt > 0 && elapsed < cooldownMs) {
     return {
       triggered: false,
       busy: true,
       profile,
       renewalCommand,
-      retryAfterSeconds: Math.max(1, Math.ceil((TOKEN_RENEW_COOLDOWN_MS - elapsed) / 1000))
+      retryAfterSeconds: Math.max(1, Math.ceil((cooldownMs - elapsed) / 1000))
     };
   }
 
@@ -442,19 +487,33 @@ const triggerSyncTokenRenewal = () => {
 
 const maybeAutoRefreshSyncToken = ({ reason = 'unknown' } = {}) => {
   const enabled = isSyncTokenAutoRefreshEnabled();
+  const passiveAutoRefreshEnabled = isSyncPassiveAutoRefreshEnabled();
+  const allowInteractiveRenewForReason = reason === 'provider-401-403'
+    || (passiveAutoRefreshEnabled && reason === 'missing-token');
   const health = getSyncTokenHealth();
   const minRemaining = getSyncTokenMinRemainingMinutes();
-  const lowRemaining = Number.isFinite(health.remainingMinutes) && health.remainingMinutes < minRemaining;
+  const renewLeadMinutes = getSyncTokenRenewLeadMinutes();
+  const renewThresholdRawMinutes = minRemaining + renewLeadMinutes;
+  const renewThresholdMinutes = Math.max(
+    minRemaining,
+    Math.min(renewThresholdRawMinutes, getSyncTokenAutoRenewMaxThresholdMinutes())
+  );
+  const lowRemaining = Number.isFinite(health.remainingMinutes) && health.remainingMinutes < renewThresholdMinutes;
   const mustRenew = !health.exists || !health.jwtValid || health.expired || lowRemaining || reason === 'provider-401-403';
 
-  if (!enabled || !mustRenew) {
+  if (!enabled || !mustRenew || !allowInteractiveRenewForReason) {
     return {
       enabled,
+      passiveAutoRefreshEnabled,
       mustRenew,
       triggered: false,
       health,
       reason,
+      allowInteractiveRenewForReason,
       minRemaining,
+      renewLeadMinutes,
+      renewThresholdRawMinutes,
+      renewThresholdMinutes,
       renewalCommand: null
     };
   }
@@ -462,12 +521,17 @@ const maybeAutoRefreshSyncToken = ({ reason = 'unknown' } = {}) => {
   const renewal = triggerSyncTokenRenewal();
   return {
     enabled,
+    passiveAutoRefreshEnabled,
     mustRenew,
     triggered: renewal.triggered,
     busy: renewal.busy,
     health,
     reason,
+    allowInteractiveRenewForReason,
     minRemaining,
+    renewLeadMinutes,
+    renewThresholdRawMinutes,
+    renewThresholdMinutes,
     renewalCommand: renewal.renewalCommand,
     retryAfterSeconds: renewal.retryAfterSeconds
   };
@@ -1859,6 +1923,9 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
     };
   }
 
+  // Renovación proactiva en preflight para evitar caer por debajo del mínimo durante canary.
+  const preflightRenewal = maybeAutoRefreshSyncToken({ reason: 'preflight' });
+
   try {
     const remote = await requestRemoteBetHistory(auth, limit, key, { fetchAll });
     const dedup = new Map();
@@ -1910,6 +1977,9 @@ export const syncRemoteBookyHistory = async ({ forceRefresh = false, limit = 60,
       error: null,
       openBets
     };
+    if (preflightRenewal?.triggered || preflightRenewal?.busy) {
+      normalized.tokenRenewal = preflightRenewal;
+    }
 
     const reconciledLocalCount = reconcileLocalTicketHistoryFromRemote(sorted);
     if (reconciledLocalCount > 0) normalized.reconciledLocalCount = reconciledLocalCount;
@@ -2050,7 +2120,7 @@ const getCachedDbBalance = (profileKey = null) => {
   };
 };
 
-export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = null } = {}) => {
+export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = null, useCachedOnly = false } = {}) => {
   await initDB();
   await db.read();
   ensureBookyStore();
@@ -2067,6 +2137,26 @@ export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = nul
   }
 
   const cached = getCachedDbBalance(key);
+
+  if (useCachedOnly) {
+    if (memoryBalanceCache?.value) {
+      return { ...memoryBalanceCache.value, stale: true, source: memoryBalanceCache.value.source || 'cache-only-memory' };
+    }
+
+    if (cached) {
+      return { ...cached, stale: true, source: cached.source || 'cache-only-db' };
+    }
+
+    return {
+      amount: null,
+      currency: DEFAULT_BOOKY_CURRENCY,
+      updatedAt: null,
+      source: 'cache-only-empty',
+      stale: true,
+      error: 'No hay balance cacheado disponible para modo cache-only.'
+    };
+  }
+
   if (!forceRefresh && cached?.updatedAt) {
     const cachedTs = new Date(cached.updatedAt).getTime();
     if (Number.isFinite(cachedTs) && (now - cachedTs) < refreshMs) {
@@ -2097,6 +2187,9 @@ export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = nul
     };
   }
 
+  // Renovación proactiva en preflight para mantener margen por encima del mínimo de sync.
+  const preflightRenewal = maybeAutoRefreshSyncToken({ reason: 'preflight' });
+
   try {
     const provider = await requestProviderBalance(auth);
     const normalized = {
@@ -2108,6 +2201,9 @@ export const fetchBookyBalance = async ({ forceRefresh = false, profileKey = nul
       endpoint: provider.endpoint,
       method: provider.method
     };
+    if (preflightRenewal?.triggered || preflightRenewal?.busy) {
+      normalized.tokenRenewal = preflightRenewal;
+    }
 
     const profileStore = getProfileStore(key, true);
     profileStore.account = {
@@ -2632,10 +2728,10 @@ export const getBookyPnlBaseSnapshot = async ({ profileKey = null } = {}) => {
   };
 };
 
-export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLimit = 60, cleanupOld = false, retentionDays = null } = {}) => {
+export const getBookyAccountSnapshot = async ({ forceRefresh = false, historyLimit = 60, cleanupOld = false, retentionDays = null, useCachedOnly = false } = {}) => {
   const ctx = getActiveProfileContext();
-  const balance = await fetchBookyBalance({ forceRefresh, profileKey: ctx.key });
-  if (forceRefresh) {
+  const balance = await fetchBookyBalance({ forceRefresh, profileKey: ctx.key, useCachedOnly });
+  if (forceRefresh && !useCachedOnly) {
     await syncRemoteBookyHistory({ forceRefresh: true, limit: historyLimit, profileKey: ctx.key });
     await getBookyHistory(historyLimit);
   }

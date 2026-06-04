@@ -13,6 +13,11 @@ const envFilePath = path.join(projectRoot, '.env');
 const ENV_RELOAD_MIN_INTERVAL_MS = 1500;
 let lastEnvReloadAt = 0;
 let lastEnvMtimeMs = 0;
+const HOT_RELOAD_ENV_KEYS = [
+  'ALTENAR_WIDGET_AUTH_TOKEN',
+  'ALTENAR_BOOKY_AUTH_TOKEN',
+  'ALTENAR_BOOKY_ACCOUNT_AUTH_TOKEN'
+];
 
 const maybeReloadEnvFromDisk = ({ force = false } = {}) => {
   try {
@@ -24,8 +29,14 @@ const maybeReloadEnvFromDisk = ({ force = false } = {}) => {
     const mtimeMs = Number(stat?.mtimeMs || 0);
     if (!force && mtimeMs <= lastEnvMtimeMs) return false;
 
-    // Recarga incremental para reflejar tokens renovados por procesos externos.
-    dotenv.config({ path: envFilePath, override: true });
+    // Recarga incremental SOLO de tokens para no pisar flags runtime (DISABLE_*, etc).
+    const raw = fs.readFileSync(envFilePath, 'utf8');
+    const parsed = dotenv.parse(raw || '');
+    for (const key of HOT_RELOAD_ENV_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+        process.env[key] = String(parsed[key] || '');
+      }
+    }
     lastEnvMtimeMs = mtimeMs;
     return true;
   } catch (_) {

@@ -24,7 +24,7 @@ const run = async () => {
     const active = db.data.portfolio.activeBets || [];
     const balance = db.data.portfolio.balance;
 
-    console.log(`\n💰 ESTADO ACTUAL DE LA BASE DE DATOS (db.json):`);
+    console.log(`\n💰 ESTADO ACTUAL DE LA BASE DE DATOS SPLIT (db-core.json + db-diagnostics.json):`);
     console.log(`   - Balance: $${balance.toFixed(2)}`);
     console.log(`   - Apuestas Activas: ${active.length}`);
     

@@ -1,5 +1,6 @@
-import fs from 'fs';
-const db = JSON.parse(fs.readFileSync('db.json', 'utf8'));
+import { readMergedDbSync } from './lib/read-split-db.mjs';
+
+const db = readMergedDbSync();
 const map = db.mappedTeams || {};
 const mahar = Object.entries(map).filter(([k,v]) => k.toLowerCase().includes('mahar'));
 console.log('Mahar Mapping:', mahar);
