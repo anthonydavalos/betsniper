@@ -930,6 +930,16 @@ PINNACLE_PREMATCH_WS_SAFETY_POLL_INTERVAL_MS=360000
 PINNACLE_PREMATCH_WS_LEAGUE_LIMIT=120
 PINNACLE_PREMATCH_WS_INCLUDE_REG_TOPICS=true
 PINNACLE_PREMATCH_WS_INCLUDE_SPC_TOPICS=true
+
+# Prematch HTTP/SSE hardening (Saturday/Canary recomendado)
+PREMATCH_HTTP_QUEUE_REFRESH_ENABLED=false
+PREMATCH_BACKGROUND_REFRESH_ENABLED=false
+PREMATCH_CACHE_TTL_MS=30000
+PREMATCH_STREAM_REFRESH_INTERVAL_MS=20000
+PREMATCH_STREAM_REFRESH_MIN_GAP_MS=45000
+PREMATCH_STREAM_HEARTBEAT_MS=20000
+PREMATCH_BACKGROUND_REFRESH_MS=60000
+PREMATCH_BACKGROUND_REFRESH_MAX_BACKOFF_MS=240000
 ```
 > Pon `true` solo para depurar el servidor Express sin que los scanners consuman CPU.
 
@@ -952,6 +962,32 @@ PINNACLE_PREMATCH_WS_INCLUDE_SPC_TOPICS=true
 > `PREMATCH_REFRESH_RECALCULATE_PINNACLE=true` fuerza recálculo de `realProb` prematch justo antes de confirmar/apostar, consultando el feed de Pinnacle. El frontend mostrará el delta instantáneo de cuota/EV/stake/probabilidad en el modal de confirmación.
 
 > Ventana híbrida recomendada para ingestas prematch: `PREMATCH_WINDOW_PRIMARY_HOURS=6` + `PREMATCH_WINDOW_PREFETCH_HOURS=6` con `PREMATCH_WINDOW_OVERLAP_MINUTES=30`. En la práctica descarga una ventana deslizante `now-30m -> now+12h`, priorizando el próximo bloque sin quedarte ciego en cambios de hora/latencia.
+
+> En el hardening actual, `GET /api/opportunities/prematch?refresh=1` devuelve snapshot/cache (SWR) y no dispara scan pesado cuando `PREMATCH_HTTP_QUEUE_REFRESH_ENABLED=false`. Si necesitas forzar cola de refresh en un diagnóstico puntual, usa `GET /api/opportunities/prematch?refresh=1&scan=1`.
+
+---
+
+### Arranque Local Recomendado (3 CLIs)
+
+1. Backend API:
+```bash
+npm run dev
+```
+2. Ingesta Arcadia/Pinnacle:
+```bash
+node services/pinnacleLight.js
+```
+3. Frontend:
+```bash
+cd client
+npm run dev
+```
+
+### ¿Qué proceso abre ventanas del navegador?
+
+- `node services/pinnacleLight.js` puede disparar `services/pinnacleGateway.js` cuando detecta sesión/token viejo de Pinnacle. Ese flujo sí puede abrir Chrome para login de Arcadia/Pinnacle.
+- Ese comportamiento es de Pinnacle, no de ACity.
+- Las ventanas de ACity/Altenar normalmente aparecen al renovar token de Booky con scripts como `scripts/extract-booky-auth-token.js` (por ejemplo con `npm run token:booky:wait-close`).
 
 ---
 

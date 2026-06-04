@@ -8,7 +8,7 @@ const ARBITRAGE_PREMATCH_START_GRACE_MINUTES = Math.max(
 );
 const ARBITRAGE_DIAG_MAX_HISTORY = Math.max(
   200,
-  Math.floor(Number(process.env.ARBITRAGE_DIAG_MAX_HISTORY || 5000))
+  Math.floor(Number(process.env.ARBITRAGE_DIAG_MAX_HISTORY || 1200))
 );
 const ARBITRAGE_DIAG_DEFAULT_LIMIT = 200;
 const ARBITRAGE_DIAG_DEFAULT_SUMMARY_WINDOW_MINUTES = Math.max(
@@ -395,6 +395,7 @@ const buildRejectionBreakdown = (diagnostics = {}) => {
     staleAltenar: Number(diagnostics?.skippedStaleAltenar || 0),
     orientation: Number(diagnostics?.skippedOrientation || 0),
     sameProvider: Number(diagnostics?.skippedSameProvider || 0),
+    arcadiaUnsupportedDc: Number(diagnostics?.skippedArcadiaUnsupportedDc || 0),
     missingOdds1x2: Number(diagnostics?.skippedMissingOdds1x2 || 0),
     missingOddsDcOpposite: Number(diagnostics?.skippedMissingOddsDcOpposite || 0),
     filteredByRisk: Number(diagnostics?.filteredByRisk || 0),
@@ -521,6 +522,8 @@ const persistArbitrageDiagnosticSnapshot = async ({
   });
 
   await writeDBWithRetry();
+
+  return row;
 };
 
 export const getArbitrageDiagnosticsReport = async ({
@@ -655,6 +658,7 @@ export const getArbitragePreview1x2 = async ({
   let skippedStaleAltenar = 0;
   let skippedOrientation = 0;
   let skippedSameProvider = 0;
+  let skippedArcadiaUnsupportedDc = 0;
   let skippedMissingOdds1x2 = 0;
   let skippedMissingOddsDcOpposite = 0;
   let generated1x2 = 0;
@@ -808,6 +812,13 @@ export const getArbitragePreview1x2 = async ({
         continue;
       }
 
+      // Arcadia no cotiza Double Chance via /bets/straight/quote en prematch.
+      // Evitamos publicar oportunidades que luego caerian en preflight con 404/market unavailable.
+      if (dcBest.provider === 'pinnacle') {
+        skippedArcadiaUnsupportedDc += 1;
+        continue;
+      }
+
       const plan = buildTwoLegStakePlan({
         bankroll: stakeBankroll,
         bestOdds: {
@@ -913,6 +924,7 @@ export const getArbitragePreview1x2 = async ({
       skippedStaleAltenar,
       skippedOrientation,
       skippedSameProvider,
+      skippedArcadiaUnsupportedDc,
       skippedMissingOdds: skippedMissingOdds1x2 + skippedMissingOddsDcOpposite,
       skippedMissingOdds1x2,
       skippedMissingOddsDcOpposite,
@@ -932,7 +944,7 @@ export const getArbitragePreview1x2 = async ({
 
   if (persistDiagnostics) {
     try {
-      await persistArbitrageDiagnosticSnapshot({
+      const snapshot = await persistArbitrageDiagnosticSnapshot({
         payload,
         query: {
           bankroll: stakeBankroll,
@@ -943,6 +955,10 @@ export const getArbitragePreview1x2 = async ({
         trigger,
         tag
       });
+
+      if (snapshot?.id) {
+        payload.diagnosticSnapshotId = String(snapshot.id);
+      }
     } catch (error) {
       console.warn(`⚠️ No se pudo persistir diagnostico de arbitraje: ${error?.message || error}`);
     }

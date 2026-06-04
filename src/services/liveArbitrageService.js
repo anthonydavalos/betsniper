@@ -1,5 +1,5 @@
 import db, { initDB, writeDBWithRetry } from '../db/database.js';
-import { getAllPinnacleLiveOdds } from './pinnacleService.js';
+import { getAllPinnacleLiveOdds, getPinnacleLiveOdds } from './pinnacleService.js';
 import { getLiveOverview, getEventDetails } from './liveValueScanner.js';
 import { findMatch } from '../utils/teamMatcher.js';
 
@@ -7,13 +7,21 @@ const DEFAULT_PREVIEW_LIMIT = 40;
 const MAX_PREVIEW_LIMIT = 200;
 const DEFAULT_MAX_EVENTS = Math.max(10, Math.floor(Number(process.env.LIVE_ARBITRAGE_MAX_EVENTS || 80)));
 const DETAILS_CONCURRENCY = Math.max(1, Math.floor(Number(process.env.LIVE_ARBITRAGE_DETAILS_CONCURRENCY || 6)));
-const DIAG_MAX_HISTORY = Math.max(200, Math.floor(Number(process.env.LIVE_ARBITRAGE_DIAG_MAX_HISTORY || 5000)));
+const DIAG_MAX_HISTORY = Math.max(200, Math.floor(Number(process.env.LIVE_ARBITRAGE_DIAG_MAX_HISTORY || 1200)));
 const DIAG_DEFAULT_LIMIT = 200;
 const DIAG_DEFAULT_WINDOW_MINUTES = Math.max(10, Math.floor(Number(process.env.LIVE_ARBITRAGE_DIAG_WINDOW_MINUTES || 180)));
 const DIAG_TOP_OPS = Math.max(1, Math.min(10, Math.floor(Number(process.env.LIVE_ARBITRAGE_DIAG_TOP_OPS || 5))));
 const DB_READ_RETRY_ATTEMPTS = Math.max(1, Math.floor(Number(process.env.LIVE_ARBITRAGE_DB_READ_RETRY_ATTEMPTS || 4)));
 const DB_READ_RETRY_DELAY_MS = Math.max(20, Math.floor(Number(process.env.LIVE_ARBITRAGE_DB_READ_RETRY_DELAY_MS || 90)));
 const REQUIRE_CROSS_PROVIDER = !['0', 'false', 'no', 'off'].includes(String(process.env.LIVE_ARBITRAGE_REQUIRE_CROSS_PROVIDER || 'true').trim().toLowerCase());
+const ROLLOUT_TOTALS_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.LIVE_ARBITRAGE_TOTALS_ENABLED || 'false').trim().toLowerCase());
+const ROLLOUT_BTTS_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.LIVE_ARBITRAGE_BTTS_ENABLED || 'false').trim().toLowerCase());
+const BTTS_RELATED_FALLBACK_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.LIVE_ARBITRAGE_BTTS_RELATED_FALLBACK_ENABLED || 'true').trim().toLowerCase());
+const TOTALS_MAX_LINE_DELTA = Math.max(0, Number(process.env.LIVE_ARBITRAGE_TOTALS_MAX_LINE_DELTA || 0.01));
+const TOTALS_MIN_PINNACLE_MAX_RISK = Math.max(0, Number(process.env.LIVE_ARBITRAGE_TOTALS_MIN_PINNACLE_MAX_RISK || 120));
+const BTTS_MIN_PINNACLE_MAX_RISK = Math.max(0, Number(process.env.LIVE_ARBITRAGE_BTTS_MIN_PINNACLE_MAX_RISK || 120));
+const MARKET_MIN_ODD = Math.max(1.01, Number(process.env.LIVE_ARBITRAGE_MARKET_MIN_ODD || 1.01));
+const MARKET_MAX_ODD = Math.max(MARKET_MIN_ODD, Number(process.env.LIVE_ARBITRAGE_MARKET_MAX_ODD || 25));
 const RISK_MIN_ROI_PERCENT_DEFAULT = Math.max(0, Number(process.env.LIVE_ARBITRAGE_MIN_ROI_PERCENT || 0));
 const RISK_MIN_PROFIT_ABS_DEFAULT = Math.max(0, Number(process.env.LIVE_ARBITRAGE_MIN_PROFIT_ABS || 0));
 const LINK_FALLBACK_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.LIVE_ARBITRAGE_LINK_FALLBACK_ENABLED || 'true').trim().toLowerCase());
@@ -112,6 +120,13 @@ const safePositiveOdd = (value) => {
   const n = toNumber(value, NaN);
   if (!Number.isFinite(n) || n <= 1) return null;
   return n;
+};
+
+const safeMarketOdd = (value) => {
+  const odd = safePositiveOdd(value);
+  if (!odd) return null;
+  if (odd < MARKET_MIN_ODD || odd > MARKET_MAX_ODD) return null;
+  return odd;
 };
 
 const clampPositiveInt = (value, fallback) => {
@@ -586,6 +601,68 @@ const resolveDoubleChanceSide = (odd = {}) => {
   return null;
 };
 
+const parseLineValue = (raw = null) => {
+  if (raw === null || raw === undefined) return null;
+  const cleaned = String(raw).replace(',', '.');
+  const match = cleaned.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const n = Number(match[0]);
+  return Number.isFinite(n) ? n : null;
+};
+
+const resolveTotalsSide = (odd = {}) => {
+  const typeId = Number(odd?.typeId);
+  if (typeId === 12) return 'over';
+  if (typeId === 13) return 'under';
+
+  const normalized = normalizeText(odd?.name || '');
+  if (normalized.startsWith('mas de') || normalized.startsWith('over')) return 'over';
+  if (normalized.startsWith('menos de') || normalized.startsWith('under')) return 'under';
+  return null;
+};
+
+const resolveBttsSide = (odd = {}) => {
+  const typeId = Number(odd?.typeId);
+  if (typeId === 74) return 'yes';
+  if (typeId === 76) return 'no';
+
+  const normalized = normalizeText(odd?.name || '');
+  if (normalized === 'si' || normalized === 'yes') return 'yes';
+  if (normalized === 'no') return 'no';
+  return null;
+};
+
+const hasEnoughPinnacleLiquidity = (maxRiskStake, minRequired = 0) => {
+  if (minRequired <= 0) return true;
+  const liquidity = Number(maxRiskStake);
+  if (!Number.isFinite(liquidity) || liquidity <= 0) return false;
+  return liquidity >= minRequired;
+};
+
+const findBestMatchingTotalLine = ({ pinTotals = [], targetLine, maxDelta = 0.01 } = {}) => {
+  if (!Array.isArray(pinTotals) || pinTotals.length === 0 || !Number.isFinite(Number(targetLine))) return null;
+
+  const safeDelta = Math.max(0, Number(maxDelta) || 0);
+  let best = null;
+
+  for (const row of pinTotals) {
+    const line = Number(row?.line);
+    if (!Number.isFinite(line)) continue;
+
+    const delta = Math.abs(line - Number(targetLine));
+    if (delta > safeDelta) continue;
+
+    if (!best || delta < best.delta) {
+      best = {
+        row,
+        delta
+      };
+    }
+  }
+
+  return best?.row || null;
+};
+
 const mapLiveAltenarOdds = ({ details, orientation }) => {
   const markets = Array.isArray(details?.markets) ? details.markets : [];
   const odds = Array.isArray(details?.odds) ? details.odds : [];
@@ -619,6 +696,8 @@ const mapLiveAltenarOdds = ({ details, orientation }) => {
     homeAway: null,
     drawAway: null
   };
+  const totalsByLine = new Map();
+  let btts = null;
 
   if (marketDc) {
     const rows = flattenMarketOddIds(marketDc)
@@ -635,6 +714,62 @@ const mapLiveAltenarOdds = ({ details, orientation }) => {
     }
   }
 
+  const totalMarkets = markets.filter((m) => Number(m?.typeId) === 18);
+  for (const market of totalMarkets) {
+    const rows = flattenMarketOddIds(market)
+      .map((id) => oddsMap.get(id))
+      .filter((odd) => odd && Number(odd?.oddStatus || 0) === 0);
+
+    const overOdd = rows.find((odd) => resolveTotalsSide(odd) === 'over');
+    const underOdd = rows.find((odd) => resolveTotalsSide(odd) === 'under');
+    const over = safeMarketOdd(overOdd?.price);
+    const under = safeMarketOdd(underOdd?.price);
+    const line = parseLineValue(market?.sv ?? market?.sn);
+
+    if (!Number.isFinite(line) || !over || !under) continue;
+
+    const lineKey = Number(line).toFixed(2);
+    const prev = totalsByLine.get(lineKey);
+    if (!prev) {
+      totalsByLine.set(lineKey, {
+        line: Number(line),
+        over,
+        under,
+        marketId: market?.id || null
+      });
+      continue;
+    }
+
+    totalsByLine.set(lineKey, {
+      line: Number(line),
+      over: Math.max(prev.over, over),
+      under: Math.max(prev.under, under),
+      marketId: prev.marketId || market?.id || null
+    });
+  }
+
+  const bttsMarket = markets.find((m) => Number(m?.typeId) === 29);
+  if (bttsMarket) {
+    const rows = flattenMarketOddIds(bttsMarket)
+      .map((id) => oddsMap.get(id))
+      .filter((odd) => odd && Number(odd?.oddStatus || 0) === 0);
+
+    const yesOdd = rows.find((odd) => resolveBttsSide(odd) === 'yes');
+    const noOdd = rows.find((odd) => resolveBttsSide(odd) === 'no');
+    const yes = safeMarketOdd(yesOdd?.price);
+    const no = safeMarketOdd(noOdd?.price);
+
+    if (yes && no) {
+      btts = {
+        yes,
+        no,
+        marketId: bttsMarket?.id || null
+      };
+    }
+  }
+
+  const totals = Array.from(totalsByLine.values()).sort((a, b) => Number(a?.line || 0) - Number(b?.line || 0));
+
   if (orientation === 'swapped') {
     return {
       oneXTwo: {
@@ -646,13 +781,17 @@ const mapLiveAltenarOdds = ({ details, orientation }) => {
         homeDraw: dcRaw.drawAway,
         homeAway: dcRaw.homeAway,
         drawAway: dcRaw.homeDraw
-      }
+      },
+      totals,
+      btts
     };
   }
 
   return {
     oneXTwo,
-    doubleChance: dcRaw
+    doubleChance: dcRaw,
+    totals,
+    btts
   };
 };
 
@@ -820,7 +959,20 @@ const buildRejectionBreakdown = (diagnostics = {}) => ({
   noSurebetEdge: Number(diagnostics?.skippedNoSurebetEdge || 0),
   uncertainStatus: Number(diagnostics?.skippedUncertainStatus || 0),
   detailsErrors: Number(diagnostics?.skippedDetailsError || 0),
-  sensitiveMismatch: Number(diagnostics?.skippedSensitiveMismatch || 0)
+  sensitiveMismatch: Number(diagnostics?.skippedSensitiveMismatch || 0),
+  totalsDisabled: Number(diagnostics?.skippedTotalsDisabled || 0),
+  totalsMissingMarket: Number(diagnostics?.skippedTotalsMissingMarket || 0),
+  totalsLineMismatch: Number(diagnostics?.skippedTotalsLineMismatch || 0),
+  totalsLowLiquidity: Number(diagnostics?.skippedTotalsLowLiquidity || 0),
+  totalsSameProvider: Number(diagnostics?.skippedTotalsSameProvider || 0),
+  totalsNoSurebetEdge: Number(diagnostics?.skippedTotalsNoSurebetEdge || 0),
+  bttsDisabled: Number(diagnostics?.skippedBttsDisabled || 0),
+  bttsMissingMarket: Number(diagnostics?.skippedBttsMissingMarket || 0),
+  bttsRelatedFallbackNoData: Number(diagnostics?.skippedBttsRelatedFallbackNoData || 0),
+  bttsRelatedFallbackError: Number(diagnostics?.skippedBttsRelatedFallbackError || 0),
+  bttsLowLiquidity: Number(diagnostics?.skippedBttsLowLiquidity || 0),
+  bttsSameProvider: Number(diagnostics?.skippedBttsSameProvider || 0),
+  bttsNoSurebetEdge: Number(diagnostics?.skippedBttsNoSurebetEdge || 0)
 });
 
 const persistDiagnosticSnapshot = async ({ payload, query, trigger = 'request', tag = null } = {}) => {
@@ -945,8 +1097,24 @@ export const getLiveArbitragePreview = async ({
   let skippedSameProvider = 0;
   let skippedNoSurebetEdge = 0;
   let skippedStaleAltenar = 0;
+  let skippedTotalsDisabled = 0;
+  let skippedTotalsMissingMarket = 0;
+  let skippedTotalsLineMismatch = 0;
+  let skippedTotalsLowLiquidity = 0;
+  let skippedTotalsSameProvider = 0;
+  let skippedTotalsNoSurebetEdge = 0;
+  let skippedBttsDisabled = 0;
+  let skippedBttsMissingMarket = 0;
+  let skippedBttsRelatedFallbackNoData = 0;
+  let skippedBttsRelatedFallbackError = 0;
+  let skippedBttsLowLiquidity = 0;
+  let skippedBttsSameProvider = 0;
+  let skippedBttsNoSurebetEdge = 0;
+  let mappedBttsViaRelatedFallback = 0;
   let generated1x2 = 0;
   let generatedDcOpposite = 0;
+  let generatedTotals = 0;
+  let generatedBtts = 0;
   const fallbackSamples = [];
   const pinLiveFallbackSamples = [];
 
@@ -1106,6 +1274,42 @@ export const getLiveArbitragePreview = async ({
       homeAway: safePositiveOdd(pinLive?.doubleChance?.homeAway),
       drawAway: safePositiveOdd(pinLive?.doubleChance?.drawAway)
     };
+    const pinTotals = Array.isArray(pinLive?.totals)
+      ? pinLive.totals
+        .map((row) => ({
+          line: Number(row?.line),
+          over: safeMarketOdd(row?.over),
+          under: safeMarketOdd(row?.under),
+          maxRiskStake: Number(row?.maxRiskStake)
+        }))
+        .filter((row) => Number.isFinite(row?.line) && row?.over && row?.under)
+      : [];
+
+    let pinBtts = {
+      yes: safeMarketOdd(pinLive?.btts?.yes),
+      no: safeMarketOdd(pinLive?.btts?.no),
+      maxRiskStake: Number(pinLive?.btts?.maxRiskStake)
+    };
+
+    if ((!pinBtts?.yes || !pinBtts?.no) && ROLLOUT_BTTS_ENABLED && BTTS_RELATED_FALLBACK_ENABLED && link?.id) {
+      try {
+        const pinRelated = await getPinnacleLiveOdds(link.id);
+        const relatedYes = safeMarketOdd(pinRelated?.btts?.yes);
+        const relatedNo = safeMarketOdd(pinRelated?.btts?.no);
+        if (relatedYes && relatedNo) {
+          pinBtts = {
+            yes: relatedYes,
+            no: relatedNo,
+            maxRiskStake: Number(pinRelated?.btts?.maxRiskStake)
+          };
+          mappedBttsViaRelatedFallback += 1;
+        } else {
+          skippedBttsRelatedFallbackNoData += 1;
+        }
+      } catch (error) {
+        skippedBttsRelatedFallbackError += 1;
+      }
+    }
 
     let generatedAnyForEvent = false;
 
@@ -1263,6 +1467,251 @@ export const getLiveArbitragePreview = async ({
       generatedAnyForEvent = true;
     }
 
+    if (!ROLLOUT_TOTALS_ENABLED) {
+      skippedTotalsDisabled += 1;
+    } else {
+      const altTotals = Array.isArray(altMapped?.totals)
+        ? altMapped.totals
+          .map((row) => ({
+            line: Number(row?.line),
+            over: safeMarketOdd(row?.over),
+            under: safeMarketOdd(row?.under)
+          }))
+          .filter((row) => Number.isFinite(row?.line) && row?.over && row?.under)
+        : [];
+
+      if (altTotals.length === 0 || pinTotals.length === 0) {
+        skippedTotalsMissingMarket += 1;
+      } else {
+        for (const altTotal of altTotals) {
+          const pinTotal = findBestMatchingTotalLine({
+            pinTotals,
+            targetLine: altTotal.line,
+            maxDelta: TOTALS_MAX_LINE_DELTA
+          });
+
+          if (!pinTotal) {
+            skippedTotalsLineMismatch += 1;
+            continue;
+          }
+
+          const overBest = chooseBestOdd({
+            pinnacleOdd: pinTotal.over,
+            altenarOdd: altTotal.over
+          });
+          const underBest = chooseBestOdd({
+            pinnacleOdd: pinTotal.under,
+            altenarOdd: altTotal.under
+          });
+
+          if (!overBest || !underBest) {
+            skippedTotalsMissingMarket += 1;
+            continue;
+          }
+
+          const pinnacleUsed = overBest.provider === 'pinnacle' || underBest.provider === 'pinnacle';
+          if (pinnacleUsed && !hasEnoughPinnacleLiquidity(pinTotal.maxRiskStake, TOTALS_MIN_PINNACLE_MAX_RISK)) {
+            skippedTotalsLowLiquidity += 1;
+            continue;
+          }
+
+          if (REQUIRE_CROSS_PROVIDER && overBest.provider === underBest.provider) {
+            skippedTotalsSameProvider += 1;
+            continue;
+          }
+
+          const plan = buildTwoLegStakePlan({
+            bankroll: stakeBankroll,
+            bestOdds: {
+              cover: overBest,
+              opposite: underBest
+            }
+          });
+
+          if (!plan) {
+            skippedTotalsNoSurebetEdge += 1;
+            continue;
+          }
+
+          opportunities.push({
+            type: 'SUREBET_TOTALS_LIVE',
+            market: 'totals_over_under',
+            line: Number(altTotal.line),
+            eventId: event?.id || null,
+            pinnacleId: link?.id || null,
+            altenarId: link?.altenarId || event?.id || null,
+            match: event?.name || `${link?.home || ''} vs ${link?.away || ''}`.trim(),
+            league: event?.league || link?.league?.name || null,
+            country: event?.country || null,
+            liveTime: event?.liveTime || null,
+            score: Array.isArray(event?.score) ? `${event.score[0] || 0}-${event.score[1] || 0}` : null,
+            orientation,
+            legs: [
+              {
+                market: `Total ${Number(altTotal.line).toFixed(2)}`,
+                selection: 'Over',
+                provider: overBest.provider,
+                odd: overBest.odd
+              },
+              {
+                market: `Total ${Number(altTotal.line).toFixed(2)}`,
+                selection: 'Under',
+                provider: underBest.provider,
+                odd: underBest.odd
+              }
+            ],
+            odds: {
+              pinnacle: {
+                line: Number(pinTotal.line),
+                over: pinTotal.over,
+                under: pinTotal.under,
+                maxRiskStake: Number(pinTotal?.maxRiskStake) || null
+              },
+              altenar: {
+                line: Number(altTotal.line),
+                over: altTotal.over,
+                under: altTotal.under
+              },
+              best: {
+                over: overBest,
+                under: underBest
+              }
+            },
+            edgePercent: plan.edgePercent,
+            roiPercent: plan.roiPercent,
+            expectedProfit: plan.expectedProfit,
+            guaranteedPayout: plan.guaranteedPayout,
+            plan: {
+              ...plan,
+              labels: {
+                cover: 'Over',
+                opposite: 'Under'
+              }
+            },
+            stakePlan: {
+              ...plan,
+              labels: {
+                cover: 'Over',
+                opposite: 'Under'
+              }
+            }
+          });
+
+          generatedTotals += 1;
+          generatedAnyForEvent = true;
+        }
+      }
+    }
+
+    if (!ROLLOUT_BTTS_ENABLED) {
+      skippedBttsDisabled += 1;
+    } else {
+      const altBtts = {
+        yes: safeMarketOdd(altMapped?.btts?.yes),
+        no: safeMarketOdd(altMapped?.btts?.no)
+      };
+
+      if (!pinBtts?.yes || !pinBtts?.no || !altBtts.yes || !altBtts.no) {
+        skippedBttsMissingMarket += 1;
+      } else {
+        const yesBest = chooseBestOdd({
+          pinnacleOdd: pinBtts.yes,
+          altenarOdd: altBtts.yes
+        });
+        const noBest = chooseBestOdd({
+          pinnacleOdd: pinBtts.no,
+          altenarOdd: altBtts.no
+        });
+
+        if (!yesBest || !noBest) {
+          skippedBttsMissingMarket += 1;
+        } else {
+          const pinnacleUsed = yesBest.provider === 'pinnacle' || noBest.provider === 'pinnacle';
+          if (pinnacleUsed && !hasEnoughPinnacleLiquidity(pinBtts.maxRiskStake, BTTS_MIN_PINNACLE_MAX_RISK)) {
+            skippedBttsLowLiquidity += 1;
+          } else if (REQUIRE_CROSS_PROVIDER && yesBest.provider === noBest.provider) {
+            skippedBttsSameProvider += 1;
+          } else {
+            const plan = buildTwoLegStakePlan({
+              bankroll: stakeBankroll,
+              bestOdds: {
+                cover: yesBest,
+                opposite: noBest
+              }
+            });
+
+            if (!plan) {
+              skippedBttsNoSurebetEdge += 1;
+            } else {
+              opportunities.push({
+                type: 'SUREBET_BTTS_LIVE',
+                market: 'btts_yes_no',
+                eventId: event?.id || null,
+                pinnacleId: link?.id || null,
+                altenarId: link?.altenarId || event?.id || null,
+                match: event?.name || `${link?.home || ''} vs ${link?.away || ''}`.trim(),
+                league: event?.league || link?.league?.name || null,
+                country: event?.country || null,
+                liveTime: event?.liveTime || null,
+                score: Array.isArray(event?.score) ? `${event.score[0] || 0}-${event.score[1] || 0}` : null,
+                orientation,
+                legs: [
+                  {
+                    market: 'BTTS',
+                    selection: 'Yes',
+                    provider: yesBest.provider,
+                    odd: yesBest.odd
+                  },
+                  {
+                    market: 'BTTS',
+                    selection: 'No',
+                    provider: noBest.provider,
+                    odd: noBest.odd
+                  }
+                ],
+                odds: {
+                  pinnacle: {
+                    yes: pinBtts.yes,
+                    no: pinBtts.no,
+                    maxRiskStake: Number(pinBtts?.maxRiskStake) || null
+                  },
+                  altenar: {
+                    yes: altBtts.yes,
+                    no: altBtts.no
+                  },
+                  best: {
+                    yes: yesBest,
+                    no: noBest
+                  }
+                },
+                edgePercent: plan.edgePercent,
+                roiPercent: plan.roiPercent,
+                expectedProfit: plan.expectedProfit,
+                guaranteedPayout: plan.guaranteedPayout,
+                plan: {
+                  ...plan,
+                  labels: {
+                    cover: 'Yes',
+                    opposite: 'No'
+                  }
+                },
+                stakePlan: {
+                  ...plan,
+                  labels: {
+                    cover: 'Yes',
+                    opposite: 'No'
+                  }
+                }
+              });
+
+              generatedBtts += 1;
+              generatedAnyForEvent = true;
+            }
+          }
+        }
+      }
+    }
+
     if (!generatedAnyForEvent) {
       skippedNoSurebetEdge += 1;
     }
@@ -1282,11 +1731,15 @@ export const getLiveArbitragePreview = async ({
     .sort((a, b) => Number(b?.plan?.edgePercent || 0) - Number(a?.plan?.edgePercent || 0))
     .slice(0, maxItems);
 
+  const outputMarkets = ['1x2', 'double_chance+opposite_1x2'];
+  if (ROLLOUT_TOTALS_ENABLED) outputMarkets.push('totals_over_under');
+  if (ROLLOUT_BTTS_ENABLED) outputMarkets.push('btts_yes_no');
+
   const payload = {
     success: true,
     mode: 'preview-only',
     market: 'live-mixed',
-    markets: ['1x2', 'double_chance+opposite_1x2'],
+    markets: outputMarkets,
     source: 'live-overview+pinnacle-live',
     generatedAt: new Date().toISOString(),
     bankroll: stakeBankroll,
@@ -1303,7 +1756,9 @@ export const getLiveArbitragePreview = async ({
       evaluatedEvents: detailRows.length,
       generatedByType: {
         surebet1x2Live: generated1x2,
-        surebetDcOppositeLive: generatedDcOpposite
+        surebetDcOppositeLive: generatedDcOpposite,
+        surebetTotalsLive: generatedTotals,
+        surebetBttsLive: generatedBtts
       },
       skippedUncertainStatus,
       skippedUnlinked,
@@ -1332,6 +1787,30 @@ export const getLiveArbitragePreview = async ({
       skippedSameProvider,
       skippedMissingOdds,
       skippedNoSurebetEdge,
+      totalsRolloutEnabled: ROLLOUT_TOTALS_ENABLED,
+      bttsRolloutEnabled: ROLLOUT_BTTS_ENABLED,
+      skippedTotalsDisabled,
+      skippedTotalsMissingMarket,
+      skippedTotalsLineMismatch,
+      skippedTotalsLowLiquidity,
+      skippedTotalsSameProvider,
+      skippedTotalsNoSurebetEdge,
+      totalsMaxLineDelta: TOTALS_MAX_LINE_DELTA,
+      totalsMinPinnacleMaxRisk: TOTALS_MIN_PINNACLE_MAX_RISK,
+      skippedBttsDisabled,
+      skippedBttsMissingMarket,
+      skippedBttsRelatedFallbackNoData,
+      skippedBttsRelatedFallbackError,
+      mappedBttsViaRelatedFallback,
+      bttsRelatedFallbackEnabled: BTTS_RELATED_FALLBACK_ENABLED,
+      skippedBttsLowLiquidity,
+      skippedBttsSameProvider,
+      skippedBttsNoSurebetEdge,
+      bttsMinPinnacleMaxRisk: BTTS_MIN_PINNACLE_MAX_RISK,
+      marketOddBounds: {
+        min: MARKET_MIN_ODD,
+        max: MARKET_MAX_ODD
+      },
       filteredByRisk,
       riskThresholds,
       requireCrossProvider: REQUIRE_CROSS_PROVIDER,

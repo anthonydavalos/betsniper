@@ -26,6 +26,7 @@ const LIVE_MAX_ODD_DRIFT = parsePositiveNumberFromEnv(process.env.BOOKY_LIVE_MAX
 const PREMATCH_MAX_ODD_DRIFT = parsePositiveNumberFromEnv(process.env.BOOKY_PREMATCH_MAX_ODD_DRIFT, 0.2);
 const PLACE_WIDGET_URL = 'https://sb2betgateway-altenar2.biahosted.com/api/widget/placeWidget';
 const DEFAULT_MIN_TOKEN_MINUTES = 2;
+const DEFAULT_EXEC_MIN_TOKEN_MINUTES = 2;
 const prepareTicketInFlight = new Map();
 const ticketMutationInFlight = new Map();
 
@@ -114,6 +115,18 @@ const buildTicketKey = (op = {}) => {
   return `${eventId}_${normalizePick(op)}`;
 };
 
+const isArbitrageLegOpportunity = (op = {}) => {
+  const source = String(op?.source || '').trim().toUpperCase();
+  const type = String(op?.type || op?.strategy || '').trim().toUpperCase();
+  const arbitrageType = String(op?.arbitrageType || '').trim().toUpperCase();
+
+  if (source === 'ARBITRAGE_PREVIEW_LEG') return true;
+  if (type.startsWith('SUREBET_')) return true;
+  if (arbitrageType.startsWith('SUREBET_')) return true;
+  if (arbitrageType.includes('ARBITRAGE')) return true;
+  return false;
+};
+
 const findPortfolioMirrorBet = (opportunity = {}) => {
   const portfolio = db.data?.portfolio || {};
   const pick = normalizePick(opportunity);
@@ -137,6 +150,42 @@ const findPortfolioMirrorBet = (opportunity = {}) => {
   }
 
   return null;
+};
+
+const findActivePortfolioBet = (opportunity = {}) => {
+  const portfolio = db.data?.portfolio || {};
+  const pick = normalizePick(opportunity);
+  const eventId = String(opportunity.eventId || '');
+  const active = Array.isArray(portfolio.activeBets) ? portfolio.activeBets : [];
+
+  return active.find((bet = {}) => {
+    if (!bet) return false;
+    if (eventId && String(bet.eventId || '') !== eventId) return false;
+    return String(bet.pick || '').toLowerCase() === pick;
+  }) || null;
+};
+
+const ensureNoDuplicateArbitrageExposureOrThrow = (opportunity = {}) => {
+  if (!isArbitrageLegOpportunity(opportunity)) return;
+
+  const activeBet = findActivePortfolioBet(opportunity);
+  if (!activeBet) return;
+
+  throw createBookyError(
+    'Ya existe exposición activa para este evento/pick de arbitraje. Se bloquea duplicado.',
+    {
+      statusCode: 409,
+      code: 'BOOKY_DUPLICATE_ACTIVE_EXPOSURE',
+      diagnostic: {
+        eventId: String(opportunity?.eventId || ''),
+        pick: normalizePick(opportunity),
+        activeBetId: activeBet?.id || null,
+        activeProviderBetId: activeBet?.providerBetId || null,
+        activeStatus: activeBet?.status || null,
+        observedAt: nowIso()
+      }
+    }
+  );
 };
 
 const ensureBookyStore = () => {
@@ -187,6 +236,38 @@ const getActiveAuthHeader = () => {
   const token = getRuntimeEnvValue('ALTENAR_BOOKY_AUTH_TOKEN', '');
   if (!token) return null;
   return token.toLowerCase().startsWith('bearer ') ? token : `Bearer ${token}`;
+};
+
+const resolveBookyHealthMinTokenMinutes = () => {
+  const n = Number(getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', String(DEFAULT_MIN_TOKEN_MINUTES)));
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MIN_TOKEN_MINUTES;
+};
+
+const resolveBookyExecutionMinTokenMinutes = () => {
+  const n = Number(getRuntimeEnvValue('BOOKY_EXEC_TOKEN_MIN_REMAINING_MINUTES', String(DEFAULT_EXEC_MIN_TOKEN_MINUTES)));
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_EXEC_MIN_TOKEN_MINUTES;
+};
+
+const resolveBookyMonitorMinTokenMinutes = () => {
+  const fallback = resolveBookyHealthMinTokenMinutes();
+  const n = Number(getRuntimeEnvValue('BOOKY_TOKEN_MONITOR_MIN_REMAINING_MINUTES', String(fallback)));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const resolveBookyTokenHealthRenewLeadMinutes = () => {
+  const fallback = Number(getRuntimeEnvValue('BOOKY_SYNC_TOKEN_RENEW_LEAD_MINUTES', '4'));
+  const n = Number(getRuntimeEnvValue('BOOKY_TOKEN_HEALTH_RENEW_LEAD_MINUTES', String(fallback)));
+  return Number.isFinite(n) && n >= 0 ? n : 4;
+};
+
+const resolveBookyTokenAutoRenewMaxThresholdMinutes = () => {
+  const fallback = 12;
+  const n = Number(getRuntimeEnvValue('BOOKY_TOKEN_AUTO_RENEW_MAX_THRESHOLD_MINUTES', String(fallback)));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const resolveBookyTokenHealthInteractiveRenewEnabled = () => {
+  return getRuntimeEnvValue('BOOKY_TOKEN_HEALTH_INTERACTIVE_RENEW_ENABLED', 'false').toLowerCase() === 'true';
 };
 
 const decodeJwtPayload = (jwt = '') => {
@@ -261,7 +342,10 @@ const getTokenHealth = () => {
   };
 };
 
-const TOKEN_RENEW_COOLDOWN_MS = 15000;
+const TOKEN_RENEW_COOLDOWN_MS = Math.max(
+  5000,
+  Number(getRuntimeEnvValue('BOOKY_TOKEN_RENEW_COOLDOWN_MS', '45000')) || 45000
+);
 let lastTokenRenewLaunchAt = 0;
 
 const triggerInteractiveTokenRenewal = () => {
@@ -328,7 +412,8 @@ export const requestBookyTokenRenewal = () => {
 
 const ensureTokenFreshOrThrow = () => {
   const enabled = getRuntimeEnvValue('BOOKY_AUTO_TOKEN_REFRESH_ENABLED', '').toLowerCase() === 'true';
-  const minMinutes = Number(getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', String(DEFAULT_MIN_TOKEN_MINUTES)));
+  const minMinutes = resolveBookyExecutionMinTokenMinutes();
+  const healthMinMinutes = resolveBookyHealthMinTokenMinutes();
   const health = getTokenHealth();
   const expectedIntegration = String(
     getRuntimeEnvValue('ALTENAR_INTEGRATION', altenarClient?.defaults?.params?.integration || '')
@@ -348,9 +433,9 @@ const ensureTokenFreshOrThrow = () => {
     };
   }
 
-  let renewalTriggered = false;
+  let renewal = null;
   if (enabled) {
-    renewalTriggered = triggerInteractiveTokenRenewal();
+    renewal = requestBookyTokenRenewal();
   }
 
   const reason = !health.exists
@@ -375,9 +460,14 @@ const ensureTokenFreshOrThrow = () => {
         expectedIntegration: expectedIntegration || null,
         integrationMismatch,
         minRequiredMinutes: Number.isFinite(minMinutes) ? minMinutes : DEFAULT_MIN_TOKEN_MINUTES,
+        minExecutionRequiredMinutes: Number.isFinite(minMinutes) ? minMinutes : DEFAULT_EXEC_MIN_TOKEN_MINUTES,
+        minHealthRequiredMinutes: Number.isFinite(healthMinMinutes) ? healthMinMinutes : DEFAULT_MIN_TOKEN_MINUTES,
         autoRefreshEnabled: enabled,
-        renewalTriggered,
-        renewalCommand: `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase()}`
+        renewalTriggered: Boolean(renewal?.started),
+        renewalBusy: Boolean(renewal?.busy),
+        renewalRetryAfterSeconds: Number(renewal?.retryAfterSeconds || 0) || null,
+        renewalMessage: renewal?.message || null,
+        renewalCommand: renewal?.renewalCommand || `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase()}`
       }
     }
   );
@@ -385,12 +475,49 @@ const ensureTokenFreshOrThrow = () => {
 
 export const getBookyTokenHealth = () => {
   const health = getTokenHealth();
+  const minHealthRequiredMinutes = resolveBookyHealthMinTokenMinutes();
+  const minExecutionRequiredMinutes = resolveBookyExecutionMinTokenMinutes();
+  const minMonitorRequiredMinutes = resolveBookyMonitorMinTokenMinutes();
+  const tokenHealthRenewLeadMinutes = resolveBookyTokenHealthRenewLeadMinutes();
+  const tokenAutoRenewMaxThresholdMinutes = resolveBookyTokenAutoRenewMaxThresholdMinutes();
+  const tokenHealthInteractiveAutoRenewEnabled = resolveBookyTokenHealthInteractiveRenewEnabled();
+  const autoRenewThresholdRawMinutes = minMonitorRequiredMinutes + tokenHealthRenewLeadMinutes;
+  const autoRenewThresholdMinutes = Math.max(
+    minMonitorRequiredMinutes,
+    Math.min(autoRenewThresholdRawMinutes, tokenAutoRenewMaxThresholdMinutes)
+  );
   const profile = getRuntimeEnvValue('BOOK_PROFILE', 'doradobet').toLowerCase();
   const integration = altenarClient?.defaults?.params?.integration || profile;
   const expectedIntegration = String(getRuntimeEnvValue('ALTENAR_INTEGRATION', integration || '')).trim().toLowerCase();
   const tokenIntegration = String(health?.tokenIntegration || '').trim().toLowerCase();
   const realPlacementEnabled = getRuntimeEnvValue('BOOKY_REAL_PLACEMENT_ENABLED', '').toLowerCase() === 'true';
+  const autoRefreshEnabled = getRuntimeEnvValue('BOOKY_AUTO_TOKEN_REFRESH_ENABLED', '').toLowerCase() === 'true';
   const renewalCommand = `node scripts/extract-booky-auth-token.js --headed --wait-close --require-profile=${profile}`;
+
+  const lowRemaining = Number.isFinite(health?.remainingMinutes) && Number(health.remainingMinutes) < autoRenewThresholdMinutes;
+  const autoRenewRecommended = Boolean(
+    !health.exists
+    || !health.jwtValid
+    || !health.authenticated
+    || health.expired
+    || lowRemaining
+  );
+  const shouldAutoRenew = Boolean(
+    autoRefreshEnabled
+    && tokenHealthInteractiveAutoRenewEnabled
+    && (
+      !health.exists
+      || !health.jwtValid
+      || !health.authenticated
+      || health.expired
+      || lowRemaining
+    )
+  );
+
+  let renewal = null;
+  if (shouldAutoRenew) {
+    renewal = requestBookyTokenRenewal();
+  }
   return {
     profile,
     integration,
@@ -404,8 +531,20 @@ export const getBookyTokenHealth = () => {
     expIso: health.expIso,
     remainingMinutes: health.remainingMinutes,
     expired: health.expired,
-    minRequiredMinutes: Number(getRuntimeEnvValue('BOOKY_TOKEN_MIN_REMAINING_MINUTES', String(DEFAULT_MIN_TOKEN_MINUTES))),
-    autoRefreshEnabled: getRuntimeEnvValue('BOOKY_AUTO_TOKEN_REFRESH_ENABLED', '').toLowerCase() === 'true',
+    minRequiredMinutes: minHealthRequiredMinutes,
+    minExecutionRequiredMinutes,
+    minMonitorRequiredMinutes,
+    tokenAutoRenewLeadMinutes: tokenHealthRenewLeadMinutes,
+    tokenAutoRenewThresholdRawMinutes: autoRenewThresholdRawMinutes,
+    tokenAutoRenewMaxThresholdMinutes,
+    tokenAutoRenewThresholdMinutes: autoRenewThresholdMinutes,
+    autoRefreshEnabled,
+    tokenHealthInteractiveAutoRenewEnabled,
+    autoRenewRecommended,
+    renewalTriggered: Boolean(renewal?.started),
+    renewalBusy: Boolean(renewal?.busy),
+    renewalRetryAfterSeconds: Number(renewal?.retryAfterSeconds || 0) || null,
+    renewalMessage: renewal?.message || null,
     realPlacementEnabled,
     renewalCommand
   };
@@ -516,6 +655,9 @@ const enforceValueGuardsOrThrow = ({ ticket, draft }) => {
   const { minEvPercent, maxOddDrop } = getValueGuardConfig();
   if (minEvPercent <= 0 && maxOddDrop <= 0) return;
 
+  const skipEvGuardForArbitrage = isArbitrageLegOpportunity(ticket?.opportunity)
+    || isArbitrageLegOpportunity(draft?.refreshed);
+
   const oldOdd = safeNumber(ticket?.opportunity?.price ?? ticket?.opportunity?.odd);
   const finalOdd = safeNumber(
     draft?.payload?.betMarkets?.[0]?.odds?.[0]?.price ?? draft?.refreshed?.price ?? draft?.refreshed?.odd
@@ -548,7 +690,7 @@ const enforceValueGuardsOrThrow = ({ ticket, draft }) => {
     );
   }
 
-  if (minEvPercent > 0 && Number.isFinite(evPercent) && evPercent < minEvPercent) {
+  if (!skipEvGuardForArbitrage && minEvPercent > 0 && Number.isFinite(evPercent) && evPercent < minEvPercent) {
     throw createBookyError(
       `Guard de valor: EV insuficiente (${evPercent.toFixed(2)}% < ${minEvPercent.toFixed(2)}%).`,
       {
@@ -844,7 +986,40 @@ const buildPlaceWidgetPayload = ({ template, refreshedOpportunity, details, mark
   const defaults = altenarClient?.defaults?.params || {};
   const templateMarket = template?.betMarkets?.[0] || {};
   const templateOdd = templateMarket?.odds?.[0] || {};
-  const stake = Math.max(1, safeNumber(refreshedOpportunity.kellyStake));
+  const stake = safeNumber(refreshedOpportunity.kellyStake, NaN);
+
+  if (!Number.isFinite(stake) || stake <= 0) {
+    throw createBookyError(
+      'Stake inválido tras refresh. Se cancela placement real para evitar envío incorrecto.',
+      {
+        statusCode: 409,
+        code: 'BOOKY_INVALID_STAKE_AFTER_REFRESH',
+        diagnostic: {
+          eventId: String(refreshedOpportunity?.eventId || ''),
+          pick: normalizePick(refreshedOpportunity),
+          stake,
+          observedAt: nowIso()
+        }
+      }
+    );
+  }
+
+  if (stake < 1) {
+    throw createBookyError(
+      'Stake menor al mínimo permitido por Booky (S/. 1.00). Ajusta bankroll/riesgo antes de confirmar.',
+      {
+        statusCode: 409,
+        code: 'BOOKY_INVALID_STAKE_BELOW_MIN',
+        diagnostic: {
+          eventId: String(refreshedOpportunity?.eventId || ''),
+          pick: normalizePick(refreshedOpportunity),
+          stake,
+          minStake: 1,
+          observedAt: nowIso()
+        }
+      }
+    );
+  }
 
   return {
     culture: defaults.culture || template?.culture || 'es-ES',
@@ -1015,9 +1190,58 @@ export const prepareSemiAutoTicket = async (opportunity) => {
   const refreshed = await refreshOpportunity(opportunity);
   if (!refreshed) throw new Error('No se pudo refrescar la oportunidad.');
 
-  if (safeNumber(refreshed.ev) <= 0) {
+  if (!isArbitrageLegOpportunity(refreshed) && safeNumber(refreshed.ev) <= 0) {
     throw new Error(`El valor desapareció tras refresh (EV=${safeNumber(refreshed.ev).toFixed(2)}%).`);
   }
+
+  const isArbitrageLeg = isArbitrageLegOpportunity(refreshed) || isArbitrageLegOpportunity(opportunity);
+  const sourceStake = safeNumber(opportunity?.kellyStake, 0);
+  const refreshedStake = safeNumber(refreshed?.kellyStake, 0);
+
+  // En arbitraje preservamos stake del plan original si el refresh individual lo degrada a 0.
+  if (isArbitrageLeg && refreshedStake <= 0 && sourceStake > 0) {
+    refreshed.kellyStake = sourceStake;
+    refreshed.stakePreservedFromArbitrage = true;
+  }
+
+  const effectiveStake = safeNumber(refreshed?.kellyStake, NaN);
+  if (!Number.isFinite(effectiveStake) || effectiveStake <= 0) {
+    throw createBookyError(
+      'Stake recalculado inválido tras refresh. Se cancela para evitar envío de stake mínimo forzado.',
+      {
+        statusCode: 409,
+        code: 'BOOKY_INVALID_STAKE_AFTER_REFRESH',
+        diagnostic: {
+          eventId: String(refreshed?.eventId || opportunity?.eventId || ''),
+          pick: normalizePick(refreshed),
+          refreshedStake,
+          sourceStake,
+          isArbitrageLeg,
+          observedAt: nowIso()
+        }
+      }
+    );
+  }
+
+  if (effectiveStake < 1) {
+    throw createBookyError(
+      'Stake recalculado por debajo del mínimo de Booky (S/. 1.00). Se cancela la preparación.',
+      {
+        statusCode: 409,
+        code: 'BOOKY_INVALID_STAKE_BELOW_MIN',
+        diagnostic: {
+          eventId: String(refreshed?.eventId || opportunity?.eventId || ''),
+          pick: normalizePick(refreshed),
+          stake: effectiveStake,
+          minStake: 1,
+          isArbitrageLeg,
+          observedAt: nowIso()
+        }
+      }
+    );
+  }
+
+  ensureNoDuplicateArbitrageExposureOrThrow(refreshed);
 
   const ticketKey = buildTicketKey(refreshed);
   const expiresAt = new Date(Date.now() + getExpiryMs(refreshed)).toISOString();

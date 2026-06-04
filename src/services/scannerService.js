@@ -45,6 +45,12 @@ const parsePositiveNumberOr = (value, fallback) => {
     return n > 0 ? n : fallback;
 };
 
+const parsePositiveNumberOrNull = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    return n > 0 ? n : null;
+};
+
 const parseAllowedOpportunityTypes = (rawValue, fallback = []) => {
     if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
         return [...fallback];
@@ -58,7 +64,7 @@ const parseAllowedOpportunityTypes = (rawValue, fallback = []) => {
 
 const parsePlacementProvider = (rawValue, fallback = 'booky') => {
     const normalized = String(rawValue || '').trim().toLowerCase();
-    if (normalized === 'booky' || normalized === 'pinnacle') return normalized;
+    if (normalized === 'booky' || normalized === 'pinnacle' || normalized === 'auto') return normalized;
     return fallback;
 };
 
@@ -114,6 +120,8 @@ const AUTO_SNIPE_MIN_EV_PERCENT = parsePositiveNumberOr(
     Math.max(0.1, Number(process.env.BOOKY_MIN_EV_PERCENT || 2))
 );
 const AUTO_SNIPE_MIN_STAKE_SOL = parsePositiveNumberOr(process.env.AUTO_SNIPE_MIN_STAKE_SOL, 1);
+const AUTO_SNIPE_MAX_STAKE_BOOKY_SOL = parsePositiveNumberOrNull(process.env.AUTO_SNIPE_MAX_STAKE_BOOKY_SOL);
+const AUTO_SNIPE_MAX_STAKE_PINNACLE_SOL = parsePositiveNumberOrNull(process.env.AUTO_SNIPE_MAX_STAKE_PINNACLE_SOL);
 const AUTO_SNIPE_MAX_BETS_PER_HOUR = parsePositiveIntOr(process.env.AUTO_SNIPE_MAX_BETS_PER_HOUR, 3);
 const AUTO_SNIPE_COOLDOWN_PER_PICK_MS = parsePositiveIntOr(process.env.AUTO_SNIPE_COOLDOWN_PER_PICK_MS, 180000);
 const AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT = parsePositiveNumberOr(process.env.AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT, 8);
@@ -131,7 +139,7 @@ const AUTO_PLACEMENT_ALLOWED_TYPES = parseAllowedOpportunityTypes(
 const AUTO_PLACEMENT_ALLOWED_TYPES_SET = new Set(AUTO_PLACEMENT_ALLOWED_TYPES);
 const BOOKY_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(process.env.BOOKY_REAL_PLACEMENT_ENABLED, false);
 const PINNACLE_REAL_PLACEMENT_ENABLED = parseBooleanFromEnv(process.env.PINNACLE_REAL_PLACEMENT_ENABLED, false);
-const AUTO_PLACEMENT_PROVIDER_OPTIONS = ['booky', 'pinnacle'];
+const AUTO_PLACEMENT_PROVIDER_OPTIONS = ['booky', 'pinnacle', 'auto'];
 let runtimeAutoPlacementProvider = parsePlacementProvider(process.env.AUTO_PLACEMENT_PROVIDER, 'booky');
 const LIVE_DIAG_MAX_ENTRIES = parsePositiveIntOr(process.env.LIVE_DIAG_MAX_ENTRIES, 1000);
 const LIVE_DIAG_PERSIST_FILE = parseBooleanFromEnv(process.env.LIVE_DIAG_PERSIST_FILE, true);
@@ -156,6 +164,11 @@ const LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES = parseAllowedSocketFamilies(
     ['match_result', 'totals', 'double_chance']
 );
 const LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES_SET = new Set(LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES);
+const LIVE_SCANNER_DB_REFRESH_EVERY_N_CYCLES = parsePositiveIntOr(process.env.LIVE_SCANNER_DB_REFRESH_EVERY_N_CYCLES, 2);
+const LIVE_SCANNER_MAX_PUBLISHED_OPS = parsePositiveIntOr(process.env.LIVE_SCANNER_MAX_PUBLISHED_OPS, 50);
+const LIVE_SCANNER_MAX_AUTOPLACEMENTS_PER_CYCLE = parsePositiveIntOr(process.env.LIVE_SCANNER_MAX_AUTOPLACEMENTS_PER_CYCLE, 6);
+const LIVE_ACTIVE_BETS_SYNC_EVERY_N_CYCLES = parsePositiveIntOr(process.env.LIVE_ACTIVE_BETS_SYNC_EVERY_N_CYCLES, 2);
+const LIVE_SCANNER_CYCLE_BUDGET_MS = parsePositiveIntOr(process.env.LIVE_SCANNER_CYCLE_BUDGET_MS, 12000);
 
 const autoSnipeInFlight = new Set();
 const autoSnipeLastAttemptAt = new Map();
@@ -187,7 +200,32 @@ let lastLivePipelineStats = {
     hybridRequotesAttempted: 0,
     hybridRequotesApplied: 0,
     hybridReason: null,
-    wsapiSocketsEnabledCount: null
+    wsapiSocketsEnabledCount: null,
+    cycleElapsedMs: 0,
+    cycleBudgetMs: LIVE_SCANNER_CYCLE_BUDGET_MS,
+    cycleBudgetExceeded: false,
+    cycleOpsCapped: 0,
+    autoPlacementsAttempted: 0,
+    autoPlacementsSkippedByCycleCap: 0
+};
+
+const capPublishedOpsForCycle = (ops = []) => {
+    if (!Array.isArray(ops) || ops.length <= LIVE_SCANNER_MAX_PUBLISHED_OPS) {
+        return { items: Array.isArray(ops) ? ops : [], capped: 0 };
+    }
+
+    const ranked = [...ops].sort((a, b) => {
+        const evA = Number(a?.ev);
+        const evB = Number(b?.ev);
+        const safeA = Number.isFinite(evA) ? evA : -999;
+        const safeB = Number.isFinite(evB) ? evB : -999;
+        return safeB - safeA;
+    });
+
+    return {
+        items: ranked.slice(0, LIVE_SCANNER_MAX_PUBLISHED_OPS),
+        capped: ranked.length - LIVE_SCANNER_MAX_PUBLISHED_OPS
+    };
 };
 
 const appendLiveDecisionLog = (entry = {}) => {
@@ -258,6 +296,7 @@ const isAutoSnipeOpportunity = (op = {}) => {
 
 const isRealPlacementEnabledForProvider = (provider = 'booky') => {
     const normalized = parsePlacementProvider(provider, 'booky');
+    if (normalized === 'auto') return BOOKY_REAL_PLACEMENT_ENABLED || PINNACLE_REAL_PLACEMENT_ENABLED;
     if (normalized === 'pinnacle') return PINNACLE_REAL_PLACEMENT_ENABLED;
     return BOOKY_REAL_PLACEMENT_ENABLED;
 };
@@ -265,6 +304,12 @@ const isRealPlacementEnabledForProvider = (provider = 'booky') => {
 const buildPlacementMode = ({ provider = 'booky', realEnabled = false } = {}) => {
     const p = parsePlacementProvider(provider, 'booky');
     return `${p}-${realEnabled ? 'real' : 'sim'}`;
+};
+
+const resolveAutoSnipeStakeCapByProvider = (provider = 'booky') => {
+    const p = parsePlacementProvider(provider, 'booky');
+    if (p === 'pinnacle') return AUTO_SNIPE_MAX_STAKE_PINNACLE_SOL;
+    return AUTO_SNIPE_MAX_STAKE_BOOKY_SOL;
 };
 
 export const getAutoPlacementProvider = () => runtimeAutoPlacementProvider;
@@ -315,11 +360,20 @@ const maybeRunAutoSnipe = async (opportunity) => {
     if (!AUTO_SNIPE_ENABLED) return { triggered: false, reason: 'disabled' };
     if (!isAutoSnipeOpportunity(opportunity)) return { triggered: false, reason: 'type-not-enabled' };
 
-    const placementProvider = getAutoPlacementProvider();
-    const providerRealEnabled = isRealPlacementEnabledForProvider(placementProvider);
+    const configuredProvider = getAutoPlacementProvider();
+    const placementProviders = configuredProvider === 'auto'
+        ? ['booky', 'pinnacle']
+        : [configuredProvider];
 
-    if (AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED && !providerRealEnabled) {
-        return { triggered: false, reason: `${placementProvider}-real-disabled`, placementProvider };
+    if (AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED) {
+        const hasAnyEnabled = placementProviders.some((provider) => isRealPlacementEnabledForProvider(provider));
+        if (!hasAnyEnabled) {
+            return {
+                triggered: false,
+                reason: configuredProvider === 'auto' ? 'all-providers-real-disabled' : `${configuredProvider}-real-disabled`,
+                placementProvider: configuredProvider
+            };
+        }
     }
 
     pruneAutoSnipeState();
@@ -339,42 +393,9 @@ const maybeRunAutoSnipe = async (opportunity) => {
         return { triggered: false, reason: 'ev-guard' };
     }
 
-    const stake = Number(opportunity?.kellyStake || 0);
-    if (!Number.isFinite(stake) || stake < AUTO_SNIPE_MIN_STAKE_SOL) {
+    const requestedStake = Number(opportunity?.kellyStake || 0);
+    if (!Number.isFinite(requestedStake) || requestedStake < AUTO_SNIPE_MIN_STAKE_SOL) {
         return { triggered: false, reason: 'stake-guard' };
-    }
-
-    if (!AUTO_SNIPE_DRY_RUN && placementProvider === 'booky' && providerRealEnabled) {
-        let balance = await getAutoSnipeBookyBalance({ forceRefresh: false });
-        let balanceAmount = Number(balance?.amount);
-
-        // Si detectamos saldo en cero, refrescamos una vez para confirmar y evitar falso bloqueo por caché viejo.
-        if (Number.isFinite(balanceAmount) && balanceAmount <= 0) {
-            balance = await getAutoSnipeBookyBalance({ forceRefresh: true });
-            balanceAmount = Number(balance?.amount);
-        }
-
-        if (Number.isFinite(balanceAmount) && balanceAmount <= 0) {
-            const currency = String(balance?.currency || 'PEN').toUpperCase();
-            return {
-                triggered: false,
-                reason: 'insufficient-balance',
-                placementProvider,
-                balanceAmount,
-                balanceCurrency: currency
-            };
-        }
-
-        if (Number.isFinite(balanceAmount) && stake > balanceAmount) {
-            const currency = String(balance?.currency || 'PEN').toUpperCase();
-            return {
-                triggered: false,
-                reason: 'insufficient-balance',
-                placementProvider,
-                balanceAmount,
-                balanceCurrency: currency
-            };
-        }
     }
 
     const opEventId = String(opportunity?.eventId || opportunity?.id || '');
@@ -419,180 +440,303 @@ const maybeRunAutoSnipe = async (opportunity) => {
     autoSnipeInFlight.add(key);
     autoSnipeLastAttemptAt.set(key, now);
 
-    let ticketIdForLog = 'n/a';
-
     try {
         if (AUTO_SNIPE_DRY_RUN) {
-            console.log(`🤖 [AUTO_SNIPE_DRY_RUN] ${opportunity.match} | ${opportunity.selection} | EV=${evPercent.toFixed(2)}% | stake=S/. ${stake.toFixed(2)}`);
-            return { triggered: true, dryRun: true };
+            console.log(
+                `🤖 [AUTO_SNIPE_DRY_RUN] providers=${placementProviders.join(',')} ` +
+                `${opportunity.match} | ${opportunity.selection} | EV=${evPercent.toFixed(2)}% | stakeReq=S/. ${requestedStake.toFixed(2)}`
+            );
+            return { triggered: true, dryRun: true, placementProvider: configuredProvider };
         }
 
-        const placementMode = buildPlacementMode({ provider: placementProvider, realEnabled: providerRealEnabled });
-        const runPlacementOnce = async () => {
-            if (placementProvider === 'pinnacle' && providerRealEnabled) {
-                const preflight = await preflightPinnacleRealQuoteByOpportunity(opportunity);
-                if (!preflight?.quoteable) {
-                    return {
-                        ok: false,
-                        reason: `not-quoteable:${String(preflight?.status || 'unknown')}`,
-                        preflight
-                    };
+        const providerResults = [];
+
+        for (const placementProvider of placementProviders) {
+            const providerRealEnabled = isRealPlacementEnabledForProvider(placementProvider);
+            if (AUTO_SNIPE_REQUIRE_REAL_PLACEMENT_ENABLED && !providerRealEnabled) {
+                providerResults.push({
+                    provider: placementProvider,
+                    triggered: false,
+                    reason: `${placementProvider}-real-disabled`
+                });
+                continue;
+            }
+
+            const providerStakeCap = resolveAutoSnipeStakeCapByProvider(placementProvider);
+            const hasStakeCap = Number.isFinite(Number(providerStakeCap)) && Number(providerStakeCap) > 0;
+            const stake = hasStakeCap
+                ? Number(Math.min(requestedStake, Number(providerStakeCap)).toFixed(2))
+                : requestedStake;
+
+            if (stake < AUTO_SNIPE_MIN_STAKE_SOL) {
+                providerResults.push({
+                    provider: placementProvider,
+                    triggered: false,
+                    reason: 'stake-cap-below-min',
+                    requestedStake,
+                    maxStakeCap: providerStakeCap
+                });
+                continue;
+            }
+
+            const opportunityForPlacement = stake !== requestedStake
+                ? {
+                    ...(opportunity || {}),
+                    kellyStake: stake,
+                    stake
+                }
+                : opportunity;
+
+            if (placementProvider === 'booky' && providerRealEnabled) {
+                let balance = await getAutoSnipeBookyBalance({ forceRefresh: false });
+                let balanceAmount = Number(balance?.amount);
+
+                if (Number.isFinite(balanceAmount) && balanceAmount <= 0) {
+                    balance = await getAutoSnipeBookyBalance({ forceRefresh: true });
+                    balanceAmount = Number(balance?.amount);
+                }
+
+                if (Number.isFinite(balanceAmount) && balanceAmount <= 0) {
+                    const currency = String(balance?.currency || 'PEN').toUpperCase();
+                    providerResults.push({
+                        provider: placementProvider,
+                        triggered: false,
+                        reason: 'insufficient-balance',
+                        balanceAmount,
+                        balanceCurrency: currency
+                    });
+                    continue;
+                }
+
+                if (Number.isFinite(balanceAmount) && stake > balanceAmount) {
+                    const currency = String(balance?.currency || 'PEN').toUpperCase();
+                    providerResults.push({
+                        provider: placementProvider,
+                        triggered: false,
+                        reason: 'insufficient-balance',
+                        balanceAmount,
+                        balanceCurrency: currency
+                    });
+                    continue;
                 }
             }
 
-            const ticket = placementProvider === 'pinnacle'
-                ? await preparePinnacleSemiAutoTicket(opportunity)
-                : await prepareSemiAutoTicket(opportunity);
-            const ticketId = ticket?.id;
-            ticketIdForLog = ticketId || 'n/a';
-            if (!ticketId) {
-                return { ok: false, reason: 'ticket-missing-id' };
-            }
+            let ticketIdForLog = 'n/a';
 
-            const placementResult = placementProvider === 'pinnacle'
-                ? (providerRealEnabled
-                    ? await confirmPinnacleRealPlacementFast(ticketId)
-                    : await confirmPinnacleSemiAutoTicket(ticketId))
-                : (providerRealEnabled
-                    ? await confirmRealPlacementFast(ticketId)
-                    : await confirmSemiAutoTicket(ticketId));
-            return { ok: true, ticketId, placementResult };
-        };
-
-        let placementAttempt = await runPlacementOnce();
-        if (!placementAttempt.ok) {
-            return { triggered: false, reason: placementAttempt.reason || 'ticket-missing-id' };
-        }
-
-        const extractMsg = (err) => String(err?.message || '').toLowerCase();
-        const shouldRetryRequote = (err) => extractMsg(err).includes('re-quote requerido') || extractMsg(err).includes('cuota cambió demasiado');
-
-        try {
-            // noop: ya tenemos resultado del primer intento
-        } catch (_) {
-            // unreachable
-        }
-
-        const placementResult = placementAttempt.placementResult;
-        autoSnipePlacedAtHistory.push(Date.now());
-        const status = String(placementResult?.ticket?.status || (placementMode === 'real' ? 'REAL_CONFIRMED_FAST' : 'CONFIRMED'));
-        const portfolioBetId = placementResult?.mirroredBet?.id || placementResult?.bet?.id || placementResult?.ticket?.portfolioBetId || 'n/a';
-        console.log(
-            `✅ [AUTO_SNIPE] Resultado final=CONFIRMED mode=${placementMode.toUpperCase()} | ${opportunity.match} (${opportunity.selection}) ` +
-            `ticket=${placementAttempt.ticketId} status=${status} portfolioBetId=${portfolioBetId}`
-        );
-        return {
-            triggered: true,
-            dryRun: false,
-            ticketId: placementAttempt.ticketId,
-            outcome: 'confirmed',
-            status,
-            portfolioBetId,
-            placementMode,
-            placementProvider
-        };
-    } catch (error) {
-        const placementMode = buildPlacementMode({ provider: placementProvider, realEnabled: providerRealEnabled });
-        const msg = error?.message || 'Error desconocido';
-        const code = String(error?.code || '');
-
-        const lowerMsg = String(msg || '').toLowerCase();
-        const isRequote = lowerMsg.includes('re-quote requerido') || lowerMsg.includes('cuota cambió demasiado');
-        if (isRequote) {
             try {
-                console.warn(`↻ [AUTO_SNIPE] Re-quote detectado. Reintentando una vez con cuota refrescada: ${opportunity?.match || 'n/a'}`);
-                const retryTicket = placementProvider === 'pinnacle'
-                    ? await preparePinnacleSemiAutoTicket(opportunity)
-                    : await prepareSemiAutoTicket(opportunity);
-                const retryTicketId = retryTicket?.id;
-                ticketIdForLog = retryTicketId || ticketIdForLog;
-                if (!retryTicketId) {
-                    return { triggered: false, reason: 'ticket-missing-id' };
+                const placementMode = buildPlacementMode({ provider: placementProvider, realEnabled: providerRealEnabled });
+                const runPlacementOnce = async () => {
+                    if (placementProvider === 'pinnacle' && providerRealEnabled) {
+                        const preflight = await preflightPinnacleRealQuoteByOpportunity(opportunityForPlacement);
+                        if (!preflight?.quoteable) {
+                            return {
+                                ok: false,
+                                reason: `not-quoteable:${String(preflight?.status || 'unknown')}`,
+                                preflight
+                            };
+                        }
+                    }
+
+                    const ticket = placementProvider === 'pinnacle'
+                        ? await preparePinnacleSemiAutoTicket(opportunityForPlacement)
+                        : await prepareSemiAutoTicket(opportunityForPlacement);
+                    const ticketId = ticket?.id;
+                    ticketIdForLog = ticketId || 'n/a';
+                    if (!ticketId) {
+                        return { ok: false, reason: 'ticket-missing-id' };
+                    }
+
+                    const placementResult = placementProvider === 'pinnacle'
+                        ? (providerRealEnabled
+                            ? await confirmPinnacleRealPlacementFast(ticketId)
+                            : await confirmPinnacleSemiAutoTicket(ticketId))
+                        : (providerRealEnabled
+                            ? await confirmRealPlacementFast(ticketId)
+                            : await confirmSemiAutoTicket(ticketId));
+                    return { ok: true, ticketId, placementResult };
+                };
+
+                const placementAttempt = await runPlacementOnce();
+                if (!placementAttempt.ok) {
+                    providerResults.push({
+                        provider: placementProvider,
+                        triggered: false,
+                        reason: placementAttempt.reason || 'ticket-missing-id'
+                    });
+                    continue;
                 }
 
-                const retryResult = placementProvider === 'pinnacle'
-                    ? (providerRealEnabled
-                        ? await confirmPinnacleRealPlacementFast(retryTicketId)
-                        : await confirmPinnacleSemiAutoTicket(retryTicketId))
-                    : (providerRealEnabled
-                        ? await confirmRealPlacementFast(retryTicketId)
-                        : await confirmSemiAutoTicket(retryTicketId));
-
+                const placementResult = placementAttempt.placementResult;
                 autoSnipePlacedAtHistory.push(Date.now());
-                const retryStatus = String(retryResult?.ticket?.status || (placementMode === 'real' ? 'REAL_CONFIRMED_FAST' : 'CONFIRMED'));
-                const retryPortfolioBetId = retryResult?.mirroredBet?.id || retryResult?.bet?.id || retryResult?.ticket?.portfolioBetId || 'n/a';
+                const status = String(placementResult?.ticket?.status || (placementMode === 'real' ? 'REAL_CONFIRMED_FAST' : 'CONFIRMED'));
+                const portfolioBetId = placementResult?.mirroredBet?.id || placementResult?.bet?.id || placementResult?.ticket?.portfolioBetId || 'n/a';
                 console.log(
-                    `✅ [AUTO_SNIPE] Resultado final=CONFIRMED mode=${placementMode.toUpperCase()} (retry) | ${opportunity.match} (${opportunity.selection}) ` +
-                    `ticket=${retryTicketId} status=${retryStatus} portfolioBetId=${retryPortfolioBetId}`
+                    `✅ [AUTO_SNIPE] Resultado final=CONFIRMED mode=${placementMode.toUpperCase()} | ${opportunity.match} (${opportunity.selection}) ` +
+                    `ticket=${placementAttempt.ticketId} status=${status} portfolioBetId=${portfolioBetId}`
                 );
                 return {
                     triggered: true,
                     dryRun: false,
-                    ticketId: retryTicketId,
+                    ticketId: placementAttempt.ticketId,
                     outcome: 'confirmed',
-                    status: retryStatus,
-                    portfolioBetId: retryPortfolioBetId,
+                    status,
+                    portfolioBetId,
                     placementMode,
                     placementProvider,
-                    retry: true
+                    configuredProvider
                 };
-            } catch (retryErr) {
-                const retryMsg = retryErr?.message || msg;
-                console.warn(`⚠️ [AUTO_SNIPE] Reintento por re-quote falló para ${opportunity?.match || 'n/a'}: ${retryMsg}`);
-                return { triggered: false, reason: 'execution-error', error: retryMsg };
+            } catch (error) {
+                const placementMode = buildPlacementMode({ provider: placementProvider, realEnabled: providerRealEnabled });
+                const msg = error?.message || 'Error desconocido';
+                const code = String(error?.code || '');
+
+                const lowerMsg = String(msg || '').toLowerCase();
+                const isRequote = lowerMsg.includes('re-quote requerido') || lowerMsg.includes('cuota cambió demasiado');
+                if (isRequote) {
+                    try {
+                        console.warn(`↻ [AUTO_SNIPE] Re-quote detectado. Reintentando una vez con cuota refrescada: ${opportunity?.match || 'n/a'}`);
+                        const retryTicket = placementProvider === 'pinnacle'
+                            ? await preparePinnacleSemiAutoTicket(opportunityForPlacement)
+                            : await prepareSemiAutoTicket(opportunityForPlacement);
+                        const retryTicketId = retryTicket?.id;
+                        ticketIdForLog = retryTicketId || ticketIdForLog;
+                        if (!retryTicketId) {
+                            providerResults.push({
+                                provider: placementProvider,
+                                triggered: false,
+                                reason: 'ticket-missing-id'
+                            });
+                            continue;
+                        }
+
+                        const retryResult = placementProvider === 'pinnacle'
+                            ? (providerRealEnabled
+                                ? await confirmPinnacleRealPlacementFast(retryTicketId)
+                                : await confirmPinnacleSemiAutoTicket(retryTicketId))
+                            : (providerRealEnabled
+                                ? await confirmRealPlacementFast(retryTicketId)
+                                : await confirmSemiAutoTicket(retryTicketId));
+
+                        autoSnipePlacedAtHistory.push(Date.now());
+                        const retryStatus = String(retryResult?.ticket?.status || (placementMode === 'real' ? 'REAL_CONFIRMED_FAST' : 'CONFIRMED'));
+                        const retryPortfolioBetId = retryResult?.mirroredBet?.id || retryResult?.bet?.id || retryResult?.ticket?.portfolioBetId || 'n/a';
+                        console.log(
+                            `✅ [AUTO_SNIPE] Resultado final=CONFIRMED mode=${placementMode.toUpperCase()} (retry) | ${opportunity.match} (${opportunity.selection}) ` +
+                            `ticket=${retryTicketId} status=${retryStatus} portfolioBetId=${retryPortfolioBetId}`
+                        );
+                        return {
+                            triggered: true,
+                            dryRun: false,
+                            ticketId: retryTicketId,
+                            outcome: 'confirmed',
+                            status: retryStatus,
+                            portfolioBetId: retryPortfolioBetId,
+                            placementMode,
+                            placementProvider,
+                            configuredProvider,
+                            retry: true
+                        };
+                    } catch (retryErr) {
+                        const retryMsg = retryErr?.message || msg;
+                        console.warn(`⚠️ [AUTO_SNIPE] Reintento por re-quote falló para ${opportunity?.match || 'n/a'}: ${retryMsg}`);
+                        providerResults.push({
+                            provider: placementProvider,
+                            triggered: false,
+                            reason: 'execution-error',
+                            error: retryMsg
+                        });
+                        continue;
+                    }
+                }
+
+                if (code === 'BOOKY_REAL_PLACEMENT_REJECTED' || code === 'PINNACLE_REAL_REJECTED') {
+                    console.warn(
+                        `❌ [AUTO_SNIPE] Resultado final=REJECTED | ${opportunity?.match || 'n/a'} ` +
+                        `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
+                    );
+                    providerResults.push({
+                        provider: placementProvider,
+                        triggered: true,
+                        dryRun: false,
+                        outcome: 'rejected',
+                        reason: 'provider-rejected',
+                        error: msg,
+                        code,
+                        placementMode,
+                        placementProvider,
+                        configuredProvider
+                    });
+                    if (configuredProvider !== 'auto') {
+                        return providerResults[providerResults.length - 1];
+                    }
+                    continue;
+                }
+
+                if (code === 'BOOKY_INSUFFICIENT_BALANCE') {
+                    console.warn(
+                        `💸 [AUTO_SNIPE] Bloqueado por saldo insuficiente | ${opportunity?.match || 'n/a'} ` +
+                        `(${opportunity?.selection || 'n/a'}) | ${msg}`
+                    );
+                    providerResults.push({
+                        provider: placementProvider,
+                        triggered: false,
+                        reason: 'insufficient-balance',
+                        error: msg,
+                        code,
+                        placementProvider
+                    });
+                    continue;
+                }
+
+                if (code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') {
+                    console.warn(
+                        `❓ [AUTO_SNIPE] Resultado final=UNCERTAIN | ${opportunity?.match || 'n/a'} ` +
+                        `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
+                    );
+                    return {
+                        triggered: true,
+                        dryRun: false,
+                        outcome: 'uncertain',
+                        reason: 'provider-uncertain',
+                        error: msg,
+                        code,
+                        placementMode,
+                        placementProvider,
+                        configuredProvider
+                    };
+                }
+
+                console.warn(`⚠️ [AUTO_SNIPE] Falló ejecución para ${opportunity?.match || 'n/a'}: ${msg}`);
+                providerResults.push({
+                    provider: placementProvider,
+                    triggered: false,
+                    reason: 'execution-error',
+                    error: msg,
+                    placementProvider
+                });
             }
         }
 
-        if (code === 'BOOKY_REAL_PLACEMENT_REJECTED' || code === 'PINNACLE_REAL_REJECTED') {
-            console.warn(
-                `❌ [AUTO_SNIPE] Resultado final=REJECTED | ${opportunity?.match || 'n/a'} ` +
-                `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
-            );
+        const rejectedResult = providerResults.find((row) => row?.triggered && row?.outcome === 'rejected');
+        if (rejectedResult) {
             return {
-                triggered: true,
-                dryRun: false,
-                outcome: 'rejected',
-                reason: 'provider-rejected',
-                error: msg,
-                code,
-                placementMode,
-                placementProvider
+                ...rejectedResult,
+                attemptedProviders: providerResults.map((row) => ({
+                    provider: row?.provider || row?.placementProvider || null,
+                    reason: row?.reason || row?.outcome || null
+                }))
             };
         }
 
-        if (code === 'BOOKY_INSUFFICIENT_BALANCE') {
-            console.warn(
-                `💸 [AUTO_SNIPE] Bloqueado por saldo insuficiente | ${opportunity?.match || 'n/a'} ` +
-                `(${opportunity?.selection || 'n/a'}) | ${msg}`
-            );
-            return {
-                triggered: false,
-                reason: 'insufficient-balance',
-                error: msg,
-                code,
-                placementProvider
-            };
-        }
-
-        if (code === 'BOOKY_REAL_CONFIRMATION_UNCERTAIN') {
-            console.warn(
-                `❓ [AUTO_SNIPE] Resultado final=UNCERTAIN | ${opportunity?.match || 'n/a'} ` +
-                `(${opportunity?.selection || 'n/a'}) ticket=${ticketIdForLog} | ${msg}`
-            );
-            return {
-                triggered: true,
-                dryRun: false,
-                outcome: 'uncertain',
-                reason: 'provider-uncertain',
-                error: msg,
-                code,
-                placementMode,
-                placementProvider
-            };
-        }
-
-        console.warn(`⚠️ [AUTO_SNIPE] Falló ejecución para ${opportunity?.match || 'n/a'}: ${msg}`);
-        return { triggered: false, reason: 'execution-error', error: msg, placementProvider };
+        return {
+            triggered: false,
+            reason: configuredProvider === 'auto' ? 'all-providers-skipped' : 'provider-skipped',
+            placementProvider: configuredProvider,
+            attemptedProviders: providerResults.map((row) => ({
+                provider: row?.provider || row?.placementProvider || null,
+                reason: row?.reason || row?.outcome || null
+            }))
+        };
     } finally {
         autoSnipeInFlight.delete(key);
     }
@@ -1108,9 +1252,21 @@ export const startBackgroundScanner = () => {
     
     const loop = async () => {
         let pollMode = 'idle';
+        const cycleStartedAtMs = Date.now();
+        const getCycleElapsedMs = () => Date.now() - cycleStartedAtMs;
+        const isCycleBudgetExceeded = () => getCycleElapsedMs() >= LIVE_SCANNER_CYCLE_BUDGET_MS;
+        let cycleBudgetExceeded = false;
+        let cycleOpsCapped = 0;
+        let autoPlacementsAttempted = 0;
+        let autoPlacementsSkippedByCycleCap = 0;
+
         try {
-            await initDB(); // Refrescar DB en cada ciclo
             ticks++;
+
+            if (ticks === 1 || (ticks % LIVE_SCANNER_DB_REFRESH_EVERY_N_CYCLES) === 0) {
+                await initDB(); // Refresco periódico para mantener coherencia sin castigar cada ciclo.
+            }
+
             pruneQuoteStabilityCache();
             
             // ---------------------------------------------------------
@@ -1156,7 +1312,7 @@ export const startBackgroundScanner = () => {
             let socketPrematchRefreshApplied = 0;
             let socketPrematchRefreshChanged = 0;
 
-            if (socketDirtyConsumed > 0) {
+            if (socketDirtyConsumed > 0 && !isCycleBudgetExceeded()) {
                 const prematchRefreshResult = await applySocketDrivenPrematchRefresh(socketDirtySignals);
                 socketPrematchRefreshAttempted = Number(prematchRefreshResult?.attempted || 0);
                 socketPrematchRefreshApplied = Number(prematchRefreshResult?.applied || 0);
@@ -1168,6 +1324,8 @@ export const startBackgroundScanner = () => {
                         `applied=${socketPrematchRefreshApplied} changed=${socketPrematchRefreshChanged}`
                     );
                 }
+            } else if (socketDirtyConsumed > 0) {
+                cycleBudgetExceeded = true;
             }
             
             const socketDiagnostics = getAcityLiveSocketDiagnostics();
@@ -1333,16 +1491,29 @@ export const startBackgroundScanner = () => {
                 }
 
                 if (socketDirtyConsumed > 0 && ops.length > 0) {
-                    const requoteResult = await applySocketDrivenRequotes(ops, socketDirtySignals);
-                    ops = Array.isArray(requoteResult?.ops) ? requoteResult.ops : ops;
-                    socketRequotesAttempted = Number(requoteResult?.attempted || 0);
-                    socketRequotesApplied = Number(requoteResult?.applied || 0);
+                    if (!isCycleBudgetExceeded()) {
+                        const requoteResult = await applySocketDrivenRequotes(ops, socketDirtySignals);
+                        ops = Array.isArray(requoteResult?.ops) ? requoteResult.ops : ops;
+                        socketRequotesAttempted = Number(requoteResult?.attempted || 0);
+                        socketRequotesApplied = Number(requoteResult?.applied || 0);
 
-                    if (socketRequotesAttempted > 0) {
-                        console.log(
-                            `   🧵 Socket requote: dirty=${socketDirtyLiveConsumed} attempted=${socketRequotesAttempted} applied=${socketRequotesApplied}`
-                        );
+                        if (socketRequotesAttempted > 0) {
+                            console.log(
+                                `   🧵 Socket requote: dirty=${socketDirtyLiveConsumed} attempted=${socketRequotesAttempted} applied=${socketRequotesApplied}`
+                            );
+                        }
+                    } else {
+                        cycleBudgetExceeded = true;
                     }
+                }
+            }
+
+            if (Array.isArray(ops) && ops.length > LIVE_SCANNER_MAX_PUBLISHED_OPS) {
+                const capped = capPublishedOpsForCycle(ops);
+                ops = capped.items;
+                cycleOpsCapped = capped.capped;
+                if (cycleOpsCapped > 0 && ticks % 2 === 0) {
+                    console.log(`   ✂️ Cap ciclo live: recortadas ${cycleOpsCapped} oportunidades (max=${LIVE_SCANNER_MAX_PUBLISHED_OPS}).`);
                 }
             }
 
@@ -1350,6 +1521,41 @@ export const startBackgroundScanner = () => {
             if (ops && ops.length > 0) {
                  console.log(`   🎯 Oportunidades LIVE encontradas: ${ops.length}`);
                 for (const op of ops) {
+                    if (isCycleBudgetExceeded()) {
+                        cycleBudgetExceeded = true;
+                        appendLiveDecisionLog({
+                            type: String(op?.type || op?.strategy || 'UNKNOWN').toUpperCase(),
+                            eventId: op?.eventId || op?.id || null,
+                            match: op?.match || null,
+                            selection: op?.selection || op?.action || null,
+                            decision: 'not-triggered',
+                            outcome: 'manual',
+                            reason: 'cycle-budget-exceeded'
+                        });
+                        continue;
+                    }
+
+                    const isAutoCandidate = AUTO_SNIPE_ENABLED && isAutoSnipeOpportunity(op);
+                    if (isAutoCandidate && autoPlacementsAttempted >= LIVE_SCANNER_MAX_AUTOPLACEMENTS_PER_CYCLE) {
+                        autoPlacementsSkippedByCycleCap += 1;
+                        appendLiveDecisionLog({
+                            type: String(op?.type || op?.strategy || 'UNKNOWN').toUpperCase(),
+                            eventId: op?.eventId || op?.id || null,
+                            match: op?.match || null,
+                            selection: op?.selection || op?.action || null,
+                            ev: Number(op?.ev || 0),
+                            kellyStake: Number(op?.kellyStake || 0),
+                            decision: 'not-triggered',
+                            outcome: 'manual',
+                            reason: 'cycle-auto-placement-cap'
+                        });
+                        continue;
+                    }
+
+                    if (isAutoCandidate) {
+                        autoPlacementsAttempted += 1;
+                    }
+
                     // Modo por defecto: semi-automático.
                     // Si AUTO_SNIPE está activo, ejecuta los tipos permitidos con guardas.
                     const autoResult = await maybeRunAutoSnipe(op);
@@ -1449,7 +1655,13 @@ export const startBackgroundScanner = () => {
                                 hybridRequotesAttempted,
                                 hybridRequotesApplied,
                                 hybridReason,
-                                wsapiSocketsEnabledCount
+                                wsapiSocketsEnabledCount,
+                                cycleElapsedMs: getCycleElapsedMs(),
+                                cycleBudgetMs: LIVE_SCANNER_CYCLE_BUDGET_MS,
+                                cycleBudgetExceeded,
+                                cycleOpsCapped,
+                                autoPlacementsAttempted,
+                                autoPlacementsSkippedByCycleCap
                         });
 
             // (Pre-match block moved up)
@@ -1458,7 +1670,8 @@ export const startBackgroundScanner = () => {
             // 3. MONITORING (Actualizar salidas)
             // ---------------------------------------------------------
             // Usamos los rawEvents para el tracking solo cuando hubo full scan.
-            if (ranFullLiveOverview && rawEvents) {
+            const shouldSyncActiveBetsNow = (ticks % LIVE_ACTIVE_BETS_SYNC_EVERY_N_CYCLES) === 0;
+            if (ranFullLiveOverview && rawEvents && shouldSyncActiveBetsNow) {
                 // [MOD] Obtener Pinnacle Feed para sincronizar activeBets también
                 let pinFeed = [];
                 try {
@@ -1468,6 +1681,8 @@ export const startBackgroundScanner = () => {
                 } catch(e) {}
                 
                 await updateActiveBetsWithLiveData(rawEvents, pinFeed);
+            } else if (ranFullLiveOverview && rawEvents && !shouldSyncActiveBetsNow && ticks % 6 === 0) {
+                console.log(`   🕒 Sync activeBets diferido (cada ${LIVE_ACTIVE_BETS_SYNC_EVERY_N_CYCLES} ciclos).`);
             } else if (hybridSelectiveCycle && ticks % 10 === 0) {
                 console.log('   🛰️ Hybrid selectivo activo: se omite refresh de activeBets en este subciclo.');
             }
@@ -1562,6 +1777,8 @@ export const getLiveDecisionDiagnostics = ({ limit = 200 } = {}) => {
             pinnacleRealPlacementEnabled: PINNACLE_REAL_PLACEMENT_ENABLED,
             minEvPercent: AUTO_SNIPE_MIN_EV_PERCENT,
             minStakeSol: AUTO_SNIPE_MIN_STAKE_SOL,
+            maxStakeBookySol: AUTO_SNIPE_MAX_STAKE_BOOKY_SOL,
+            maxStakePinnacleSol: AUTO_SNIPE_MAX_STAKE_PINNACLE_SOL,
             maxBetsPerHour: AUTO_SNIPE_MAX_BETS_PER_HOUR,
             cooldownPerPickMs: AUTO_SNIPE_COOLDOWN_PER_PICK_MS,
             reentryMinOddImprovementPct: AUTO_SNIPE_REENTRY_MIN_ODD_IMPROVEMENT_PCT,
@@ -1580,7 +1797,12 @@ export const getLiveDecisionDiagnostics = ({ limit = 200 } = {}) => {
             liveHybridSocketColdMinRawMessages: LIVE_HYBRID_SOCKET_COLD_MIN_RAW_MESSAGES,
             liveHybridFullScanEveryNCycles: LIVE_HYBRID_FULL_SCAN_EVERY_N_CYCLES,
             liveHybridSelectiveMaxPerCycle: LIVE_HYBRID_SELECTIVE_MAX_PER_CYCLE,
-            liveHybridSelectiveAllowedFamilies: LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES
+            liveHybridSelectiveAllowedFamilies: LIVE_HYBRID_SELECTIVE_ALLOWED_FAMILIES,
+            liveScannerDbRefreshEveryNCycles: LIVE_SCANNER_DB_REFRESH_EVERY_N_CYCLES,
+            liveScannerMaxPublishedOps: LIVE_SCANNER_MAX_PUBLISHED_OPS,
+            liveScannerMaxAutoPlacementsPerCycle: LIVE_SCANNER_MAX_AUTOPLACEMENTS_PER_CYCLE,
+            liveActiveBetsSyncEveryNCycles: LIVE_ACTIVE_BETS_SYNC_EVERY_N_CYCLES,
+            liveScannerCycleBudgetMs: LIVE_SCANNER_CYCLE_BUDGET_MS
         },
         pipeline: lastLivePipelineStats,
         acitySocketDiagnostics: getAcityLiveSocketDiagnostics(),

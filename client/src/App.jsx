@@ -40,7 +40,7 @@ function normalizePick(obj = {}) {
         return Number.isFinite(line) ? `under_${line}` : 'under';
     }
 
-    return String(obj.selection || obj.action || obj.market || '').replace(/\s+/g, '_');
+    return String(obj.selection || obj.action || obj.market || '').replace(/\s+/g, '_').toLowerCase();
 }
 
 // Helper: Generar ID único por oportunidad (eventId + pick normalizado)
@@ -58,7 +58,12 @@ const REENTRY_MIN_ODD_IMPROVEMENT_PCT = 8;
 const REENTRY_MIN_EV_PERCENT = 3;
 const REENTRY_MIN_STAKE_SOL = 1;
 const MIN_BOOKY_STAKE_SOL = 1;
-const AUTO_PLACEMENT_PROVIDER_ALLOWED = ['booky', 'pinnacle'];
+const AUTO_PLACEMENT_PROVIDER_ALLOWED = ['booky', 'pinnacle', 'auto'];
+const AUTO_PLACEMENT_PROVIDER_LABELS = {
+    booky: 'Booky',
+    pinnacle: 'Pinnacle',
+    auto: 'Auto'
+};
 const LIVE_REQUOTE_RETRY_DELAY_MS = 900;
 const LIVE_MANUAL_MAX_ODD_DROP_PCT = (() => {
     const raw = Number(import.meta?.env?.VITE_LIVE_MANUAL_MAX_ODD_DROP_PCT);
@@ -75,6 +80,11 @@ const PINNACLE_PREFLIGHT_TTL_MS = (() => {
 const normalizeAutoPlacementProvider = (value = '', fallback = 'booky') => {
     const normalized = String(value || '').trim().toLowerCase();
     return AUTO_PLACEMENT_PROVIDER_ALLOWED.includes(normalized) ? normalized : fallback;
+};
+
+const resolveManualPlacementProvider = (value = '', fallback = 'booky') => {
+    const normalized = normalizeAutoPlacementProvider(value, fallback);
+    return normalized === 'auto' ? 'booky' : normalized;
 };
 
 const normalizeAutoPlacementProviderOptions = (values = []) => {
@@ -1103,7 +1113,9 @@ function App() {
     const prematchWsHealthFetchInFlightRef = useRef(false);
     const prematchSseRef = useRef(null);
     const prematchSseReconnectTimerRef = useRef(null);
+    const prematchSseReconnectAttemptRef = useRef(0);
     const lastPrematchSseEventAtRef = useRef(0);
+    const lastPrematchStaleRevalidateAtRef = useRef(0);
     const bookyAccountFetchInFlightRef = useRef(false);
     const lastBookyAccountFetchAttemptAtRef = useRef(0);
     const lastBookyAccountFetchAtRef = useRef(0);
@@ -1115,8 +1127,10 @@ function App() {
     const lastPlacementProviderFetchAtRef = useRef(0);
     const lastPinnacleAccountFetchAtRef = useRef(0);
     const lastPinnacleSettledAutoSyncAtRef = useRef(0);
+    const lastPinnacleOpenAutoSyncAtRef = useRef(0);
     const pinnacleBalanceFetchInFlightRef = useRef(false);
     const pinnacleSettledAutoSyncInFlightRef = useRef(false);
+    const pinnacleOpenAutoSyncInFlightRef = useRef(false);
     const latestPortfolioActiveBetsRef = useRef([]);
     const latestBookyHistoryRef = useRef([]);
     const activeTabRef = useRef(activeTab);
@@ -1129,6 +1143,8 @@ function App() {
     const remoteOpenEventIdsRef = useRef(new Set());
     const autoTokenRenewInFlightRef = useRef(false);
     const lastSilentTokenRenewAttemptAtRef = useRef(0);
+    const lastAutoRenewTokenFingerprintRef = useRef(null);
+    const nextAutoRenewAllowedAtRef = useRef(0);
     const placementProviderFetchInFlightRef = useRef(false);
     const arbitrageExecutingKeysRef = useRef(new Set());
     const arbitrageRiskAutoRefreshTimerRef = useRef(null);
@@ -1137,7 +1153,9 @@ function App() {
     const CORE_POLL_MS = 2000;
     const PREMATCH_POLL_MS = 30000;
     const PREMATCH_WS_HEALTH_POLL_MS = 30000;
-    const PREMATCH_SSE_RECONNECT_MS = 5000;
+    const PREMATCH_SSE_RECONNECT_BASE_MS = 5000;
+    const PREMATCH_SSE_RECONNECT_MAX_MS = 60000;
+    const PREMATCH_SSE_STALE_REVALIDATE_MIN_GAP_MS = 45000;
     const PREMATCH_SSE_WATCHDOG_MS = 90000;
     const ARBITRAGE_POLL_MS = 30000;
     const ARBITRAGE_RISK_AUTO_REFRESH_DEBOUNCE_MS = 800;
@@ -1150,12 +1168,15 @@ function App() {
     const PINNACLE_HISTORY_SYNC_DAYS = 180;
     const PINNACLE_HISTORY_SYNC_LIMIT = 500;
     const PINNACLE_SETTLED_AUTO_SYNC_MS = 45000;
+    const PINNACLE_OPEN_AUTO_SYNC_MS = 45000;
     const BOOKY_HISTORY_LIMIT = 120;
     const BOOKY_HISTORY_LIMIT_FINISHED_REAL = 0;
     const TOKEN_CLOCK_TICK_MS = 1000;
     const TOKEN_AUTO_RENEW_COOLDOWN_MS = 45000;
     const TOKEN_AUTO_RENEW_RETRY_ON_FAILURE_MS = 8000;
-    const TOKEN_AUTO_RENEW_LEAD_MINUTES = 1;
+    const TOKEN_AUTO_RENEW_LEAD_MINUTES = 2;
+    const TOKEN_AUTO_RENEW_SAME_TOKEN_RETRY_MS = 2 * 60 * 1000;
+    const TOKEN_AUTO_RENEW_EXPIRED_RETRY_MS = 45 * 1000;
   
   // [NEW] Local optimismo state: IDs recently interacted with (USING REFS TO AVOID STALE CLOSURES IN INTERVAL)
   const localDiscardedIdsRef = useRef(new Set());
@@ -1464,7 +1485,7 @@ function App() {
                 : `/api/booky/account?historyLimit=${selectedHistoryLimit}`;
             const shouldFetchPlacementProvider = forceBookyRefresh || (nowMs - lastPlacementProviderFetchAtRef.current) >= PLACEMENT_PROVIDER_POLL_MS;
             const shouldFetchPinnacleBalance =
-                normalizeAutoPlacementProvider(autoPlacementProvider, 'booky') === 'pinnacle'
+                resolveManualPlacementProvider(autoPlacementProvider, 'booky') === 'pinnacle'
                 && (forceBookyRefresh || (nowMs - lastPinnacleAccountFetchAtRef.current) >= PINNACLE_BALANCE_POLL_MS);
 
             if (shouldFetchPlacementProvider) {
@@ -1788,6 +1809,60 @@ function App() {
                     ]
                 });
 
+                const manualPlacementProvider = resolveManualPlacementProvider(autoPlacementProvider, 'booky');
+                const hasPinnacleExposure = serverActiveBets.some((bet) => isPinnacleProviderBet(bet));
+                const shouldAutoSyncPinnacleOpen = manualPlacementProvider === 'pinnacle' || hasPinnacleExposure;
+                const canRunPinnacleOpenAutoSync =
+                    shouldAutoSyncPinnacleOpen
+                    && !pinnacleHistorySyncInFlightRef.current
+                    && !pinnacleOpenAutoSyncInFlightRef.current
+                    && (Date.now() - Number(lastPinnacleOpenAutoSyncAtRef.current || 0) >= PINNACLE_OPEN_AUTO_SYNC_MS);
+
+                if (canRunPinnacleOpenAutoSync) {
+                    pinnacleOpenAutoSyncInFlightRef.current = true;
+                    pinnacleHistorySyncInFlightRef.current = true;
+                    lastPinnacleOpenAutoSyncAtRef.current = Date.now();
+
+                    void axios.get('/api/pinnacle/history', {
+                        params: {
+                            refresh: 1,
+                            limit: 0,
+                            status: 'unsettled',
+                            days: 30
+                        },
+                        timeout: 30000
+                    })
+                        .then((res) => {
+                            if (!res?.data?.success) {
+                                throw new Error(res?.data?.error || 'No se pudo auto-sincronizar open Pinnacle.');
+                            }
+
+                            const touchedCount = Number(res.data?.reconcileStats?.touchedCount || 0);
+                            setPinnacleHistorySyncMeta((prev) => ({
+                                ...prev,
+                                fetchedAt: res.data?.fetchedAt || new Date().toISOString(),
+                                totalCount: Number(res.data?.totalCount || 0),
+                                touchedCount,
+                                source: res.data?.source || null,
+                                error: null
+                            }));
+
+                            if (touchedCount > 0) {
+                                void fetchData({ forceBookyRefresh: true });
+                            }
+                        })
+                        .catch((error) => {
+                            setPinnacleHistorySyncMeta((prev) => ({
+                                ...prev,
+                                error: error?.message || 'Auto-sync open Pinnacle falló.'
+                            }));
+                        })
+                        .finally(() => {
+                            pinnacleHistorySyncInFlightRef.current = false;
+                            pinnacleOpenAutoSyncInFlightRef.current = false;
+                        });
+                }
+
                 const shouldAutoSyncPinnacleSettled = serverActiveBets.some((bet) => shouldAttemptPinnacleSettledAutoSyncForBet(bet));
                 const canRunPinnacleSettledAutoSync =
                     shouldAutoSyncPinnacleSettled
@@ -2003,7 +2078,7 @@ function App() {
     };
 
     const preflightPrematchRowsForPinnacle = async (rows = [], { force = false } = {}) => {
-        const provider = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+        const provider = resolveManualPlacementProvider(autoPlacementProvider, 'booky');
         if (provider !== 'pinnacle') return;
 
         const list = Array.isArray(rows) ? rows : [];
@@ -2383,12 +2458,10 @@ function App() {
         const marketRaw = String(leg?.market || '').trim();
         const marketLower = marketRaw.toLowerCase();
         const isOneXTwo = marketLower === '1x2';
-        const isDoubleChance = marketLower.includes('double chance') || marketLower.includes('doble oportunidad');
-        if (!isOneXTwo && !isDoubleChance) return null;
+        if (!isOneXTwo) return null;
 
         const selection = normalizeArbitrageLegSelection(marketRaw, leg?.selection || '');
-        if (isOneXTwo && !(selection === 'Home' || selection === 'Draw' || selection === 'Away')) return null;
-        if (isDoubleChance && !(selection === '1X' || selection === 'X2' || selection === '12')) return null;
+        if (!(selection === 'Home' || selection === 'Draw' || selection === 'Away')) return null;
 
         const ev = Number(op?.plan?.roiPercent || 0);
         const realProb = (Number.isFinite(ev) && Number.isFinite(odd) && odd > 1)
@@ -2403,7 +2476,7 @@ function App() {
             match: op?.match || '-',
             league: op?.league || '-',
             date: op?.matchDate || null,
-            market: isOneXTwo ? '1x2' : 'Double Chance',
+            market: '1x2',
             selection,
             action: `Apostar ${selection}`,
             odd,
@@ -2563,6 +2636,21 @@ function App() {
     };
 
     const getArbitrageExecutionKey = (op = {}, idx = 0) => `${String(op?.type || 'ARB')}_${String(op?.eventId || idx)}_${idx}`;
+    const getArbitrageExecutionId = (executionKey = '') => `${String(executionKey || 'ARB')}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const persistArbitrageExecutionAuditEvent = async (executionId, payload = {}) => {
+        const safeExecutionId = String(executionId || '').trim();
+        if (!safeExecutionId) return;
+
+        try {
+            await axios.post('/api/opportunities/arbitrage/execution-audit/events', {
+                executionId: safeExecutionId,
+                ...payload
+            }, { timeout: 8000 });
+        } catch (_) {
+            // Auditoría best-effort: no bloquear flujo principal por fallo de logging.
+        }
+    };
 
     const setArbitrageDualPreflightAudit = (executionKey, payload = {}) => {
         if (!executionKey) return;
@@ -2737,6 +2825,19 @@ function App() {
         }
 
         const riskContext = resolveArbitrageStakeContext();
+        const toExecutionLegSignature = (leg = null) => {
+            const market = String(leg?.opportunity?.market || leg?.leg?.market || '').trim().toLowerCase();
+            const selection = String(leg?.opportunity?.selection || leg?.leg?.selection || '').trim().toUpperCase();
+            if (!market || !selection) return null;
+            return `${market}|${selection}`;
+        };
+
+        const baseDualPlan = buildDualExecutionPlan(baseOpportunity, Array.isArray(baseOpportunity?.legs) ? baseOpportunity.legs : []);
+        const expectedArcadiaSignatures = new Set(
+            (Array.isArray(baseDualPlan?.arcadiaLegs) ? baseDualPlan.arcadiaLegs : [])
+                .map((leg) => toExecutionLegSignature(leg))
+                .filter(Boolean)
+        );
 
         await fetchPrematchData({ force: true });
 
@@ -2753,30 +2854,37 @@ function App() {
                 }
                 : {})
         };
+        const previewSnapshotIds = [];
+        const withPreviewSnapshotIds = (payload = {}) => ({
+            ...payload,
+            previewSnapshotIds: Array.from(new Set(previewSnapshotIds.filter(Boolean)))
+        });
 
         const arbitrageRes = await axios.get('/api/opportunities/arbitrage/preview', {
             params: preflightParams,
             timeout: 25000
         });
+        const firstSnapshotId = String(arbitrageRes?.data?.diagnosticSnapshotId || '').trim();
+        if (firstSnapshotId) previewSnapshotIds.push(firstSnapshotId);
 
         const altenarOnDemandRefresh = arbitrageRes?.data?.onDemandRefresh?.altenarEvent || null;
         if (refreshAltenarEventId && (!altenarOnDemandRefresh || altenarOnDemandRefresh?.success !== true)) {
-            return {
+            return withPreviewSnapshotIds({
                 ok: false,
                 reason: 'altenar-refresh-failed',
                 message: `No se pudo refrescar cuota Altenar en tiempo real antes de ejecutar (${altenarOnDemandRefresh?.message || 'sin detalle'}).`
-            };
+            });
         }
 
         const rows = Array.isArray(arbitrageRes?.data?.data) ? arbitrageRes.data.data : [];
         let refreshedOpportunity = rows.find((row) => isSameArbitrageOpportunity(baseOpportunity, row)) || null;
 
         if (!refreshedOpportunity) {
-            return {
+            return withPreviewSnapshotIds({
                 ok: false,
                 reason: 'missing-after-refresh',
                 message: 'La oportunidad ya no existe en el snapshot actualizado.'
-            };
+            });
         }
 
         const requiresDcDoubleCheck = ARBITRAGE_DUAL_DC_DOUBLECHECK_ENABLED
@@ -2799,42 +2907,44 @@ function App() {
                 },
                 timeout: 25000
             });
+            const secondSnapshotId = String(secondPreflightRes?.data?.diagnosticSnapshotId || '').trim();
+            if (secondSnapshotId) previewSnapshotIds.push(secondSnapshotId);
 
             const secondRefresh = secondPreflightRes?.data?.onDemandRefresh?.altenarEvent || null;
             if (!secondRefresh || secondRefresh?.success !== true) {
-                return {
+                return withPreviewSnapshotIds({
                     ok: false,
                     reason: 'dc-second-refresh-failed',
                     message: `No se pudo validar doble refresh del mercado DC (${secondRefresh?.message || 'sin detalle'}).`
-                };
+                });
             }
 
             const secondRows = Array.isArray(secondPreflightRes?.data?.data) ? secondPreflightRes.data.data : [];
             const secondOpportunity = secondRows.find((row) => isSameArbitrageOpportunity(baseOpportunity, row)) || null;
             if (!secondOpportunity) {
-                return {
+                return withPreviewSnapshotIds({
                     ok: false,
                     reason: 'dc-missing-after-double-refresh',
                     message: 'El mercado Double Chance desapareció tras doble confirmación; se bloquea ejecución para evitar ghost fill.'
-                };
+                });
             }
 
             const secondDcOdd = Number(extractAltenarDcOddFromOpportunity(secondOpportunity));
             if (!(Number.isFinite(secondDcOdd) && secondDcOdd > 1)) {
-                return {
+                return withPreviewSnapshotIds({
                     ok: false,
                     reason: 'dc-unavailable-after-double-refresh',
                     message: 'La pata Double Chance de Altenar no quedó disponible tras doble refresh.'
-                };
+                });
             }
 
             const dcDrift = Math.abs(secondDcOdd - firstDcOdd);
             if (dcDrift > ARBITRAGE_DUAL_DC_DOUBLECHECK_MAX_ODD_DRIFT) {
-                return {
+                return withPreviewSnapshotIds({
                     ok: false,
                     reason: 'dc-odd-drift-after-double-refresh',
                     message: `La cuota DC cambió demasiado en segundos (${firstDcOdd.toFixed(3)} -> ${secondDcOdd.toFixed(3)}).`
-                };
+                });
             }
 
             refreshedOpportunity = secondOpportunity;
@@ -2843,30 +2953,30 @@ function App() {
         const liveRoi = Number(refreshedOpportunity?.plan?.roiPercent || 0);
         const liveProfit = Number(refreshedOpportunity?.plan?.expectedProfit || 0);
         if (!Number.isFinite(liveRoi) || liveRoi < Number(riskContext.minRoiPercent || 0)) {
-            return {
+            return withPreviewSnapshotIds({
                 ok: false,
                 reason: 'roi-below-threshold',
                 message: `ROI actualizado ${Number.isFinite(liveRoi) ? liveRoi.toFixed(3) : 'n/a'}% < mínimo ${Number(riskContext.minRoiPercent || 0).toFixed(3)}%.`,
                 refreshedOpportunity,
                 riskContext
-            };
+            });
         }
 
         if (!Number.isFinite(liveProfit) || liveProfit < Number(riskContext.minProfitAbs || 0)) {
-            return {
+            return withPreviewSnapshotIds({
                 ok: false,
                 reason: 'profit-below-threshold',
                 message: `Profit actualizado S/. ${Number.isFinite(liveProfit) ? liveProfit.toFixed(2) : 'n/a'} < mínimo S/. ${Number(riskContext.minProfitAbs || 0).toFixed(2)}.`,
                 refreshedOpportunity,
                 riskContext
-            };
+            });
         }
 
         const refreshedLegs = Array.isArray(refreshedOpportunity?.legs) ? refreshedOpportunity.legs : [];
         const dualPlan = buildDualExecutionPlan(refreshedOpportunity, refreshedLegs);
         if (!dualPlan?.canExecute) {
             const unsupportedArcadiaMsg = 'La pata Arcadia refrescada usa un mercado no soportado en dual (actualmente solo 1x2 en Arcadia).';
-            return {
+            return withPreviewSnapshotIds({
                 ok: false,
                 reason: dualPlan?.reason || 'dual-plan-invalid',
                 message: dualPlan?.reason === 'arcadia-market-unsupported'
@@ -2874,10 +2984,60 @@ function App() {
                     : 'La oportunidad refrescada ya no tiene patas Arcadia + Altenar ejecutables.',
                 refreshedOpportunity,
                 riskContext
-            };
+            });
         }
 
-        return {
+        const refreshedArcadiaLegs = Array.isArray(dualPlan?.arcadiaLegs) && dualPlan.arcadiaLegs.length > 0
+            ? dualPlan.arcadiaLegs
+            : (dualPlan?.arcadia ? [dualPlan.arcadia] : []);
+
+        const refreshedArcadiaSignatures = new Set(
+            refreshedArcadiaLegs
+                .map((leg) => toExecutionLegSignature(leg))
+                .filter(Boolean)
+        );
+
+        const droppedArcadiaLegs = Array.from(expectedArcadiaSignatures)
+            .filter((sig) => !refreshedArcadiaSignatures.has(sig));
+
+        if (expectedArcadiaSignatures.size >= 2 && droppedArcadiaLegs.length > 0) {
+            return withPreviewSnapshotIds({
+                ok: false,
+                reason: 'arcadia-legs-dropped-after-refresh',
+                message: `Se perdió pata Arcadia tras refresh (${droppedArcadiaLegs.join(', ')}). Se bloquea para evitar ejecución parcial en Pinnacle.`,
+                refreshedOpportunity,
+                refreshedLegs,
+                dualPlan,
+                riskContext,
+                liveRoi,
+                liveProfit,
+                expectedArcadiaLegs: Array.from(expectedArcadiaSignatures),
+                refreshedArcadiaLegs: Array.from(refreshedArcadiaSignatures)
+            });
+        }
+
+        for (const leg of refreshedArcadiaLegs) {
+            const legOpportunity = leg?.opportunity || null;
+            const quotePreflight = await runPinnacleQuotePreflightForOpportunity(legOpportunity, { force: true });
+            if (quotePreflight && quotePreflight.quoteable !== true) {
+                const statusTxt = String(quotePreflight?.status || 'NOT_QUOTEABLE').trim();
+                const providerTxt = String(quotePreflight?.providerDetail || quotePreflight?.message || '').trim();
+                const selectionTxt = String(legOpportunity?.selection || 'n/a').trim();
+                return withPreviewSnapshotIds({
+                    ok: false,
+                    reason: 'arcadia-not-quoteable-after-preflight',
+                    message: `Arcadia no quoteable para ${selectionTxt} (${statusTxt})${providerTxt ? `: ${providerTxt}` : '.'}`,
+                    refreshedOpportunity,
+                    refreshedLegs,
+                    dualPlan,
+                    riskContext,
+                    liveRoi,
+                    liveProfit
+                });
+            }
+        }
+
+        return withPreviewSnapshotIds({
             ok: true,
             refreshedOpportunity,
             refreshedLegs,
@@ -2885,7 +3045,7 @@ function App() {
             riskContext,
             liveRoi,
             liveProfit
-        };
+        });
     };
 
     const setArbitrageExecutionRunning = (executionKey, running) => {
@@ -3029,12 +3189,26 @@ function App() {
 
     const handleExecuteArbitrageDual = async ({ op = {}, legs = [], idx = 0 } = {}) => {
         const executionKey = getArbitrageExecutionKey(op, idx);
+        const executionId = getArbitrageExecutionId(executionKey);
         const baseRoi = Number(op?.plan?.roiPercent || 0);
         const baseProfit = Number(op?.plan?.expectedProfit || 0);
         if (arbitrageExecutingKeysRef.current.has(executionKey)) return;
 
         const dualPlan = buildDualExecutionPlan(op, legs);
         if (!dualPlan?.canExecute) {
+            await persistArbitrageExecutionAuditEvent(executionId, {
+                executionKey,
+                stage: 'initial-validation',
+                status: 'blocked',
+                reason: dualPlan?.reason || 'dual-plan-invalid',
+                message: 'No hay patas Arcadia + Altenar ejecutables para esta oportunidad.',
+                match: op?.match || null,
+                eventId: op?.eventId || null,
+                pinnacleId: op?.pinnacleId || null,
+                comboCode: op?.comboCode || null,
+                baseRoi,
+                baseProfit
+            });
             alert('⚠️ Esta oportunidad no tiene patas ejecutables Arcadia + Altenar para ejecución dual secuencial.');
             return;
         }
@@ -3060,6 +3234,23 @@ function App() {
         if (existingArcadiaExposure) {
             const providerBetIdTxt = String(existingArcadiaExposure?.providerBetId || '').trim() || 'n/a';
             const blockedPick = normalizePick(existingArcadiaLeg?.opportunity || {});
+            await persistArbitrageExecutionAuditEvent(executionId, {
+                executionKey,
+                stage: 'initial-validation',
+                status: 'blocked',
+                reason: 'existing-arcadia-exposure',
+                message: `Exposición Arcadia ya abierta para pick ${blockedPick || 'n/a'} (providerBetId=${providerBetIdTxt}).`,
+                match: op?.match || null,
+                eventId: op?.eventId || null,
+                pinnacleId: op?.pinnacleId || null,
+                comboCode: op?.comboCode || null,
+                baseRoi,
+                baseProfit,
+                meta: {
+                    blockingTicketId: existingArcadiaExposure?.id || null,
+                    providerBetId: providerBetIdTxt
+                }
+            });
             alert(
                 '⚠️ Ejecución dual bloqueada para evitar duplicado Arcadia.\n\n' +
                 `Ya existe exposición abierta en Arcadia para este pick (${blockedPick || 'n/a'}).\n` +
@@ -3086,6 +3277,20 @@ function App() {
         setArbitrageExecutionRunning(executionKey, true);
 
         try {
+            await persistArbitrageExecutionAuditEvent(executionId, {
+                executionKey,
+                stage: 'execution-start',
+                status: 'started',
+                reason: 'user-confirmed',
+                message: 'Usuario confirmó ejecución dual secuencial Arcadia -> Altenar.',
+                match: op?.match || null,
+                eventId: op?.eventId || null,
+                pinnacleId: op?.pinnacleId || null,
+                comboCode: op?.comboCode || null,
+                baseRoi,
+                baseProfit
+            });
+
             const preflight = await runArbitrageDualPreflight({ baseOpportunity: op });
             setArbitrageDualPreflightAudit(executionKey, {
                 status: preflight?.ok ? 'ok' : 'blocked',
@@ -3097,8 +3302,41 @@ function App() {
                 liveProfit: preflight?.liveProfit ?? preflight?.refreshedOpportunity?.plan?.expectedProfit
             });
 
+            await persistArbitrageExecutionAuditEvent(executionId, {
+                executionKey,
+                stage: 'preflight',
+                status: preflight?.ok ? 'ok' : 'blocked',
+                reason: preflight?.reason || null,
+                message: preflight?.message || (preflight?.ok ? 'Pre-flight validado con snapshot actualizado.' : null),
+                match: op?.match || null,
+                eventId: op?.eventId || null,
+                pinnacleId: op?.pinnacleId || null,
+                comboCode: op?.comboCode || null,
+                baseRoi,
+                baseProfit,
+                liveRoi: preflight?.liveRoi ?? preflight?.refreshedOpportunity?.plan?.roiPercent,
+                liveProfit: preflight?.liveProfit ?? preflight?.refreshedOpportunity?.plan?.expectedProfit,
+                previewSnapshotIds: preflight?.previewSnapshotIds || []
+            });
+
             if (!preflight?.ok) {
                 const reasonCode = preflight?.reason ? ` [${preflight.reason}]` : '';
+                await persistArbitrageExecutionAuditEvent(executionId, {
+                    executionKey,
+                    stage: 'execution-end',
+                    status: 'blocked',
+                    reason: preflight?.reason || 'preflight-blocked',
+                    message: preflight?.message || 'Pre-flight bloqueado.',
+                    match: op?.match || null,
+                    eventId: op?.eventId || null,
+                    pinnacleId: op?.pinnacleId || null,
+                    comboCode: op?.comboCode || null,
+                    baseRoi,
+                    baseProfit,
+                    liveRoi: preflight?.liveRoi ?? null,
+                    liveProfit: preflight?.liveProfit ?? null,
+                    previewSnapshotIds: preflight?.previewSnapshotIds || []
+                });
                 alert(
                     `⛔ Pre-flight dual abortado${reasonCode}\n\n` +
                     `${preflight?.message || 'La oportunidad ya no cumple umbrales de ejecución.'}`
@@ -3115,6 +3353,22 @@ function App() {
                 ? preflight.dualPlan.altenarLegs
                 : (preflight?.dualPlan?.altenar ? [preflight.dualPlan.altenar] : []);
             if (refreshedArcadiaLegs.length === 0 || refreshedAltenarLegs.length === 0) {
+                await persistArbitrageExecutionAuditEvent(executionId, {
+                    executionKey,
+                    stage: 'preflight',
+                    status: 'blocked',
+                    reason: 'refreshed-plan-invalid',
+                    message: 'Plan refrescado inválido para ejecutar Arcadia + Altenar.',
+                    match: op?.match || null,
+                    eventId: op?.eventId || null,
+                    pinnacleId: op?.pinnacleId || null,
+                    comboCode: op?.comboCode || null,
+                    baseRoi,
+                    baseProfit,
+                    liveRoi: preflight?.liveRoi ?? null,
+                    liveProfit: preflight?.liveProfit ?? null,
+                    previewSnapshotIds: preflight?.previewSnapshotIds || []
+                });
                 alert('⛔ Pre-flight dual abortado: plan refrescado inválido para ejecutar Arcadia + Altenar.');
                 await refreshArbitrageWithPrematch();
                 await fetchData({ forceBookyRefresh: true });
@@ -3131,6 +3385,26 @@ function App() {
             }
             if (existingAfterPreflight) {
                 const providerBetIdTxt = String(existingAfterPreflight?.providerBetId || '').trim() || 'n/a';
+                await persistArbitrageExecutionAuditEvent(executionId, {
+                    executionKey,
+                    stage: 'preflight',
+                    status: 'blocked',
+                    reason: 'existing-arcadia-exposure-after-preflight',
+                    message: `Exposición Arcadia detectada tras pre-flight (providerBetId=${providerBetIdTxt}).`,
+                    match: op?.match || null,
+                    eventId: op?.eventId || null,
+                    pinnacleId: op?.pinnacleId || null,
+                    comboCode: op?.comboCode || null,
+                    baseRoi,
+                    baseProfit,
+                    liveRoi: preflight?.liveRoi ?? null,
+                    liveProfit: preflight?.liveProfit ?? null,
+                    previewSnapshotIds: preflight?.previewSnapshotIds || [],
+                    meta: {
+                        blockingTicketId: existingAfterPreflight?.id || null,
+                        providerBetId: providerBetIdTxt
+                    }
+                });
                 alert(
                     '⚠️ Ejecución dual bloqueada tras pre-flight para evitar duplicado Arcadia.\n\n' +
                     `ticket local: ${existingAfterPreflight?.id || 'n/a'} | providerBetId: ${providerBetIdTxt}`
@@ -3152,6 +3426,29 @@ function App() {
                     baseProfit,
                     liveRoi: preflight?.liveRoi ?? null,
                     liveProfit: preflight?.liveProfit ?? null
+                });
+
+                await persistArbitrageExecutionAuditEvent(executionId, {
+                    executionKey,
+                    stage: 'preflight',
+                    status: 'blocked',
+                    reason: 'liquidity-insufficient-after-preflight',
+                    message: 'Saldo insuficiente por provider según split refrescado.',
+                    match: op?.match || null,
+                    eventId: op?.eventId || null,
+                    pinnacleId: op?.pinnacleId || null,
+                    comboCode: op?.comboCode || null,
+                    baseRoi,
+                    baseProfit,
+                    liveRoi: preflight?.liveRoi ?? null,
+                    liveProfit: preflight?.liveProfit ?? null,
+                    previewSnapshotIds: preflight?.previewSnapshotIds || [],
+                    meta: {
+                        altenarRequired: Number(refreshedLiquidityGuard?.altenarRequired || 0),
+                        bookyAvailable: Number(refreshedLiquidityGuard?.bookyAvailable || 0),
+                        arcadiaRequired: Number(refreshedLiquidityGuard?.arcadiaRequired || 0),
+                        pinnacleAvailable: Number(refreshedLiquidityGuard?.pinnacleAvailable || 0)
+                    }
                 });
 
                 alert(
@@ -3179,7 +3476,7 @@ function App() {
                         return Number.isFinite(fallback) ? fallback : NaN;
                     })();
 
-                    const minRequiredMinutes = Number(latestToken?.minRequiredMinutes || 2);
+                    const minRequiredMinutes = Number(latestToken?.minExecutionRequiredMinutes || latestToken?.minRequiredMinutes || 2);
                     const tokenReady = Boolean(
                         latestToken?.exists &&
                         latestToken?.jwtValid &&
@@ -3193,16 +3490,33 @@ function App() {
                         setArbitrageDualPreflightAudit(executionKey, {
                             status: 'blocked',
                             reason: 'booky-token-not-ready',
-                            message: `Token Altenar no apto (remaining=${Number.isFinite(remainingMinutes) ? remainingMinutes.toFixed(2) : 'n/a'} min, mínimo=${Number(minRequiredMinutes || 0).toFixed(2)}).`,
+                            message: `Token Altenar no apto para ejecución (remaining=${Number.isFinite(remainingMinutes) ? remainingMinutes.toFixed(2) : 'n/a'} min, mínimo ejecución=${Number(minRequiredMinutes || 0).toFixed(2)}).`,
                             baseRoi,
                             baseProfit,
                             liveRoi: preflight?.liveRoi ?? null,
                             liveProfit: preflight?.liveProfit ?? null
                         });
 
+                        await persistArbitrageExecutionAuditEvent(executionId, {
+                            executionKey,
+                            stage: 'preflight',
+                            status: 'blocked',
+                            reason: 'booky-token-not-ready',
+                            message: `Token Altenar no apto para ejecución (remaining=${Number.isFinite(remainingMinutes) ? remainingMinutes.toFixed(2) : 'n/a'} min, mínimo=${Number(minRequiredMinutes || 0).toFixed(2)} min).`,
+                            match: op?.match || null,
+                            eventId: op?.eventId || null,
+                            pinnacleId: op?.pinnacleId || null,
+                            comboCode: op?.comboCode || null,
+                            baseRoi,
+                            baseProfit,
+                            liveRoi: preflight?.liveRoi ?? null,
+                            liveProfit: preflight?.liveProfit ?? null,
+                            previewSnapshotIds: preflight?.previewSnapshotIds || []
+                        });
+
                         alert(
                             '⛔ Ejecución dual abortada antes de Arcadia\n\n' +
-                            `Token Altenar no apto. Remaining: ${Number.isFinite(remainingMinutes) ? remainingMinutes.toFixed(2) : 'n/a'} min | mínimo requerido: ${Number(minRequiredMinutes || 0).toFixed(2)} min.\n` +
+                            `Token Altenar no apto para ejecución. Remaining: ${Number.isFinite(remainingMinutes) ? remainingMinutes.toFixed(2) : 'n/a'} min | mínimo ejecución: ${Number(minRequiredMinutes || 0).toFixed(2)} min.\n` +
                             `Acción: renueva token y reintenta para evitar HEDGE_REQUIRED.`
                         );
                         await refreshArbitrageWithPrematch();
@@ -3218,14 +3532,62 @@ function App() {
             for (const leg of refreshedArcadiaLegs) {
                 const legResult = await runProviderRealPlacement({
                     provider: 'pinnacle',
-                    opportunity: leg.opportunity,
+                    opportunity: {
+                        ...(leg.opportunity || {}),
+                        executionId
+                    },
                     confirmMode: 'confirm-fast'
                 });
                 arcadiaResults.push({ leg, result: legResult });
 
+                await persistArbitrageExecutionAuditEvent(executionId, {
+                    executionKey,
+                    stage: 'placement',
+                    status: legResult?.outcome === 'confirmed' ? 'confirmed' : (legResult?.outcome || 'rejected'),
+                    reason: legResult?.outcome === 'confirmed' ? 'arcadia-leg-confirmed' : 'arcadia-leg-failed',
+                    message: legResult?.message || null,
+                    provider: 'pinnacle',
+                    outcome: legResult?.outcome || null,
+                    code: legResult?.code || null,
+                    ticketId: legResult?.ticketId || null,
+                    match: op?.match || null,
+                    eventId: op?.eventId || null,
+                    pinnacleId: op?.pinnacleId || null,
+                    comboCode: op?.comboCode || null,
+                    baseRoi,
+                    baseProfit,
+                    liveRoi: preflight?.liveRoi ?? null,
+                    liveProfit: preflight?.liveProfit ?? null,
+                    previewSnapshotIds: preflight?.previewSnapshotIds || [],
+                    meta: {
+                        selection: leg?.opportunity?.selection || null,
+                        market: leg?.opportunity?.market || null
+                    }
+                });
+
                 if (legResult.outcome !== 'confirmed') {
                     const code = legResult?.code ? ` | code=${legResult.code}` : '';
                     const failedSelection = leg?.opportunity?.selection || 'n/a';
+                    await persistArbitrageExecutionAuditEvent(executionId, {
+                        executionKey,
+                        stage: 'execution-end',
+                        status: 'rejected',
+                        reason: 'arcadia-leg-failed',
+                        message: legResult?.message || 'No se pudo confirmar pata Arcadia.',
+                        provider: 'pinnacle',
+                        outcome: legResult?.outcome || null,
+                        code: legResult?.code || null,
+                        ticketId: legResult?.ticketId || null,
+                        match: op?.match || null,
+                        eventId: op?.eventId || null,
+                        pinnacleId: op?.pinnacleId || null,
+                        comboCode: op?.comboCode || null,
+                        baseRoi,
+                        baseProfit,
+                        liveRoi: preflight?.liveRoi ?? null,
+                        liveProfit: preflight?.liveProfit ?? null,
+                        previewSnapshotIds: preflight?.previewSnapshotIds || []
+                    });
                     alert(`❌ Resultado final=REJECTED (Arcadia ${failedSelection})${code}\n${legResult?.message || 'No se pudo confirmar pata Arcadia.'}`);
                     await fetchData({ forceBookyRefresh: true });
                     return;
@@ -3236,10 +3598,38 @@ function App() {
             for (const leg of refreshedAltenarLegs) {
                 const legResult = await runProviderRealPlacement({
                     provider: 'booky',
-                    opportunity: leg.opportunity,
+                    opportunity: {
+                        ...(leg.opportunity || {}),
+                        executionId
+                    },
                     confirmMode: 'confirm-fast'
                 });
                 altenarResults.push({ leg, result: legResult });
+
+                await persistArbitrageExecutionAuditEvent(executionId, {
+                    executionKey,
+                    stage: 'placement',
+                    status: legResult?.outcome === 'confirmed' ? 'confirmed' : (legResult?.outcome || 'rejected'),
+                    reason: legResult?.outcome === 'confirmed' ? 'altenar-leg-confirmed' : 'altenar-leg-failed',
+                    message: legResult?.message || null,
+                    provider: 'booky',
+                    outcome: legResult?.outcome || null,
+                    code: legResult?.code || null,
+                    ticketId: legResult?.ticketId || null,
+                    match: op?.match || null,
+                    eventId: op?.eventId || null,
+                    pinnacleId: op?.pinnacleId || null,
+                    comboCode: op?.comboCode || null,
+                    baseRoi,
+                    baseProfit,
+                    liveRoi: preflight?.liveRoi ?? null,
+                    liveProfit: preflight?.liveProfit ?? null,
+                    previewSnapshotIds: preflight?.previewSnapshotIds || [],
+                    meta: {
+                        selection: leg?.opportunity?.selection || null,
+                        market: leg?.opportunity?.market || null
+                    }
+                });
 
                 if (legResult.outcome !== 'confirmed') {
                     const secondOutcome = legResult.outcome === 'uncertain' ? 'UNCERTAIN' : 'REJECTED';
@@ -3255,6 +3645,26 @@ function App() {
                         `${legResult?.message || 'Sin detalle adicional.'}\n\n` +
                         'Acción: cubrir manualmente el riesgo de las patas Arcadia ya ejecutadas.'
                     );
+                    await persistArbitrageExecutionAuditEvent(executionId, {
+                        executionKey,
+                        stage: 'execution-end',
+                        status: legResult?.outcome === 'uncertain' ? 'uncertain' : 'rejected',
+                        reason: 'hedge-required-second-leg-failed',
+                        message: legResult?.message || 'Fallo en segunda pata Altenar con exposición Arcadia ya confirmada.',
+                        provider: 'booky',
+                        outcome: legResult?.outcome || null,
+                        code: legResult?.code || null,
+                        ticketId: legResult?.ticketId || null,
+                        match: op?.match || null,
+                        eventId: op?.eventId || null,
+                        pinnacleId: op?.pinnacleId || null,
+                        comboCode: op?.comboCode || null,
+                        baseRoi,
+                        baseProfit,
+                        liveRoi: preflight?.liveRoi ?? null,
+                        liveProfit: preflight?.liveProfit ?? null,
+                        previewSnapshotIds: preflight?.previewSnapshotIds || []
+                    });
                     await fetchData({ forceBookyRefresh: true });
                     return;
                 }
@@ -3272,12 +3682,43 @@ function App() {
                 `Arcadia (${arcadiaResults.length}):\n${confirmedArcadiaText}\n\n` +
                 `Altenar (${altenarResults.length}):\n${confirmedAltenarText}`
             );
+            await persistArbitrageExecutionAuditEvent(executionId, {
+                executionKey,
+                stage: 'execution-end',
+                status: 'confirmed',
+                reason: 'dual-confirmed',
+                message: 'Todas las patas confirmadas en ejecución dual.',
+                match: op?.match || null,
+                eventId: op?.eventId || null,
+                pinnacleId: op?.pinnacleId || null,
+                comboCode: op?.comboCode || null,
+                baseRoi,
+                baseProfit,
+                liveRoi: preflight?.liveRoi ?? null,
+                liveProfit: preflight?.liveProfit ?? null,
+                previewSnapshotIds: preflight?.previewSnapshotIds || []
+            });
             await fetchData({ forceBookyRefresh: true });
         } catch (error) {
             setArbitrageDualPreflightAudit(executionKey, {
                 status: 'error',
                 reason: 'runtime-error',
                 message: error?.message || 'Error desconocido durante ejecución dual.',
+                baseRoi,
+                baseProfit,
+                liveRoi: null,
+                liveProfit: null
+            });
+            await persistArbitrageExecutionAuditEvent(executionId, {
+                executionKey,
+                stage: 'execution-end',
+                status: 'error',
+                reason: 'runtime-error',
+                message: error?.message || 'Error inesperado durante ejecución dual.',
+                match: op?.match || null,
+                eventId: op?.eventId || null,
+                pinnacleId: op?.pinnacleId || null,
+                comboCode: op?.comboCode || null,
                 baseRoi,
                 baseProfit,
                 liveRoi: null,
@@ -3511,7 +3952,7 @@ function App() {
     };
 
     useEffect(() => {
-        const provider = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+        const provider = resolveManualPlacementProvider(autoPlacementProvider, 'booky');
         if (provider !== 'pinnacle') return;
         if (!Array.isArray(prematchOps) || prematchOps.length === 0) return;
         void preflightPrematchRowsForPinnacle(prematchOps, { force: false });
@@ -3631,10 +4072,20 @@ function App() {
         if (cancelled) return;
         if (prematchSseReconnectTimerRef.current) return;
 
+        const attempt = Number(prematchSseReconnectAttemptRef.current || 0);
+        const backoffMs = Math.min(
+            PREMATCH_SSE_RECONNECT_MAX_MS,
+            PREMATCH_SSE_RECONNECT_BASE_MS * (2 ** Math.min(attempt, 6))
+        );
+        const jitterMs = Math.floor(Math.random() * 600);
+        const delayMs = backoffMs + jitterMs;
+
+        prematchSseReconnectAttemptRef.current = attempt + 1;
+
         prematchSseReconnectTimerRef.current = setTimeout(() => {
             prematchSseReconnectTimerRef.current = null;
             connectPrematchSse();
-        }, PREMATCH_SSE_RECONNECT_MS);
+        }, delayMs);
     };
 
     const handlePrematchUpdate = (evt) => {
@@ -3660,6 +4111,7 @@ function App() {
             prematchSseRef.current = es;
 
             es.onopen = () => {
+                prematchSseReconnectAttemptRef.current = 0;
                 lastPrematchSseEventAtRef.current = Date.now();
                 fetchPrematchWsHealth();
             };
@@ -3695,8 +4147,15 @@ function App() {
         const stale = !lastEventAt || (Date.now() - lastEventAt) > PREMATCH_SSE_WATCHDOG_MS;
         if (!stale) return;
 
-        fetchPrematchData({ force: true });
-        fetchPrematchWsHealth({ force: true });
+        const nowMs = Date.now();
+        const sinceLastRevalidateMs = nowMs - Number(lastPrematchStaleRevalidateAtRef.current || 0);
+
+        if (sinceLastRevalidateMs >= PREMATCH_SSE_STALE_REVALIDATE_MIN_GAP_MS) {
+            // En stale usamos SWR: pedir snapshot/cache sin refresh forzado.
+            fetchPrematchData({ force: false });
+            fetchPrematchWsHealth({ force: true });
+            lastPrematchStaleRevalidateAtRef.current = nowMs;
+        }
 
         if (!prematchSseRef.current) {
             connectPrematchSse();
@@ -3723,13 +4182,54 @@ function App() {
   }, []);
 
   useEffect(() => {
+      const remainingMinutes = getTokenRemainingMinutes(tokenHealth);
+      const minExecutionRequiredMinutes = Number(tokenHealth?.minExecutionRequiredMinutes || tokenHealth?.minRequiredMinutes || 2);
+      const autoRenewTriggerMinutes = minExecutionRequiredMinutes + TOKEN_AUTO_RENEW_LEAD_MINUTES;
+      const interactiveAutoRenewEnabled = Boolean(tokenHealth?.tokenHealthInteractiveAutoRenewEnabled);
+
+      const tokenFingerprint = [
+          String(tokenHealth?.profile || ''),
+          String(tokenHealth?.tokenIntegration || ''),
+          String(tokenHealth?.tokenUserName || ''),
+          String(tokenHealth?.expIso || ''),
+          String(tokenHealth?.minRequiredMinutes || ''),
+          String(tokenHealth?.minExecutionRequiredMinutes || '')
+      ].join('|');
+
+      // Si el token ya está sano, liberamos el bloqueo para permitir futuros auto-renew cuando vuelva a degradar.
+      if (
+          tokenHealth?.exists &&
+          tokenHealth?.jwtValid &&
+          tokenHealth?.authenticated &&
+          !tokenHealth?.expired &&
+          Number.isFinite(remainingMinutes) &&
+          remainingMinutes > autoRenewTriggerMinutes
+      ) {
+          lastAutoRenewTokenFingerprintRef.current = null;
+          nextAutoRenewAllowedAtRef.current = 0;
+      }
+
       const shouldAutoRenew = Boolean(
           tokenHealth?.autoRefreshEnabled &&
-          tokenHealth &&
-          !hasEnoughTokenLife(tokenHealth)
+          interactiveAutoRenewEnabled &&
+          (
+              !tokenHealth?.exists ||
+              !tokenHealth?.jwtValid ||
+              !tokenHealth?.authenticated ||
+              tokenHealth?.expired ||
+              !Number.isFinite(remainingMinutes) ||
+              remainingMinutes <= autoRenewTriggerMinutes
+          )
       );
 
       if (!shouldAutoRenew) return;
+
+      // Para un mismo token degradado, reintentar solo de forma espaciada (no cada 45s).
+      if (tokenFingerprint && lastAutoRenewTokenFingerprintRef.current === tokenFingerprint) {
+          if (Date.now() < Number(nextAutoRenewAllowedAtRef.current || 0)) {
+              return;
+          }
+      }
 
       const nowMs = Date.now();
       const elapsed = nowMs - Number(lastSilentTokenRenewAttemptAtRef.current || 0);
@@ -3742,9 +4242,20 @@ function App() {
           .then(async (renewRes) => {
               const started = Boolean(renewRes?.data?.success && renewRes?.data?.started);
               const busy = Boolean(renewRes?.data?.busy);
+              const retryAfterSeconds = Number(renewRes?.data?.retryAfterSeconds || 0);
 
               if (started || busy) {
                   lastSilentTokenRenewAttemptAtRef.current = Date.now();
+                  if (tokenFingerprint) {
+                      lastAutoRenewTokenFingerprintRef.current = tokenFingerprint;
+                      const serverRetryMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+                          ? retryAfterSeconds * 1000
+                          : null;
+                      const retryMs = serverRetryMs || (Number.isFinite(remainingMinutes) && remainingMinutes <= 0
+                          ? TOKEN_AUTO_RENEW_EXPIRED_RETRY_MS
+                          : TOKEN_AUTO_RENEW_SAME_TOKEN_RETRY_MS);
+                      nextAutoRenewAllowedAtRef.current = Date.now() + retryMs;
+                  }
               } else {
                   lastSilentTokenRenewAttemptAtRef.current = Date.now() - (TOKEN_AUTO_RENEW_COOLDOWN_MS - TOKEN_AUTO_RENEW_RETRY_ON_FAILURE_MS);
                   return;
@@ -3885,10 +4396,25 @@ function App() {
         );
     };
 
+    const hasEnoughTokenLifeForExecution = (token = null, nowMs = Date.now()) => {
+        const remainingMinutes = getTokenRemainingMinutes(token, nowMs);
+        const minRequiredMinutes = Number(token?.minExecutionRequiredMinutes || token?.minRequiredMinutes || 2);
+        return Boolean(
+            token?.exists &&
+            token?.jwtValid &&
+            token?.authenticated &&
+            !token?.expired &&
+            Number.isFinite(remainingMinutes) &&
+            remainingMinutes >= minRequiredMinutes
+        );
+    };
+
     const tokenRemainingMinutes = getTokenRemainingMinutes(tokenHealth, tokenClockMs);
-    const tokenMinRequiredMinutes = Number(tokenHealth?.minRequiredMinutes || 2);
-    const tokenAutoRenewThresholdMinutes = tokenMinRequiredMinutes + TOKEN_AUTO_RENEW_LEAD_MINUTES;
-    const tokenAutoRefreshEnabled = Boolean(tokenHealth?.autoRefreshEnabled);
+    const tokenExecutionMinRequiredMinutes = Number(tokenHealth?.minExecutionRequiredMinutes || tokenHealth?.minRequiredMinutes || 2);
+    const tokenAutoRenewThresholdMinutes = tokenExecutionMinRequiredMinutes + TOKEN_AUTO_RENEW_LEAD_MINUTES;
+    const tokenAutoRefreshEnabled = Boolean(
+        tokenHealth?.autoRefreshEnabled && tokenHealth?.tokenHealthInteractiveAutoRenewEnabled
+    );
     const silentRenewElapsedMs = tokenClockMs - Number(lastSilentTokenRenewAttemptAtRef.current || 0);
     const silentRenewCooldownRemainingSec = Math.max(0, Math.ceil((TOKEN_AUTO_RENEW_COOLDOWN_MS - silentRenewElapsedMs) / 1000));
     const silentRenewCooldownActive = Boolean(
@@ -3936,7 +4462,7 @@ function App() {
         ? Number(simulatedRealizedPnL.toFixed(2))
         : 0;
 
-    const manualProviderNormalized = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+    const manualProviderNormalized = resolveManualPlacementProvider(autoPlacementProvider, 'booky');
     const showPinnacleBalanceInHeader = manualProviderNormalized === 'pinnacle' && Number.isFinite(pinnacleBalanceAmount);
     const wantsPinnacleBalance = manualProviderNormalized === 'pinnacle';
 
@@ -3973,12 +4499,14 @@ function App() {
             ? `Saldo Pinnacle no disponible; fallback ${activeBookyLabel}`
             : `Saldo mostrado: ${activeBookyLabel} (Booky/ACity)`);
     const autoPlacementProviderLabel = String(autoPlacementProvider || 'booky').toUpperCase();
-    const autoPlacementProviderPretty = autoPlacementProvider === 'pinnacle' ? 'Pinnacle' : 'Booky';
+    const autoPlacementProviderPretty = AUTO_PLACEMENT_PROVIDER_LABELS[autoPlacementProvider] || 'Booky';
     const autoPlacementProviderBadgeClass = autoPlacementProvider === 'pinnacle'
         ? (pinnacleHistorySyncing
             ? 'bg-blue-500/35 text-blue-100 border-blue-300/70 ring-1 ring-blue-300/35'
             : 'bg-blue-500/20 text-blue-300 border-blue-500/35 hover:bg-blue-500/30')
-        : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/35';
+        : (autoPlacementProvider === 'auto'
+            ? 'bg-cyan-500/20 text-cyan-200 border-cyan-400/40'
+            : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/35');
     const [tokenRenewing, setTokenRenewing] = useState(false);
     const tokenRenewingRef = useRef(false);
 
@@ -4068,12 +4596,19 @@ function App() {
         const opportunityTypeUpper = String(opportunity?.type || opportunity?.strategy || '').toUpperCase();
         const optimisticIsSnipe = opportunityTypeUpper === 'LIVE_SNIPE';
         const optimisticIsLiveExecution = opportunityTypeUpper.startsWith('LIVE_') || opportunityTypeUpper === 'LA_VOLTEADA';
-            const manualPlacementProvider = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky');
+            const manualPlacementProvider = resolveManualPlacementProvider(autoPlacementProvider, 'booky');
             const isBookyManualPlacement = manualPlacementProvider === 'booky';
             const providerApiBase = isBookyManualPlacement ? '/api/booky' : '/api/pinnacle';
             const providerLabel = isBookyManualPlacement ? 'Booky' : 'Pinnacle';
             const providerPrefix = isBookyManualPlacement ? 'BOOKY' : 'PINNACLE';
             let useRealPlacement = !isBookyManualPlacement;
+
+        const alreadyBlockedByKey = blockedBetIdsRef.current instanceof Set && blockedBetIdsRef.current.has(id);
+        if (alreadyBlockedByKey) {
+            alert('⚠️ Ya existe una exposición activa para este evento/pick. Se bloquea el envío duplicado.');
+            await fetchData({ forceBookyRefresh: true });
+            return;
+        }
 
         const resolveFreshOpportunityForRetry = () => {
             const latest = latestLiveCandidatesByKeyRef.current?.get(id) || null;
@@ -4227,14 +4762,14 @@ function App() {
         const token = tokenRes?.data?.token;
         const tokenCheckAvailable = Boolean(tokenRes?.data?.success);
 
-        if (isBookyManualPlacement && tokenCheckAvailable && !hasEnoughTokenLife(token)) {
+        if (isBookyManualPlacement && tokenCheckAvailable && !hasEnoughTokenLifeForExecution(token)) {
             const liveTokenMins = getTokenRemainingMinutes(token);
-            const minRequiredMins = Number(token?.minRequiredMinutes || 2);
+            const minRequiredMins = Number(token?.minExecutionRequiredMinutes || token?.minRequiredMinutes || 2);
             const reason = !token?.authenticated
                 ? 'token no autenticado'
                 : (token?.expired
                     ? 'token vencido'
-                    : `token por vencer (${liveTokenMins.toFixed(1)} min < ${minRequiredMins.toFixed(1)} min requeridos)`);
+                    : `token por vencer (${liveTokenMins.toFixed(1)} min < ${minRequiredMins.toFixed(1)} min de ejecución)`);
             await axios.post(`${providerApiBase}/cancel/${ticket.id}`).catch(() => {});
             alert(`⚠️ No se puede apostar en ${providerLabel}: ${reason}. Renueva token y reintenta.`);
             localPlacedBetIdsRef.current.delete(id);
@@ -4649,6 +5184,18 @@ function App() {
                     delete pendingBetDetailsRef.current[id];
                     forceUpdate();
                     await fetchData();
+                } else if (code === 'BOOKY_DUPLICATE_ACTIVE_EXPOSURE') {
+                    alert(`⚠️ Duplicado bloqueado por seguridad: ${msg}${diagText}`);
+                    await fetchData({ forceBookyRefresh: true });
+                    localPlacedBetIdsRef.current.delete(id);
+                    delete pendingBetDetailsRef.current[id];
+                    forceUpdate();
+                } else if (code === 'BOOKY_INVALID_STAKE_AFTER_REFRESH' || code === 'BOOKY_INVALID_STAKE_BELOW_MIN') {
+                    alert(`⚠️ Stake inválido tras refresh: ${msg}${diagText}`);
+                    await fetchData({ forceBookyRefresh: true });
+                    localPlacedBetIdsRef.current.delete(id);
+                    delete pendingBetDetailsRef.current[id];
+                    forceUpdate();
                 } else {
                     const normalizedMsg = String(msg || '').toLowerCase();
                     if (normalizedMsg.includes('ticket no encontrado')) {
@@ -6061,7 +6608,11 @@ function App() {
                                                                     {legProcessing ? 'Procesando...' : 'Semi-auto'}
                                                                 </button>
                                                             ) : (
-                                                                <span className="text-[9px] uppercase tracking-wide text-slate-500">Solo referencia</span>
+                                                                <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                                                                    {normalizeArbitrageProviderBucket(leg?.provider || '') === 'arcadia'
+                                                                        ? 'Referencia (se ejecuta en Fase 2 Dual)'
+                                                                        : 'Solo referencia'}
+                                                                </span>
                                                             )}
                                                         </div>
                                                     );
@@ -6420,7 +6971,7 @@ function App() {
 
                                     // Display Logic Fixes: Include Explicit Finish here
                                     const showFinished = executionStatus === 'FINISHED' || op.isFinished || isExplicitlyFinished;
-                                    const manualProviderIsPinnacle = normalizeAutoPlacementProvider(autoPlacementProvider, 'booky') === 'pinnacle';
+                                    const manualProviderIsPinnacle = resolveManualPlacementProvider(autoPlacementProvider, 'booky') === 'pinnacle';
                                     const shouldShowPinnaclePreflight = Boolean(
                                         manualProviderIsPinnacle
                                         && executionStatus === 'PENDING'

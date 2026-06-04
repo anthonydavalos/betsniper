@@ -1,33 +1,22 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { DEFAULT_CORE_DATA, DEFAULT_DIAGNOSTICS_DATA, writeMergedDbSync } from './lib/read-split-db.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const dbPath = path.join(__dirname, '../db.json');
+const cloneJson = (value, fallback = {}) => {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return JSON.parse(JSON.stringify(fallback));
+  }
+};
 
 const defaultData = {
-  config: { 
-    bankroll: 100, 
-    kellyFraction: 0.25 
-  },
-  mappedTeams: { 
-    "Man City": "Manchester City" 
-  },
-  upcomingMatches: [],
-  altenarUpcoming: [],
-  liveTracking: [],
-  portfolio: {
-    balance: 100,
-    initialCapital: 100,
-    activeBets: [],
-    history: []
-  }
+  ...cloneJson(DEFAULT_CORE_DATA, {}),
+  ...cloneJson(DEFAULT_DIAGNOSTICS_DATA, {})
 };
 
 console.log('🧹 Reiniciando Base de Datos a estado de fábrica...');
 try {
-    fs.writeFileSync(dbPath, JSON.stringify(defaultData, null, 2));
-    console.log('✅ Base de datos (db.json) ha sido reseteada exitosamente.');
+    writeMergedDbSync(defaultData);
+    console.log('✅ Base de datos split (db-core.json + db-diagnostics.json) ha sido reseteada exitosamente.');
     console.log('💰 Balance: 100');
     console.log('📝 Apuestas limpiadas.');
     console.log('📅 Eventos limpiados.');

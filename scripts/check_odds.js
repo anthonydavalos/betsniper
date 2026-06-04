@@ -19,7 +19,7 @@ const run = async () => {
     );
 
     if (!match) {
-        console.log(`❌ No se encontró el partido '${matchName}' en la base de datos local (db.json).`);
+        console.log(`❌ No se encontró el partido '${matchName}' en la base de datos local (db-core.json + db-diagnostics.json).`);
         console.log("Probando búsqueda flexible...");
         // Intentar buscar en db.data directamente si structure difiere
         return;

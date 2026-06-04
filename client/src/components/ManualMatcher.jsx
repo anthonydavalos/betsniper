@@ -468,6 +468,8 @@ const ManualMatcher = () => {
         // Default sort by date
         return new Date(a.date) - new Date(b.date);
     });
+    const ALTENAR_RENDER_LIMIT = 50;
+    const visibleAltenar = filteredAltenar.slice(0, ALTENAR_RENDER_LIMIT);
 
     // Auto-search Altenar cuando seleccionas Pinnacle
     useEffect(() => {
@@ -696,7 +698,12 @@ const ManualMatcher = () => {
                         </div>
                     )}
 
-                    <h3 className="text-green-400 font-bold mb-2 sticky top-0">2. Altenar Candidates ({filteredAltenar.length})</h3>
+                    <h3 className="text-green-400 font-bold mb-1 sticky top-0">2. Altenar Candidates ({filteredAltenar.length})</h3>
+                    {filteredAltenar.length > ALTENAR_RENDER_LIMIT && (
+                        <div className="text-[11px] text-amber-300 mb-2">
+                            Mostrando {ALTENAR_RENDER_LIMIT} de {filteredAltenar.length} candidatos para mantener fluidez en UI.
+                        </div>
+                    )}
                     
                     <div className="relative mb-2 flex gap-2">
                         <div className="relative flex-1">
@@ -720,7 +727,7 @@ const ManualMatcher = () => {
                     </div>
 
                     <div className="overflow-y-auto flex-1 min-h-0 space-y-2 pr-2">
-                        {filteredAltenar.slice(0, 50).map(alt => (
+                        {visibleAltenar.map(alt => (
                             <div 
                                 key={alt.id}
                                 onClick={() => setSelectedAlt(alt)}

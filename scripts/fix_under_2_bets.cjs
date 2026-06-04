@@ -1,8 +1,6 @@
-const fs = require('fs');
-const path = require('path');
+const { readMergedDbSync, writeMergedDbSync } = require('./lib/read-split-db.cjs');
 
-const dbPath = path.join(__dirname, '../db.json');
-const dbData = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+const dbData = readMergedDbSync();
 
 console.log('🔧 Iniciando reparación de apuestas Under mal formadas...');
 
@@ -68,21 +66,30 @@ const fixBet = (bet) => {
 };
 
 // 1. Scan Active Bets
-dbData.portfolio.activeBets.forEach(bet => {
+const activeBets = Array.isArray(dbData?.portfolio?.activeBets) ? dbData.portfolio.activeBets : [];
+activeBets.forEach(bet => {
     if (fixBet(bet)) fixedCount++;
 });
 
 // 2. Scan History
-dbData.portfolio.history.forEach(bet => {
+const history = Array.isArray(dbData?.portfolio?.history) ? dbData.portfolio.history : [];
+history.forEach(bet => {
     if (fixBet(bet)) fixedCount++;
 });
 
 // 3. Aplica reembolso al balance
+if (!dbData.portfolio || typeof dbData.portfolio !== 'object') {
+    dbData.portfolio = { balance: 100, initialCapital: 100, activeBets: [], history: [] };
+}
+if (!Number.isFinite(Number(dbData.portfolio.balance))) {
+    dbData.portfolio.balance = 100;
+}
+
 if (refundTotal > 0) {
     console.log(`\n💵 Aplicando reembolso total al balance: ${dbData.portfolio.balance.toFixed(2)} + ${refundTotal.toFixed(2)}`);
     dbData.portfolio.balance += refundTotal;
     console.log(`💰 Nuevo Balance: ${dbData.portfolio.balance.toFixed(2)}`);
 }
 
-fs.writeFileSync(dbPath, JSON.stringify(dbData, null, 2));
-console.log(`\n✅ Reparación completada. ${fixedCount} apuestas corregidos.`);
+writeMergedDbSync(dbData);
+console.log(`\n✅ Reparación completada. ${fixedCount} apuestas corregidos (db-core.json + db-diagnostics.json).`);

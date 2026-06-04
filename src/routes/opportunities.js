@@ -23,6 +23,12 @@ import {
   getLiveArbitrageSimulationHistory,
   getLiveArbitrageSimulationSummary
 } from '../services/liveArbitrageSimulationService.js';
+import { getLiveArbitrageOperationsDashboard } from '../services/liveArbitrageOpsDashboardService.js';
+import {
+  appendArbitrageExecutionAuditEvent,
+  getArbitrageExecutionAuditByExecutionId,
+  getArbitrageExecutionAuditRecent
+} from '../services/arbitrageExecutionAuditService.js';
 import { refreshAltenarEventDetailsNow } from '../services/altenarPrematchScheduler.js';
 import db from '../db/database.js';
 
@@ -46,6 +52,50 @@ const PREMATCH_STREAM_HEARTBEAT_MS = Math.max(
     ? Number(process.env.PREMATCH_STREAM_HEARTBEAT_MS)
     : 20000
 );
+const PREMATCH_STREAM_REFRESH_MIN_GAP_MS = Math.max(
+  PREMATCH_CACHE_TTL_MS,
+  Number.isFinite(Number(process.env.PREMATCH_STREAM_REFRESH_MIN_GAP_MS))
+    ? Number(process.env.PREMATCH_STREAM_REFRESH_MIN_GAP_MS)
+    : 30000
+);
+const PREMATCH_STREAM_MAX_CLIENTS = Math.max(
+  5,
+  Number.isFinite(Number(process.env.PREMATCH_STREAM_MAX_CLIENTS))
+    ? Number(process.env.PREMATCH_STREAM_MAX_CLIENTS)
+    : 80
+);
+const PREMATCH_STREAM_CLIENT_IDLE_TIMEOUT_MS = Math.max(
+  PREMATCH_STREAM_HEARTBEAT_MS,
+  Number.isFinite(Number(process.env.PREMATCH_STREAM_CLIENT_IDLE_TIMEOUT_MS))
+    ? Number(process.env.PREMATCH_STREAM_CLIENT_IDLE_TIMEOUT_MS)
+    : 90000
+);
+const PREMATCH_STREAM_MAX_PAYLOAD_BYTES = Math.max(
+  16384,
+  Number.isFinite(Number(process.env.PREMATCH_STREAM_MAX_PAYLOAD_BYTES))
+    ? Number(process.env.PREMATCH_STREAM_MAX_PAYLOAD_BYTES)
+    : 1024 * 768
+);
+const PREMATCH_STREAM_MAX_BACKPRESSURE_HITS = Math.max(
+  1,
+  Number.isFinite(Number(process.env.PREMATCH_STREAM_MAX_BACKPRESSURE_HITS))
+    ? Number(process.env.PREMATCH_STREAM_MAX_BACKPRESSURE_HITS)
+    : 3
+);
+const PREMATCH_BACKGROUND_REFRESH_MS = Math.max(
+  10000,
+  Number.isFinite(Number(process.env.PREMATCH_BACKGROUND_REFRESH_MS))
+    ? Number(process.env.PREMATCH_BACKGROUND_REFRESH_MS)
+    : 45000
+);
+const PREMATCH_BACKGROUND_REFRESH_ENABLED = String(process.env.PREMATCH_BACKGROUND_REFRESH_ENABLED || 'false').toLowerCase() === 'true';
+const PREMATCH_HTTP_QUEUE_REFRESH_ENABLED = String(process.env.PREMATCH_HTTP_QUEUE_REFRESH_ENABLED || 'false').toLowerCase() === 'true';
+const PREMATCH_BACKGROUND_REFRESH_MAX_BACKOFF_MS = Math.max(
+  PREMATCH_BACKGROUND_REFRESH_MS,
+  Number.isFinite(Number(process.env.PREMATCH_BACKGROUND_REFRESH_MAX_BACKOFF_MS))
+    ? Number(process.env.PREMATCH_BACKGROUND_REFRESH_MAX_BACKOFF_MS)
+    : 180000
+);
 
 let prematchCache = {
   timestamp: null,
@@ -56,6 +106,20 @@ let prematchCache = {
 let prematchInFlightPromise = null;
 let prematchStreamTicker = null;
 const prematchStreamClients = new Set();
+let prematchBackgroundTimer = null;
+let prematchBackgroundErrorStreak = 0;
+
+function removePrematchStreamClient(client, { end = false } = {}) {
+  if (!client) return;
+  prematchStreamClients.delete(client);
+  if (end) {
+    try {
+      client.end();
+    } catch (_) {
+      // noop
+    }
+  }
+}
 
 const runPrematchRefresh = async () => {
   const allOpportunities = await scanPrematchOpportunities();
@@ -65,6 +129,62 @@ const runPrematchRefresh = async () => {
     updatedAtMs: Date.now()
   };
   return prematchCache;
+};
+
+const queuePrematchRefresh = ({ force = false, minGapMs = PREMATCH_STREAM_REFRESH_MIN_GAP_MS, reason = 'manual' } = {}) => {
+  const cacheAgeMs = Date.now() - Number(prematchCache.updatedAtMs || 0);
+  const hasRecentCache = Number.isFinite(cacheAgeMs) && cacheAgeMs >= 0 && cacheAgeMs < Math.max(0, Number(minGapMs) || 0);
+
+  if (!force && hasRecentCache) {
+    return { queued: false, reason: 'cache-fresh' };
+  }
+
+  if (prematchInFlightPromise) {
+    return { queued: false, reason: 'in-flight' };
+  }
+
+  ensurePrematchRefresh({ deferred: true }).catch((error) => {
+    console.warn(`⚠️ Prematch refresh async falló (${reason}): ${error?.message || error}`);
+  });
+
+  return { queued: true, reason: 'queued' };
+};
+
+const schedulePrematchBackgroundRefresh = (delayMs = PREMATCH_BACKGROUND_REFRESH_MS) => {
+  if (prematchBackgroundTimer) clearTimeout(prematchBackgroundTimer);
+  prematchBackgroundTimer = setTimeout(async () => {
+    prematchBackgroundTimer = null;
+
+    try {
+      const result = queuePrematchRefresh({
+        force: false,
+        minGapMs: PREMATCH_STREAM_REFRESH_MIN_GAP_MS,
+        reason: 'background-ticker'
+      });
+
+      if (result.queued && prematchInFlightPromise) {
+        await prematchInFlightPromise;
+      }
+
+      prematchBackgroundErrorStreak = 0;
+      schedulePrematchBackgroundRefresh(PREMATCH_BACKGROUND_REFRESH_MS);
+    } catch (error) {
+      prematchBackgroundErrorStreak = Math.min(prematchBackgroundErrorStreak + 1, 7);
+      const backoffMs = Math.min(
+        PREMATCH_BACKGROUND_REFRESH_MAX_BACKOFF_MS,
+        PREMATCH_BACKGROUND_REFRESH_MS * (2 ** prematchBackgroundErrorStreak)
+      );
+      console.warn(
+        `⚠️ Prematch background refresh en backoff (${backoffMs}ms, streak=${prematchBackgroundErrorStreak}): ${error?.message || error}`
+      );
+      schedulePrematchBackgroundRefresh(backoffMs);
+    }
+  }, Math.max(1000, Number(delayMs) || PREMATCH_BACKGROUND_REFRESH_MS));
+};
+
+const ensurePrematchBackgroundRefreshStarted = () => {
+  if (prematchBackgroundTimer) return;
+  schedulePrematchBackgroundRefresh(2000);
 };
 
 const ensurePrematchRefresh = ({ deferred = false } = {}) => {
@@ -138,12 +258,38 @@ function filterIgnoredPrematchRows(rows = []) {
 }
 
 function emitPrematchSseEvent(eventName, payload) {
-  const body = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const client of prematchStreamClients) {
+  let safePayload = payload;
+  let serialized = JSON.stringify(safePayload);
+
+  if (Buffer.byteLength(serialized, 'utf8') > PREMATCH_STREAM_MAX_PAYLOAD_BYTES && eventName === 'prematch-update') {
+    safePayload = {
+      ...payload,
+      truncated: true,
+      originalCount: Array.isArray(payload?.data) ? payload.data.length : Number(payload?.count || 0),
+      data: []
+    };
+    serialized = JSON.stringify(safePayload);
+  }
+
+  const body = `event: ${eventName}\ndata: ${serialized}\n\n`;
+  for (const client of Array.from(prematchStreamClients)) {
+    if (!client || client.writableEnded || client.destroyed) {
+      removePrematchStreamClient(client, { end: false });
+      continue;
+    }
+
     try {
-      client.write(body);
+      const ok = client.write(body);
+      if (!ok) {
+        client.__prematchBackpressureHits = Number(client.__prematchBackpressureHits || 0) + 1;
+        if (client.__prematchBackpressureHits >= PREMATCH_STREAM_MAX_BACKPRESSURE_HITS) {
+          removePrematchStreamClient(client, { end: true });
+        }
+      } else {
+        client.__prematchBackpressureHits = 0;
+      }
     } catch (_) {
-      // noop
+      removePrematchStreamClient(client, { end: false });
     }
   }
 }
@@ -155,13 +301,20 @@ function startPrematchStreamTickerIfNeeded() {
     if (prematchStreamClients.size === 0) return;
 
     try {
-      const latest = await ensurePrematchRefresh({ deferred: false });
-      const filtered = filterIgnoredPrematchRows(latest.data || []);
+      const nowMs = Date.now();
+      const cacheAgeMs = nowMs - Number(prematchCache.updatedAtMs || 0);
+      const shouldQueueRefresh = cacheAgeMs >= PREMATCH_STREAM_REFRESH_MIN_GAP_MS;
+
+      if (shouldQueueRefresh) {
+        queuePrematchRefresh({ reason: 'sse-ticker' });
+      }
+
+      const filtered = filterIgnoredPrematchRows(prematchCache.data || []);
       emitPrematchSseEvent('prematch-update', {
-        timestamp: latest.timestamp || new Date().toISOString(),
+        timestamp: prematchCache.timestamp || new Date().toISOString(),
         count: filtered.length,
         data: filtered,
-        source: 'sse-refresh'
+        source: shouldQueueRefresh ? 'sse-cache-refresh-queued' : 'sse-cache'
       });
     } catch (error) {
       emitPrematchSseEvent('prematch-error', {
@@ -170,6 +323,10 @@ function startPrematchStreamTickerIfNeeded() {
       });
     }
   }, PREMATCH_STREAM_REFRESH_INTERVAL_MS);
+}
+
+if (PREMATCH_BACKGROUND_REFRESH_ENABLED) {
+  ensurePrematchBackgroundRefreshStarted();
 }
 
 function stopPrematchStreamTickerIfIdle() {
@@ -230,13 +387,13 @@ router.get('/prematch/diagnostics', async (req, res) => {
 });
 
 // GET /api/opportunities/live/placement-provider
-// Muestra proveedor activo de auto-placement (booky|pinnacle).
+// Muestra proveedor activo de auto-placement (booky|pinnacle|auto).
 router.get('/live/placement-provider', async (_req, res) => {
   try {
     res.json({
       success: true,
       provider: getAutoPlacementProvider(),
-      allowed: ['booky', 'pinnacle']
+      allowed: ['booky', 'pinnacle', 'auto']
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -261,6 +418,9 @@ router.get('/prematch', async (req, res) => {
   try {
     const refresh = String(req.query?.refresh || '').toLowerCase();
     const forceRefresh = refresh === '1' || refresh === 'true' || refresh === 'yes';
+    const scan = String(req.query?.scan || '').toLowerCase();
+    const forceScan = scan === '1' || scan === 'true' || scan === 'yes';
+    const allowHttpQueueRefresh = PREMATCH_HTTP_QUEUE_REFRESH_ENABLED || forceScan;
     const nowMs = Date.now();
     const hasFreshCache = (nowMs - Number(prematchCache.updatedAtMs || 0)) <= PREMATCH_CACHE_TTL_MS;
 
@@ -277,27 +437,26 @@ router.get('/prematch', async (req, res) => {
 
     // Modo rápido por defecto: no bloquear request esperando el scan pesado.
     // Se devuelve último snapshot (o vacío) y el refresco sigue en background.
-    if (!forceRefresh) {
-      ensurePrematchRefresh({ deferred: true });
-      const filteredSnapshot = filterIgnoredPrematchRows(prematchCache.data || []);
-      return res.json({
-        timestamp: prematchCache.timestamp || new Date().toISOString(),
-        count: filteredSnapshot.length,
-        data: filteredSnapshot,
-        source: filteredSnapshot.length > 0 ? 'stale-while-revalidate' : 'warming',
-        warming: true,
-        cacheAgeMs: nowMs - Number(prematchCache.updatedAtMs || nowMs)
-      });
-    }
+    const queueResult = allowHttpQueueRefresh
+      ? queuePrematchRefresh({
+          force: forceRefresh,
+          minGapMs: forceRefresh ? PREMATCH_STREAM_REFRESH_MIN_GAP_MS : PREMATCH_CACHE_TTL_MS,
+          reason: forceRefresh ? 'http-force' : 'http-cache-miss'
+        })
+      : { queued: false, reason: 'http-queue-disabled' };
 
-    const latest = await ensurePrematchRefresh({ deferred: false });
-    const filteredOpportunities = filterIgnoredPrematchRows(latest.data || []);
-
-    res.json({
-      timestamp: latest.timestamp || new Date().toISOString(),
-      count: filteredOpportunities.length,
-      data: filteredOpportunities,
-      source: 'fresh-forced'
+    const filteredSnapshot = filterIgnoredPrematchRows(prematchCache.data || []);
+    return res.json({
+      timestamp: prematchCache.timestamp || new Date().toISOString(),
+      count: filteredSnapshot.length,
+      data: filteredSnapshot,
+      source: forceRefresh
+        ? (filteredSnapshot.length > 0 ? 'force-refresh-queued' : 'force-warming')
+        : (filteredSnapshot.length > 0 ? 'stale-while-revalidate' : 'warming'),
+      warming: true,
+      refreshQueued: Boolean(queueResult.queued),
+      refreshQueueReason: queueResult.reason,
+      cacheAgeMs: nowMs - Number(prematchCache.updatedAtMs || nowMs)
     });
   } catch (error) {
     if (Array.isArray(prematchCache.data) && prematchCache.data.length > 0) {
@@ -317,11 +476,23 @@ router.get('/prematch', async (req, res) => {
 // GET /api/opportunities/prematch/stream
 // Stream SSE para push de oportunidades prematch (sin polling fijo en frontend).
 router.get('/prematch/stream', async (_req, res) => {
+  if (prematchStreamClients.size >= PREMATCH_STREAM_MAX_CLIENTS) {
+    return res.status(503).json({
+      success: false,
+      code: 'PREMATCH_STREAM_AT_CAPACITY',
+      message: `Stream prematch al limite (${PREMATCH_STREAM_MAX_CLIENTS} clientes).`
+    });
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
+
+  if (typeof res.socket?.setTimeout === 'function') {
+    res.socket.setTimeout(PREMATCH_STREAM_CLIENT_IDLE_TIMEOUT_MS);
+  }
 
   prematchStreamClients.add(res);
   startPrematchStreamTickerIfNeeded();
@@ -355,13 +526,24 @@ router.get('/prematch/stream', async (_req, res) => {
 
   const heartbeat = setInterval(() => {
     if (!prematchStreamClients.has(res)) return;
-    res.write(`event: heartbeat\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
+    try {
+      res.write(`event: heartbeat\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
+    } catch (_) {
+      removePrematchStreamClient(res, { end: false });
+    }
   }, PREMATCH_STREAM_HEARTBEAT_MS);
 
-  _req.on('close', () => {
+  const cleanup = () => {
     clearInterval(heartbeat);
-    prematchStreamClients.delete(res);
+    removePrematchStreamClient(res, { end: false });
     stopPrematchStreamTickerIfIdle();
+  };
+
+  res.on('timeout', cleanup);
+  res.on('error', cleanup);
+
+  _req.on('close', () => {
+    cleanup();
   });
 });
 
@@ -572,6 +754,67 @@ router.post('/arbitrage/live/simulation/run', async (req, res) => {
   }
 });
 
+// POST /api/opportunities/arbitrage/execution-audit/events
+// Persiste eventos del flujo dual (start/preflight/placement/final) correlacionados por executionId.
+router.post('/arbitrage/execution-audit/events', async (req, res) => {
+  try {
+    const payload = await appendArbitrageExecutionAuditEvent(req.body || {});
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    const status = Number(error?.statusCode || 400);
+    res.status(status).json({
+      success: false,
+      error: error?.message || 'No se pudo persistir evento de auditoria dual.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/execution-audit?limit=100
+// Lista ejecuciones recientes (ultimo evento por executionId).
+router.get('/arbitrage/execution-audit', async (req, res) => {
+  try {
+    const limitRaw = Number(req.query?.limit);
+    const payload = await getArbitrageExecutionAuditRecent({
+      limit: Number.isFinite(limitRaw) ? limitRaw : undefined
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo consultar auditoria de ejecucion dual.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/execution-audit/:executionId
+// Retorna timeline completo + correlaciones de snapshot y placements para auditoria 1-click.
+router.get('/arbitrage/execution-audit/:executionId', async (req, res) => {
+  try {
+    const includeCorrelations = !['0', 'false', 'no'].includes(String(req.query?.includeCorrelations || '1').trim().toLowerCase());
+    const payload = await getArbitrageExecutionAuditByExecutionId(req.params.executionId, {
+      includeCorrelations
+    });
+
+    res.json({
+      success: true,
+      ...payload
+    });
+  } catch (error) {
+    const status = Number(error?.statusCode || 500);
+    res.status(status).json({
+      success: false,
+      error: error?.message || 'No se pudo consultar ejecucion dual por executionId.'
+    });
+  }
+});
+
 // GET /api/opportunities/arbitrage/live/simulation/history
 // Retorna historial reciente de operaciones simuladas (estados y evidencia por pata).
 router.get('/arbitrage/live/simulation/history', async (req, res) => {
@@ -612,6 +855,25 @@ router.get('/arbitrage/live/simulation/summary', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error?.message || 'No se pudo consultar resumen de simulacion live.'
+    });
+  }
+});
+
+// GET /api/opportunities/arbitrage/live/operations-dashboard
+// Dashboard operativo de Fase 4: estados, outcomes, latencia, rechazos y slippage.
+router.get('/arbitrage/live/operations-dashboard', async (req, res) => {
+  try {
+    const windowMinutesRaw = Number(req.query?.windowMinutes);
+
+    const payload = await getLiveArbitrageOperationsDashboard({
+      windowMinutes: Number.isFinite(windowMinutesRaw) ? windowMinutesRaw : undefined
+    });
+
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error?.message || 'No se pudo construir dashboard operativo de arbitraje live.'
     });
   }
 });

@@ -13,6 +13,10 @@ yarn-error.log
 # Database
 db.json
 .db.json.tmp
+db-core.json
+db-diagnostics.json
+.db-core.json.tmp
+.db-diagnostics.json.tmp
 
 # Archivos con credenciales / runtime que nunca deben subirse
 data.txt
@@ -34,3 +38,15 @@ Thumbs.db
 .chrome_session/
 client/nul
 nul
+
+# Backups y archivos de reparación de base de datos
+*.bak
+*.corrupt.bak
+*.repair-source.bak
+
+# Reportes generados localmente
+reporte_completo_partidos.csv
+
+# Archivos de monitoreo/salida de scripts (en data/)
+data/ops-monitor-*.json
+data/ops-monitor-*.progress.json

@@ -11,7 +11,7 @@ import {
   cancelPinnacleSemiAutoTicket
 } from './pinnacleSemiAutoService.js';
 
-const SIM_HISTORY_LIMIT = Math.max(200, Math.floor(Number(process.env.LIVE_ARBITRAGE_SIM_HISTORY_LIMIT || 3000)));
+const SIM_HISTORY_LIMIT = Math.max(200, Math.floor(Number(process.env.LIVE_ARBITRAGE_SIM_HISTORY_LIMIT || 800)));
 const SIM_DEFAULT_LIMIT = Math.max(1, Math.floor(Number(process.env.LIVE_ARBITRAGE_SIM_DEFAULT_LIMIT || 5)));
 
 const nowIso = () => new Date().toISOString();

@@ -1,13 +1,12 @@
 const fs = require('fs');
 const path = require('path');
+const { readMergedDbSync } = require('./lib/read-split-db.cjs');
 
-const dbPath = path.join(__dirname, '../db.json');
 const reportPath = path.join(__dirname, '../reporte_completo_partidos.csv');
 
 try {
     console.log("Leyendo base de datos...");
-    const rawData = fs.readFileSync(dbPath, 'utf8');
-    const db = JSON.parse(rawData);
+    const db = readMergedDbSync();
 
     const upcomingMatches = db.upcomingMatches || [];
     const altenarMatches = db.altenarUpcoming || [];

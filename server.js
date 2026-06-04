@@ -4,7 +4,8 @@ import dotenv from 'dotenv';
 import { initDB, pruneStaleEventCaches } from './src/db/database.js';
 
 // Cargar variables de entorno
-dotenv.config({ override: true });
+const dotenvOverride = String(process.env.DOTENV_OVERRIDE || '').trim().toLowerCase() === 'true';
+dotenv.config({ override: dotenvOverride });
 
 // Inicializar App Express
 const app = express();

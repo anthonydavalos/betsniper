@@ -1,8 +1,4 @@
-const fs = require('fs');
-const path = require('path');
-
-// RUTAS
-const DB_PATH = path.join(__dirname, '../db.json');
+const { readMergedDbSync, writeMergedDbSync } = require('./lib/read-split-db.cjs');
 
 // IDs ESPECÍFICOS A PURGAR (Añadir aquí si hay más conocidos)
 const TARGET_IDS = [
@@ -15,13 +11,7 @@ const TARGET_IDS = [
 
 function purgeInvalidBets() {
     console.log("🧹 Iniciando purga de apuestas inválidas...");
-
-    if (!fs.existsSync(DB_PATH)) {
-        console.error("❌ No se encontró db.json");
-        process.exit(1);
-    }
-
-    const db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    const db = readMergedDbSync();
     
     // Validar estructura básica
     if (!db.portfolio) {
@@ -127,8 +117,8 @@ function purgeInvalidBets() {
     console.log(`   - Ajuste de Balance: ${moneyRefunded >= 0 ? '+' : ''}${moneyRefunded.toFixed(2)} (${oldBalance.toFixed(2)} -> ${newBalance.toFixed(2)})`);
 
     if (betsDeleted > 0) {
-        fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-        console.log("💾 Cambios guardados en db.json");
+        writeMergedDbSync(db);
+        console.log("💾 Cambios guardados en db-core.json + db-diagnostics.json");
     } else {
         console.log("👍 No se encontraron apuestas para eliminar.");
     }
